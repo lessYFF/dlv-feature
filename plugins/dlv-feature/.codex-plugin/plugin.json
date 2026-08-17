@@ -1,0 +1,22 @@
+{
+  "name": "dlv-feature",
+  "version": "0.1.0",
+  "description": "A disciplined end-to-end feature delivery workflow for Codex.",
+  "author": {
+    "name": "lessYFF",
+    "url": "https://github.com/lessYFF"
+  },
+  "homepage": "https://github.com/lessYFF/dlv-feature",
+  "repository": "https://github.com/lessYFF/dlv-feature",
+  "keywords": ["feature-delivery", "prd", "architecture", "verification"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "DLV Feature",
+    "shortDescription": "Deliver features with evidence-backed gates.",
+    "longDescription": "Guides a feature from requirement review through PRD, architecture, code specification, implementation, and verified delivery.",
+    "developerName": "lessYFF",
+    "category": "Productivity",
+    "capabilities": ["Feature planning", "Code delivery", "Verification"],
+    "defaultPrompt": "Use $dlv-feature to deliver this feature through requirement review, boundary proofs, implementation, and executable evidence."
+  }
+}

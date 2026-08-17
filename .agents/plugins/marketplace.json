@@ -1,0 +1,20 @@
+{
+  "name": "dlv-feature-marketplace",
+  "interface": {
+    "displayName": "DLV Feature Marketplace"
+  },
+  "plugins": [
+    {
+      "name": "dlv-feature",
+      "source": {
+        "source": "local",
+        "path": "./plugins/dlv-feature"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
