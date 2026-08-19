@@ -12,6 +12,13 @@ from typing import Any
 
 from validate_boundary_proofs import validate_boundary_proofs
 from validate_verification_evidence import validate_verification_evidence
+from delivery_proof import (
+    code_result_digest,
+    proof_contract_digest,
+    repository_fingerprint,
+    validate_finalization,
+    validate_proof_contract,
+)
 
 
 FEATURE_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -33,7 +40,7 @@ FORBIDDEN_GOVERNANCE = re.compile(
     r"上下文胶囊|Context\s+Capsule|DLV_CONTEXT_CAPSULES"
 )
 PLACEHOLDER = re.compile(r"(?:TODO|TBD|待填写|待补充|template placeholder|fill this section)", re.I)
-VERDICTS = {None, "PASS", "CONDITIONAL", "BLOCKED"}
+VERDICTS = {None, "PASS", "BLOCKED"}
 SIMPLICITY_ITEMS = {"delete", "kiss", "dry", "responsibility", "dependency"}
 SIMPLICITY_STATUSES = {"PASS", "FAIL", "N/A"}
 
@@ -103,6 +110,7 @@ ID_PATTERNS = {
     "TEST": re.compile(r"\bT-B[0-9]{2,}-[0-9]+\b"),
     "BATCH": re.compile(r"\bB[0-9]{2,}\b"),
     "BP": re.compile(r"\bBP-[0-9]+\b"),
+    "PO": re.compile(r"\bPO-[0-9]+\b"),
     "EVID": re.compile(r"\bEVID-[0-9]+\b"),
 }
 ARCH_KINDS = ("ARCH", "FLOW", "API", "DATA", "UI", "IMPACT", "CONTRACT", "SHAPE")
@@ -615,7 +623,7 @@ def validate_inputs_shape(stage: str, item: dict[str, Any], errors: list[str]) -
         "architecture": {"prd", "prototype", "repositories"},
         "code_spec": {"prd", "architecture", "repositories"},
         "code": {"code_spec", "repositories"},
-        "verification": {"prd", "architecture", "code_spec", "code_result", "repositories"},
+        "verification": {"prd", "prototype", "architecture", "code_spec", "code_result", "proof_contract", "repositories"},
     }
     if stage not in required:
         return
@@ -642,7 +650,13 @@ def validate_completed_inputs(stages: dict[str, Any], errors: list[str]) -> None
         "architecture": {"prd": prd_fp, "prototype": proto_fp},
         "code_spec": {"prd": prd_fp, "architecture": arch_fp},
         "code": {"code_spec": spec_fp},
-        "verification": {"prd": prd_fp, "architecture": arch_fp, "code_spec": spec_fp, "code_result": code_result},
+        "verification": {
+            "prd": prd_fp,
+            "prototype": proto_fp,
+            "architecture": arch_fp,
+            "code_spec": spec_fp,
+            "code_result": code_result,
+        },
     }
     for stage, values in expected.items():
         status = stages.get(stage, {}).get("status")
@@ -661,17 +675,23 @@ def validate_prototype_contract(item: dict[str, Any], prd_text: str, errors: lis
     if not isinstance(contract, dict):
         errors.append("completed prototype requires stages.prototype.contract")
         return
-    required = {"target_app", "target_surface", "source_refs", "story_ids", "covered_states", "prd_fingerprint", "deviations"}
+    required = {
+        "target_app", "target_surface", "source_refs", "story_ids", "covered_states",
+        "viewports", "forbidden_elements", "visual_truth", "prd_fingerprint", "deviations",
+    }
     missing = required - contract.keys()
     if missing:
         errors.append(f"prototype contract missing: {', '.join(sorted(missing))}")
     for key in ("target_app", "target_surface"):
         if not isinstance(contract.get(key), str) or not contract[key].strip():
             errors.append(f"prototype contract.{key} must be non-empty")
-    for key in ("source_refs", "story_ids", "covered_states", "deviations"):
+    for key in ("source_refs", "story_ids", "covered_states", "viewports", "forbidden_elements", "deviations"):
         value = contract.get(key)
-        if not isinstance(value, list) or (key != "deviations" and not value):
-            errors.append(f"prototype contract.{key} must be {'a' if key == 'deviations' else 'a non-empty'} array")
+        optional_empty = key in {"deviations", "forbidden_elements"}
+        if not isinstance(value, list) or (not optional_empty and not value):
+            errors.append(f"prototype contract.{key} must be {'an' if optional_empty else 'a non-empty'} array")
+    if contract.get("visual_truth") is not True:
+        errors.append("approved prototype contract must declare visual_truth=true")
     for story in contract.get("story_ids", []) if isinstance(contract.get("story_ids"), list) else []:
         if not isinstance(story, str) or not ID_PATTERNS["US"].fullmatch(story) or story not in prd_text:
             errors.append(f"prototype contract has unknown story ID: {story}")
@@ -784,6 +804,8 @@ def validate_semantics(
     stages: dict[str, Any],
     confirmed_src: set[str],
     architecture_review: dict[str, Any],
+    proof_obligations: dict[str, dict[str, Any]],
+    proof_fingerprints: dict[str, str],
     errors: list[str],
 ) -> None:
     docs: dict[str, str] = {}
@@ -1047,10 +1069,16 @@ def validate_semantics(
             errors.append("architecture UI decisions require Code Spec ## 4. 前端实现")
         for heading in ("2. 实现映射", "7. 测试规格", "8. 实现批次"):
             require_ids(sections["code_spec"].get(heading, ""), assurance_ids, f"code-spec.md {heading}", errors)
+            require_ids(
+                sections["code_spec"].get(heading, ""),
+                set(proof_obligations),
+                f"code-spec.md {heading} proof obligations",
+                errors,
+            )
 
     if "verification" in docs:
         trace = sections["verification"].get("6. 验收追踪", "")
-        required = product.get("AC", set()) | product.get("EX", set()) | rules | tests | batches | assurance_ids
+        required = product.get("AC", set()) | product.get("EX", set()) | rules | tests | batches | assurance_ids | set(proof_obligations)
         required |= ids(docs.get("architecture", ""), "CONTRACT") | ids(docs.get("architecture", ""), "SHAPE")
         require_ids(trace, required, "verification.md 验收追踪", errors)
         verdict = stages.get("verification", {}).get("verdict")
@@ -1062,6 +1090,8 @@ def validate_semantics(
             boundary_ids,
             verdict,
             errors,
+            proof_obligations=proof_obligations,
+            expected_fingerprints=proof_fingerprints,
         )
 
 
@@ -1095,8 +1125,8 @@ def main() -> int:
     state = extract_state(state_path, errors)
     if state is None:
         return report(errors, warnings)
-    if state.get("schema_version") != 5:
-        errors.append("state.md schema_version must be 5; compatibility with older schemas is intentionally unsupported")
+    if state.get("schema_version") != 6:
+        errors.append("state.md schema_version must be 6; compatibility with older schemas is intentionally unsupported")
         return report(errors, warnings)
     if state.get("feature_id") != args.feature_id:
         errors.append("state.md feature_id does not match directory/argument")
@@ -1161,18 +1191,60 @@ def main() -> int:
     if prototype.get("status") == "not_applicable" and (feature_dir / "prototype.html").exists():
         errors.append("prototype.html exists while prototype is not_applicable")
 
+    proof_obligations: dict[str, dict[str, Any]] = {}
+    proof_active = stages.get("code_spec", {}).get("status") == "completed" or any(
+        stages.get(name, {}).get("status") in {"in_progress", "completed", "stale", "blocked"}
+        for name in ("code", "verification")
+    )
+    if proof_active:
+        proof_obligations = validate_proof_contract(
+            state.get("proof_contract"),
+            ids(prd_text, "AC") | ids(prd_text, "EX"),
+            stages.get("code_spec", {}).get("fingerprint"),
+            prototype.get("status") == "completed",
+            errors,
+        )
+    proof_fp = proof_contract_digest(state.get("proof_contract"))
+    verification_inputs = stages.get("verification", {}).get("inputs")
+    if stages.get("verification", {}).get("status") == "completed" and isinstance(verification_inputs, dict):
+        if verification_inputs.get("proof_contract") != proof_fp:
+            errors.append("completed verification has stale proof_contract input")
+
     code = stages.get("code", {})
     if code.get("status") == "completed":
         if code.get("result") is None or code.get("result") == "" or code.get("result") == [] or code.get("result") == {}:
             errors.append("completed code requires a non-empty result")
+        elif not isinstance(code.get("result"), dict):
+            errors.append("completed code result must be an object with repository_fingerprint")
+        else:
+            recorded = code["result"].get("repository_fingerprint")
+            if not isinstance(recorded, str) or not SHA256.fullmatch(recorded):
+                errors.append("completed code result requires repository_fingerprint")
+            else:
+                try:
+                    current = repository_fingerprint(root, args.feature_id)
+                except ValueError as exc:
+                    errors.append(str(exc))
+                else:
+                    if recorded != current:
+                        errors.append("completed code repository_fingerprint is stale")
         validate_simplicity_gate(code, errors)
     verdict = stages.get("verification", {}).get("verdict")
     if verdict not in VERDICTS:
         errors.append("invalid verification verdict")
-    if stages.get("verification", {}).get("status") == "completed" and verdict not in {"PASS", "CONDITIONAL"}:
-        errors.append("completed verification requires PASS or CONDITIONAL verdict")
+    if stages.get("verification", {}).get("status") == "completed" and verdict != "PASS":
+        errors.append("completed verification requires PASS verdict")
+    validate_finalization(state, errors)
 
-    validate_semantics(feature_dir, stages, confirmed_src, architecture_review, errors)
+    validate_semantics(
+        feature_dir,
+        stages,
+        confirmed_src,
+        architecture_review,
+        proof_obligations,
+        {"truth": proof_fp, "code": code_result_digest(state)},
+        errors,
+    )
     if feature_dir.is_dir():
         for entry in feature_dir.iterdir():
             if entry.is_file() and entry.name not in ALLOWED_FILES:
