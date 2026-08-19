@@ -2,7 +2,7 @@
 
 ## 目标
 
-把 fresh 技术方案展开为文件、符号、规则、测试和批次级实现合同；实现者不重新发现产品行为或重做架构决策。
+把 fresh 技术方案展开为文件、符号、规则、测试、批次和证明义务；实现者不重新发现产品行为或重做架构决策。
 
 ## 就绪检查
 
@@ -14,10 +14,24 @@
 
 每个 `BP-*` 必须映射到至少一个 `D/R/T/B`，并明确 exact route/symbol/Service guard、guard-before-write、直接 POST/已知 ID 入口、缺 action permission、缺 entity/product-line permission、适用的错租户/生命周期，以及 zero side effect。读取边界还必须断言 denied JSON 不含 sensitive fields；lineage 边界还必须断言 source perturbation、draft mutation、recomplete/history snapshot 的正确选择。不能以 UI 测试或“已有权限校验”代替。
 
-接口映射到 DTO/Controller/Caller/Adapter；数据映射到 migration、Model/Entity、Repository、转换和测试；UI 映射到路由、组件、状态、handler、API 绑定和 shape 验证。
+接口映射到 DTO/Controller/Caller/Adapter；数据映射到 migration、Model/Entity、Repository、转换和测试；UI 映射到路由、组件、状态、handler、API 绑定和 shape 验证。沿用户入口展开一跳直接依赖，覆盖样式、helper、权限、配置与构建；未知跨切依赖是 gap，不以手工路径白名单假装闭合。
+
+## Proof Contract
+
+为每个 `AC/EX` 建立至少一个 `PO-*`，且精确选择一种证明类型：
+
+| 类型 | 最低证明 |
+|---|---|
+| `visual` | 批准原型与实现使用相同终端、视口、状态、数据和字体截图；结构/禁止元素检查、关键几何和感知 diff |
+| `runtime` | 在目标浏览器、开发者工具或真机执行用户动作并观察结果；原生副作用必须读取结果回证 |
+| `boundary` | direct API/入口的允许与拒绝角色、zero write/service-not-invoked、投影与 lineage probe |
+| `invariant` | 服务/数据库状态转换、跨事实一致性、租户和历史数据不变量 |
+| `artifact` | build、目录隔离、配置、bundle、产物哈希、console/lifecycle 或发布健康 |
+
+每项写入 `state.md -> proof_contract.obligations`：`id/product_ids/proof_type/surface/environment/critical/expected/states`。`environment` 必须冻结该义务实际验收的目标运行时与关键版本，不得只写 local/dev/test。核心 CTA、权限、安全、数据完整性和发布阻断项必须 `critical=true`；它们不能降级为人工或 conditional。批准 Code Spec 时同时冻结 `proof_contract.code_spec_fingerprint` 并令 verdict=PASS。
 
 ## 实现批次与对齐门
 
 每个 `Bxx` 是唯一最小执行边界：目标（至少一条 `R-*` 和 `AC/EX`）、架构锚点、仓库与基线、候选路径、源码/测试必读、允许与排除范围、依赖深度、test-first red/green/回归命令、消费的 `BP-*` 精确断言、完成/回滚条件、Simplicity 合同和超限理由。默认预算 3 仓库、20 路径、8 源码、4 测试/配置、1 hop。
 
-技术方案的每个影响项必须被消费；Code Spec 不得新增未批准的表、接口、组件、依赖、公共抽象或写入目标。每个 `BP-*` 必须进入至少一个 `Dxx`、`T-*` 和 `Bxx`，缺口返回 Architecture 并传播 stale。用户批准后记录指纹并进入 Code；批准不等于授权写业务代码。
+技术方案的每个影响项必须被消费；Code Spec 不得新增未批准的表、接口、组件、依赖、公共抽象或写入目标。每个 `BP-*` 必须进入至少一个 `Dxx`、`T-*` 和 `Bxx`；每个 `PO-*` 必须进入实现映射、测试规格和实现批次。缺口返回上游并传播 stale。用户批准后记录指纹并进入 Code；批准不等于授权写业务代码。

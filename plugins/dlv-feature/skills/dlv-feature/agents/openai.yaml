@@ -1,4 +1,4 @@
 interface:
   display_name: "DLV Feature"
-  short_description: "从需求复核到真实任务验收的研发闭环，阻断需求丢失、错误复用和假通过"
-  default_prompt: "Use $dlv-feature to deliver this feature through requirement review, boundary proofs, implementation, and executable evidence."
+  short_description: "以证明义务、视觉一致性和真实运行时证据驱动端到端功能交付"
+  default_prompt: "Use $dlv-feature to deliver this feature with fresh truth, typed proof obligations, target-runtime mission evidence, and deterministic finalization."

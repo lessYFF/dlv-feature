@@ -41,12 +41,15 @@ def stage_state(name: str) -> dict:
             {
                 "inputs": {
                     "prd": None,
+                    "prototype": None,
                     "architecture": None,
                     "code_spec": None,
                     "code_result": None,
+                    "proof_contract": None,
                     "repositories": {},
                 },
                 "verdict": None,
+                "finalization": None,
             }
         )
     if name == "prototype":
@@ -97,7 +100,7 @@ def main() -> int:
 
     feature_dir.mkdir(parents=True, exist_ok=True)
     state = {
-        "schema_version": 5,
+        "schema_version": 6,
         "feature_id": args.feature_id,
         "current_stage": "prd",
         "requirement_review": {
@@ -125,6 +128,12 @@ def main() -> int:
             },
             "material_decisions": [],
             "approved_at": None,
+        },
+        "proof_contract": {
+            "status": "pending",
+            "code_spec_fingerprint": None,
+            "obligations": [],
+            "verdict": "PENDING",
         },
         "stages": {name: stage_state(name) for name in STAGES},
         "blockers": [],
