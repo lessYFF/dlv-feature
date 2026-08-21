@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Regression and forward tests for the schema-v7 verification kernel."""
+"""Regression and forward tests for the schema-v8 delivery kernel."""
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import subprocess
@@ -16,11 +17,16 @@ from unittest.mock import patch
 
 import finalize_delivery
 import invalidate_downstream
+import approve_stage
+import quality_review
 import seal_proof_contract
+import upgrade_v7_to_v8
+import verification_run
 from delivery_proof import (
     acquire_windows_lock,
     extract_state,
     evaluate_oracle,
+    finalization_token,
     validate_finalization,
     proof_contract_digest,
     resolve_source,
@@ -29,7 +35,14 @@ from delivery_proof import (
     validate_proof_contract,
     write_state,
 )
-from validate_feature import validate_database_section, validate_document
+from validate_feature import validate_database_section, validate_document, validate_v8_gates
+from quality_gates import (
+    proof_contract_draft_digest,
+    prototype_decision_digest,
+    requirement_review_digest,
+    validate_approval_receipt,
+    validate_review_payload,
+)
 from validate_verification_evidence import validate_verification_run
 from verification_run import MAX_CAPTURE_BYTES, record, render, run_bounded, start
 
@@ -85,7 +98,12 @@ def contract() -> dict[str, object]:
                 },
             ],
         }],
-        "approval": {"approved_by": "test-owner", "reference": "test-approval-01"},
+        "approval": {
+            "approved_by": "test-owner",
+            "reference": "test-approval-01",
+            "approval_text_sha256": "a" * 64,
+            "quality_review_run_id": "code-spec-review-01",
+        },
         "sealed_at": "2026-08-21T00:00:00+08:00",
         "seal": None,
     }
@@ -137,7 +155,475 @@ def result_file(root: Path, *, status: str = "passed") -> Path:
     return path
 
 
+def prepare_sealable(root: Path, feature_id: str) -> Path:
+    subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), feature_id, "--root", str(root)], check=True)
+    state_path = root / "delivery" / feature_id / "state.md"
+    (state_path.parent / "prd.md").write_text("AC-01", encoding="utf-8")
+    code_spec = state_path.parent / "code-spec.md"
+    code_spec.write_text("approved code specification\n", encoding="utf-8")
+    content, state = extract_state(state_path)
+    pending = contract()
+    pending.update({
+        "status": "pending",
+        "code_spec_fingerprint": None,
+        "approval": None,
+        "sealed_at": None,
+        "seal": None,
+    })
+    state["proof_contract"] = pending
+    write_state(state_path, content, state)
+    review_input = root / f"{feature_id}-review.json"
+    review_input.write_text(json.dumps({
+        "review_type": "code_spec",
+        "reviewer": "test-reviewer",
+        "review_reference": "test-review-reference",
+        "verdict": "PASS",
+        "findings": [],
+    }), encoding="utf-8")
+    quality_review.record_review(feature_id, root, "code_spec", "code-spec-review-01", review_input)
+    content, state = extract_state(state_path)
+    artifact_sha = hashlib.sha256(code_spec.read_bytes()).hexdigest()
+    state["approvals"]["code_spec"] = {
+        "stage": "code_spec",
+        "artifact_sha256": artifact_sha,
+        "approved_by": "test-owner",
+        "approval_reference": "test-approval-01",
+        "approval_text_sha256": "a" * 64,
+        "approved_at": "2026-08-21T00:00:00+08:00",
+        "quality_review_run_id": "code-spec-review-01",
+        "proof_contract_sha256": proof_contract_draft_digest(state["proof_contract"]),
+    }
+    write_state(state_path, content, state)
+    return state_path
+
+
+def prepare_profile_run(root: Path, proof_type: str) -> tuple[Path, Path]:
+    feature_id = f"{proof_type}-profile"
+    init_git(root)
+    subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), feature_id, "--root", str(root)], check=True)
+    state_path = root / "delivery" / feature_id / "state.md"
+    value = contract()
+    observation = (
+        {"viewport": "1280x720", "dpr": 2, "font_fingerprints": ["font-a"], "pixel_diff_ratio": 0, "geometry_diff_max": 0, "forbidden_elements_count": 0}
+        if proof_type == "visual"
+        else {"runtime": "api", "action": "create task", "result_readback": {"status": "created"}}
+    )
+    value["environments"][0]["spec"] = {  # type: ignore[index]
+        "runtime": "browser" if proof_type == "visual" else "api",
+        "preflight": [{"id": "python", "argv": ["python3", "-c", "print('ready')"]}],
+    }
+    obligation = value["obligations"][0]  # type: ignore[index]
+    obligation["proof_type"] = proof_type
+    obligation["runner"] = {
+        "argv": ["python3", "-c", f"import json; print(json.dumps({observation!r}))"],
+        "cwd": ".",
+        "observation_adapter": "visual_bundle" if proof_type == "visual" else "runtime_trace",
+    }
+    sources = (
+        [("pixel", "/observation/pixel_diff_ratio", 0), ("geometry", "/observation/geometry_diff_max", 0), ("forbidden", "/observation/forbidden_elements_count", 0)]
+        if proof_type == "visual"
+        else [("readback", "/observation/result_readback/status", "created")]
+    )
+    obligation["assertions"] = [
+        {"id": f"ASRT-{index:02d}", "description": label, "oracle": {"kind": "json_path", "source": source, "operator": "eq", "expected": expected}}
+        for index, (label, source, expected) in enumerate(sources, 1)
+    ]
+    value["seal"] = proof_contract_digest(value)
+    environment = root / f"{proof_type}-environment.json"
+    environment.write_text(json.dumps(value["environments"][0]["spec"]), encoding="utf-8")  # type: ignore[index]
+    content, state = extract_state(state_path)
+    state["proof_contract"] = value
+    (state_path.parent / "proof-contract.json").write_text(json.dumps(value), encoding="utf-8")
+    state["stages"]["code_spec"].update({"status": "completed", "fingerprint": "c" * 64})
+    state["stages"]["code"].update({"status": "completed", "result": {"repository_fingerprint": repository_fingerprint(root, feature_id)}})
+    write_state(state_path, content, state)
+    start(feature_id, root, "run-001", [f"ENV-01={environment}"])
+    inputs = root / ".dlv" / "inputs"
+    inputs.mkdir(parents=True, exist_ok=True)
+    result = inputs / f"{proof_type}-result.json"
+    result.write_text(json.dumps({"po_id": "PO-01", "proof_type": proof_type, "outcome": "evaluate", "anchors": []}), encoding="utf-8")
+    return state_path, result
+
+
+PRD_DOCUMENT = """# 最小交付 — 产品需求文档（PRD）
+
+## 目录
+
+- [1. 需求背景与目标](#1-需求背景与目标)
+- [2. 范围与约束](#2-范围与约束)
+- [3. 功能需求](#3-功能需求)
+- [4. 业务流程](#4-业务流程)
+- [7. 验收标准](#7-验收标准)
+- [9. 风险与待确认事项](#9-风险与待确认事项)
+- [10. 需求追踪](#10-需求追踪)
+
+## 1. 需求背景与目标
+
+SRC-01 要求交付一个可以被机器验证的最小行为，目标是让交付状态与真实执行结果一致。
+
+## 2. 范围与约束
+
+- 范围内：验证一个固定输入并返回确定结果。
+- 范围外：用户界面和外部系统集成。
+- 界面影响: none
+
+## 3. 功能需求
+
+| ID | 要求 |
+|---|---|
+| FR-01 | 系统读取输入并产生确定结果。 |
+| BR-01 | 草稿结果不得计为完成。 |
+
+## 4. 业务流程
+
+1. 调用者提交固定输入。
+2. 系统计算并返回结果。
+3. 验证器读取结果并裁决。
+
+## 7. 验收标准
+
+| ID | 标准 |
+|---|---|
+| AC-01 | 执行后草稿计数为零且状态码为成功。 |
+
+## 9. 风险与待确认事项
+
+| 项目 | 结论 |
+|---|---|
+| 未决问题 | 无未决问题，固定输入已确认。 |
+
+## 10. 需求追踪
+
+| 来源 | 功能 | 业务规则 | 验收 |
+|---|---|---|---|
+| SRC-01 | FR-01 | BR-01 | AC-01 |
+"""
+
+
+ARCHITECTURE_DOCUMENT = """# 最小交付 — 技术方案
+
+## 目录
+
+- [1. 概述](#1-概述)
+- [2. 现状](#2-现状)
+- [3. 方案](#3-方案)
+- [4. 流程](#4-流程)
+- [8. 质量保障](#8-质量保障)
+- [9. 影响范围](#9-影响范围)
+- [10. 发布与回滚](#10-发布与回滚)
+- [11. 需求追踪](#11-需求追踪)
+
+## 1. 概述
+
+- 输入：调用者提供的固定输入。
+- 处理：交给现有校验器执行。
+- 输出：结构化结果作为唯一事实。
+
+## 2. 现状
+
+| 分析 | 结论 |
+|---|---|
+| 可复用能力 | 沿用现有校验器。 |
+| 事实所有权 | 校验器是结果的正典事实所有者。 |
+| API/事务/权限边界 | 现有接口内完成校验，不改变事务与权限边界。 |
+| 系统性缺口 | 缺口是缺少确定性结果绑定。 |
+
+## 3. 方案
+
+| ID | 裁决 |
+|---|---|
+| ARCH-01 | 复用、扩展与新增裁决：复用现有校验器，仅绑定结构化结果。 |
+| ALT-01 | 被拒绝方案：拒绝手写通过状态，因为无法证明真实执行。 |
+| RULE-01 | 规则分派：唯一分派点是现有校验器。 |
+
+## 4. 流程
+
+FLOW-01 描述固定执行顺序。
+
+```mermaid
+flowchart TD
+  A[读取输入] --> B[执行校验]
+  B --> C[记录结果]
+```
+
+## 8. 质量保障
+
+| 维度 | 保障 |
+|---|---|
+| 正确性 | 结构化断言从执行输出计算，不接受手填结果。 |
+| 失败处理 | 任一断言失败即拒绝完成。 |
+
+## 9. 影响范围
+
+| ID | 范围 | 状态 |
+|---|---|---|
+| IMPACT-01 | 校验器与对应测试 | approved |
+
+## 10. 发布与回滚
+
+1. 先运行完整测试，再发布校验规则。
+2. 触发条件命中时恢复上一版本规则。
+
+| 回滚触发 | 动作 |
+|---|---|
+| 确定性测试失败 | 恢复上一版本并重新执行测试。 |
+
+## 11. 需求追踪
+
+| 产品要求 | 架构 |
+|---|---|
+| FR-01 BR-01 AC-01 | ARCH-01 FLOW-01 IMPACT-01 |
+"""
+
+
+CODE_SPEC_DOCUMENT = """# 最小交付 — 代码实现规格（Code Spec）
+
+## 目录
+
+- [1. 实现概述](#1-实现概述)
+- [2. 实现映射](#2-实现映射)
+- [6. 规则与异常](#6-规则与异常)
+- [7. 测试规格](#7-测试规格)
+- [8. 实现批次](#8-实现批次)
+- [9. 变更控制](#9-变更控制)
+
+## 1. 实现概述
+
+按既有校验器模式实现一个批次，并用 Proof Contract 绑定真实执行结果。
+
+## 2. 实现映射
+
+| Domain | 架构 | 影响 | Proof |
+|---|---|---|---|
+| D01 | ARCH-01 FLOW-01 | IMPACT-01 | PO-01 |
+
+## 6. 规则与异常
+
+| 规则 | 产品输入 | 行为 |
+|---|---|---|
+| R-D01-1 | FR-01 BR-01 AC-01 | 草稿计数非零时不得完成。 |
+
+## 7. 测试规格
+
+| 测试 | 规则 | Proof | 预期 |
+|---|---|---|---|
+| T-B01-1 | R-D01-1 | PO-01 | 固定输入返回成功且草稿计数为零。 |
+
+## 8. 实现批次
+
+### B01: 最小确定性行为
+
+#### 目标
+
+完成 R-D01-1 与 AC-01，并由 PO-01 提供执行证据。
+
+#### 架构锚点
+
+- ARCH-01
+
+#### 仓库与基线
+
+- 当前仓库的已提交基线。
+
+#### 候选路径
+
+- source.txt
+
+#### 源码必读
+
+- source.txt
+
+#### 测试/配置必读
+
+- 本测试文件中的交付门回归测试。
+
+#### 允许修改
+
+- source.txt
+
+#### 排除范围
+
+- 不修改外部系统。
+
+#### 依赖深度
+
+1
+
+#### 测试与完成条件
+
+- T-B01-1 与 PO-01 必须通过，B01 才完成。
+
+## 9. 变更控制
+
+| 变化 | 处理 |
+|---|---|
+| ARCH-01 或 AC-01 改变 | 重新审查 Code Spec 并重跑 PO-01。 |
+"""
+
+
+def run_delivery_cli(root: Path, script: str, *arguments: str) -> subprocess.CompletedProcess[str]:
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPTS / script), *arguments, "--root", str(root)],
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        raise AssertionError(completed.stdout + completed.stderr)
+    return completed
+
+
+def prepare_approved_delivery(root: Path, feature_id: str) -> Path:
+    init_git(root)
+    run_delivery_cli(root, "init_feature.py", feature_id)
+    state_path = root / "delivery" / feature_id / "state.md"
+    content, state = extract_state(state_path)
+    state["requirement_review"].update({
+        "source_fingerprint": "b" * 64,
+        "confirmed_ids": ["SRC-01"],
+        "summary": {
+            "goal": "machine-verified delivery",
+            "users_scenarios": "delivery owner runs one deterministic check",
+            "in_scope": "fixed input validation",
+            "out_scope": "user interface and integrations",
+            "key_rules": "draft results never count as complete",
+            "ui_impact": "none",
+            "open_questions": "no open questions",
+        },
+    })
+    write_state(state_path, content, state)
+    approval = ("--approved-by", "test-owner", "--approval-reference", "approval-01", "--approval-text-sha256", "a" * 64)
+    run_delivery_cli(root, "approve_stage.py", "requirement_review", feature_id, *approval)
+    (state_path.parent / "prd.md").write_text(PRD_DOCUMENT, encoding="utf-8")
+    run_delivery_cli(root, "approve_stage.py", "product", feature_id, *approval)
+
+    (state_path.parent / "architecture-design.md").write_text(ARCHITECTURE_DOCUMENT, encoding="utf-8")
+    content, state = extract_state(state_path)
+    prd_sha = state["stages"]["prd"]["fingerprint"]
+    state["stages"]["architecture"]["inputs"] = {"prd": prd_sha, "prototype": None, "repositories": {}}
+    state["architecture_review"].update({
+        "status": "completed",
+        "inputs": {"prd": prd_sha, "prototype": None, "repositories": {}},
+        "existing_capabilities": ["existing deterministic validator"],
+        "fact_owners": [{
+            "id": "FACT-01", "fact": "validation outcome", "canonical_owner": "validator",
+            "snapshot_or_reference": "reference", "lifecycle": "one run",
+            "forbidden_duplicates": "handwritten pass state", "evidence": "source.txt",
+        }],
+        "additions": [],
+        "api_decisions": [],
+        "isolation": {"applicable": False, "verdict": "N/A"},
+        "concurrency": {"applicable": False, "verdict": "N/A"},
+        "rule_variants": {"applicable": False, "verdict": "N/A"},
+        "boundary_proofs": {"applicable": False, "reason": "No access boundary changes", "proofs": [], "verdict": "N/A"},
+        "material_decisions": [],
+        "approved_at": "2026-08-21T00:00:00+08:00",
+    })
+    write_state(state_path, content, state)
+    review_dir = root / ".dlv" / "inputs"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    architecture_review_result = review_dir / "architecture-review.json"
+    architecture_review_result.write_text(json.dumps({
+        "review_type": "architecture", "reviewer": "test-reviewer",
+        "review_reference": "architecture-review-reference", "verdict": "PASS", "findings": [],
+    }), encoding="utf-8")
+    run_delivery_cli(
+        root, "quality_review.py", "architecture", feature_id,
+        "--run-id", "architecture-review-01", "--result", str(architecture_review_result),
+    )
+    run_delivery_cli(root, "approve_stage.py", "architecture", feature_id, *approval)
+
+    (state_path.parent / "code-spec.md").write_text(CODE_SPEC_DOCUMENT, encoding="utf-8")
+    content, state = extract_state(state_path)
+    state["stages"]["code_spec"]["inputs"] = {
+        "prd": state["stages"]["prd"]["fingerprint"],
+        "architecture": state["stages"]["architecture"]["fingerprint"],
+        "repositories": {},
+    }
+    draft = contract()
+    draft["obligations"][0]["trace_ids"] = ["ARCH-01", "FLOW-01", "R-D01-1", "T-B01-1", "B01"]  # type: ignore[index]
+    draft.update({"status": "pending", "code_spec_fingerprint": None, "approval": None, "sealed_at": None, "seal": None})
+    state["proof_contract"] = draft
+    write_state(state_path, content, state)
+    code_review_result = review_dir / "code-spec-review.json"
+    code_review_result.write_text(json.dumps({
+        "review_type": "code_spec", "reviewer": "test-reviewer",
+        "review_reference": "code-spec-review-reference", "verdict": "PASS", "findings": [],
+    }), encoding="utf-8")
+    run_delivery_cli(
+        root, "quality_review.py", "code_spec", feature_id,
+        "--run-id", "code-spec-review-01", "--result", str(code_review_result),
+    )
+    run_delivery_cli(root, "approve_stage.py", "code_spec", feature_id, *approval)
+    run_delivery_cli(root, "seal_proof_contract.py", feature_id)
+    return state_path
+
+
 class ContractTests(unittest.TestCase):
+    def test_four_human_gates_and_two_quality_reviews_execute_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_approved_delivery(root, "approval-workflow")
+            _, state = extract_state(state_path)
+            self.assertEqual("completed", state["requirement_review"]["status"])
+            self.assertEqual("completed", state["stages"]["prd"]["status"])
+            self.assertEqual("not_applicable", state["stages"]["prototype"]["status"])
+            self.assertEqual("PASS", state["quality_reviews"]["architecture"]["verdict"])
+            self.assertEqual("completed", state["stages"]["architecture"]["status"])
+            self.assertEqual("PASS", state["quality_reviews"]["code_spec"]["verdict"])
+            self.assertEqual("completed", state["stages"]["code_spec"]["status"])
+            self.assertEqual("code", state["current_stage"])
+            self.assertEqual(
+                state["quality_reviews"]["code_spec"]["review_run_id"],
+                state["approvals"]["code_spec"]["quality_review_run_id"],
+            )
+            self.assertEqual("completed", state["proof_contract"]["status"])
+
+    def test_quality_review_rejects_feature_id_path_traversal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            result = root / "review.json"
+            result.write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "feature-id"):
+                quality_review.record_review("../escape", root, "architecture", "review-01", result)
+
+    def test_requirement_completion_without_receipt_is_invalid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "approval-gate", "--root", str(root)], check=True)
+            state_path = root / "delivery/approval-gate/state.md"
+            content, state = extract_state(state_path)
+            state["requirement_review"] = {
+                "status": "completed",
+                "source_fingerprint": "b" * 64,
+                "confirmed_ids": ["SRC-01"],
+                "summary": {"goal": "goal"},
+                "approved_at": "2026-08-21T00:00:00+08:00",
+            }
+            write_state(state_path, content, state)
+            errors: list[str] = []
+            validate_v8_gates(root, "approval-gate", state_path.parent, state, errors)
+            self.assertTrue(any("approvals.requirement_review" in error for error in errors))
+
+    def test_approval_receipt_is_bound_to_exact_artifact(self) -> None:
+        receipt = {
+            "stage": "prd", "artifact_sha256": "a" * 64, "approved_by": "owner",
+            "approval_reference": "decision-1", "approval_text_sha256": "b" * 64,
+            "approved_at": "2026-08-21T00:00:00+08:00",
+        }
+        errors: list[str] = []
+        validate_approval_receipt(receipt, "prd", "c" * 64, errors)
+        self.assertTrue(any("stale" in error for error in errors))
+
+    def test_quality_review_cannot_pass_with_open_major_finding(self) -> None:
+        errors: list[str] = []
+        validate_review_payload({
+            "review_type": "architecture", "review_run_id": "architecture-review-01",
+            "reviewer": "reviewer", "review_reference": "review-1", "reviewed_at": "now",
+            "verdict": "PASS", "artifact_sha256": "a" * 64,
+            "findings": [{"id": "ARQ-1", "severity": "major", "status": "open", "statement": "unsafe write path", "evidence": "architecture-design.md"}],
+        }, "architecture", errors)
+        self.assertTrue(any("cannot PASS" in error for error in errors))
+
     def test_windows_lock_retries_until_the_long_running_owner_releases(self) -> None:
         attempts = 0
 
@@ -214,6 +700,41 @@ class ContractTests(unittest.TestCase):
         validate_proof_contract(contract(), {"AC-01"}, "c" * 64, True, errors)
         self.assertTrue(any("visual proof" in error for error in errors))
 
+    def test_visual_proof_rejects_build_runtime_and_generic_adapter(self) -> None:
+        value = contract()
+        value["environments"][0]["spec"]["runtime"] = "node-build"  # type: ignore[index]
+        obligation = value["obligations"][0]  # type: ignore[index]
+        obligation["proof_type"] = "visual"
+        errors: list[str] = []
+        validate_proof_contract(value, {"AC-01"}, "c" * 64, False, errors)
+        self.assertTrue(any("visual proof requires" in error for error in errors))
+        self.assertTrue(any("observation_adapter" in error for error in errors))
+
+    def test_runtime_proof_requires_target_runtime_and_readback(self) -> None:
+        value = contract()
+        value["environments"][0]["spec"]["runtime"] = "node-build"  # type: ignore[index]
+        obligation = value["obligations"][0]  # type: ignore[index]
+        obligation["proof_type"] = "runtime"
+        errors: list[str] = []
+        validate_proof_contract(value, {"AC-01"}, "c" * 64, False, errors)
+        self.assertTrue(any("build-only runtime" in error for error in errors))
+        self.assertTrue(any("result_readback" in error for error in errors))
+
+    def test_node_target_runtime_is_distinct_from_node_build(self) -> None:
+        value = contract()
+        value["environments"][0]["spec"]["runtime"] = "node"  # type: ignore[index]
+        obligation = value["obligations"][0]  # type: ignore[index]
+        obligation["proof_type"] = "runtime"
+        obligation["runner"]["observation_adapter"] = "runtime_trace"
+        obligation["assertions"] = [{
+            "id": "ASRT-01", "description": "result is read back",
+            "oracle": {"kind": "state", "source": "/observation/result_readback", "operator": "eq", "expected": {"status": "created"}},
+        }]
+        value["seal"] = proof_contract_digest(value)
+        errors: list[str] = []
+        validate_proof_contract(value, {"AC-01"}, "c" * 64, False, errors)
+        self.assertEqual([], errors)
+
     def test_preflight_check_id_cannot_escape_run_directory(self) -> None:
         value = contract()
         value["environments"][0]["spec"]["preflight"][0]["id"] = "../../escape"  # type: ignore[index]
@@ -225,18 +746,9 @@ class ContractTests(unittest.TestCase):
     def test_seal_command_is_one_way(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            subprocess.run(["python3", str(SCRIPTS / "init_feature.py"), "seal-test", "--root", str(root)], check=True)
-            state_path = root / "delivery" / "seal-test" / "state.md"
-            (state_path.parent / "prd.md").write_text("AC-01", encoding="utf-8")
-            content, state = extract_state(state_path)
-            pending = contract()
-            pending.update({"status": "pending", "sealed_at": None, "seal": None})
-            state["proof_contract"] = pending
-            state["stages"]["code_spec"].update({"status": "completed", "fingerprint": "c" * 64})
-            write_state(state_path, content, state)
+            state_path = prepare_sealable(root, "seal-test")
             command = [
                 "python3", str(SCRIPTS / "seal_proof_contract.py"), "seal-test", "--root", str(root),
-                "--approved-by", "test-owner", "--approval-reference", "test-approval-01",
             ]
             first = subprocess.run(command, capture_output=True, text=True)
             second = subprocess.run(command, capture_output=True, text=True)
@@ -248,37 +760,37 @@ class ContractTests(unittest.TestCase):
     def test_seal_recovers_an_orphaned_snapshot_and_serializes_concurrent_writers(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "seal-recovery", "--root", str(root)], check=True)
-            state_path = root / "delivery/seal-recovery/state.md"
-            (state_path.parent / "prd.md").write_text("AC-01", encoding="utf-8")
-            content, state = extract_state(state_path)
-            pending = contract()
-            pending.update({"status": "pending", "approval": None, "sealed_at": None, "seal": None})
-            state["proof_contract"] = pending
-            state["stages"]["code_spec"].update({"status": "completed", "fingerprint": "c" * 64})
-            write_state(state_path, content, state)
-            orphan = contract()
+            state_path = prepare_sealable(root, "seal-recovery")
+            _, state = extract_state(state_path)
+            orphan = json.loads(json.dumps(state["proof_contract"]))
+            receipt = state["approvals"]["code_spec"]
+            orphan.update({
+                "status": "completed",
+                "code_spec_fingerprint": receipt["artifact_sha256"],
+                "approval": {
+                    "approved_by": receipt["approved_by"],
+                    "reference": receipt["approval_reference"],
+                    "approval_text_sha256": receipt["approval_text_sha256"],
+                    "quality_review_run_id": receipt["quality_review_run_id"],
+                },
+                "sealed_at": "2026-08-21T00:00:00+08:00",
+            })
+            orphan["seal"] = proof_contract_digest(orphan)
             (state_path.parent / "proof-contract.json").write_text(json.dumps(orphan), encoding="utf-8")
-            recovered = seal_proof_contract.seal_contract("seal-recovery", root, "test-owner", "test-approval-01")
+            recovered = seal_proof_contract.seal_contract("seal-recovery", root)
             _, updated = extract_state(state_path)
             self.assertEqual(orphan["seal"], recovered)
             self.assertEqual(orphan, updated["proof_contract"])
+            self.assertEqual("completed", updated["stages"]["code_spec"]["status"])
+            self.assertEqual("code", updated["current_stage"])
 
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "seal-concurrent", "--root", str(root)], check=True)
-            state_path = root / "delivery/seal-concurrent/state.md"
-            (state_path.parent / "prd.md").write_text("AC-01", encoding="utf-8")
-            content, state = extract_state(state_path)
-            pending = contract()
-            pending.update({"status": "pending", "approval": None, "sealed_at": None, "seal": None})
-            state["proof_contract"] = pending
-            state["stages"]["code_spec"].update({"status": "completed", "fingerprint": "c" * 64})
-            write_state(state_path, content, state)
+            state_path = prepare_sealable(root, "seal-concurrent")
 
-            def attempt(reference: str) -> str:
+            def attempt(_reference: str) -> str:
                 try:
-                    return seal_proof_contract.seal_contract("seal-concurrent", root, "test-owner", reference)
+                    return seal_proof_contract.seal_contract("seal-concurrent", root)
                 except ValueError:
                     return "rejected"
 
@@ -310,8 +822,55 @@ CREATE TABLE task (id bigint PRIMARY KEY);
 
     def test_sql_only_database_shape_passes(self) -> None:
         errors: list[str] = []
-        validate_database_section("```sql\nCREATE TABLE task (id bigint PRIMARY KEY);\n```", errors)
+        validate_database_section("```sql\nCREATE TABLE task (id bigint PRIMARY KEY);\nCOMMENT ON COLUMN task.id IS 'identifier';\n```", errors)
         self.assertEqual([], errors)
+
+    def test_inline_comments_after_column_commas_pass(self) -> None:
+        errors: list[str] = []
+        validate_database_section("""```sql
+CREATE TABLE task (
+  id bigint PRIMARY KEY, -- identifier
+  status varchar(32) NOT NULL -- lifecycle status
+);
+```""", errors)
+        self.assertEqual([], errors)
+
+    def test_nested_type_parentheses_do_not_truncate_column_validation(self) -> None:
+        errors: list[str] = []
+        validate_database_section("""```sql
+CREATE TABLE invoice (
+  id bigint PRIMARY KEY,
+  amount numeric(14,2) NOT NULL,
+  state varchar(20) DEFAULT 'draft'
+);
+COMMENT ON COLUMN invoice.id IS 'identifier';
+COMMENT ON COLUMN invoice.amount IS 'money amount';
+COMMENT ON COLUMN invoice.state IS 'lifecycle state';
+```""", errors)
+        self.assertEqual([], errors)
+
+    def test_alter_table_added_column_requires_comment(self) -> None:
+        errors: list[str] = []
+        validate_database_section("```sql\nALTER TABLE task ADD COLUMN completed_at timestamptz;\n```", errors)
+        self.assertTrue(any("task.completed_at" in error for error in errors))
+
+    def test_procedural_migration_logic_is_rejected(self) -> None:
+        errors: list[str] = []
+        validate_database_section("""```sql
+CREATE TABLE task (id bigint);
+COMMENT ON COLUMN task.id IS 'identifier';
+DO $$ BEGIN LOOP INSERT INTO task VALUES (1); END LOOP; END $$;
+```""", errors)
+        self.assertTrue(any("migration execution logic" in error for error in errors))
+
+    def test_migration_numbering_is_rejected_from_schema_contract(self) -> None:
+        errors: list[str] = []
+        validate_database_section("""```sql
+-- V20260822__create_task
+CREATE TABLE task (id bigint);
+COMMENT ON COLUMN task.id IS 'identifier';
+```""", errors)
+        self.assertTrue(any("migration numbering" in error for error in errors))
 
     def test_sql_comment_cannot_fake_ddl(self) -> None:
         errors: list[str] = []
@@ -320,6 +879,83 @@ CREATE TABLE task (id bigint PRIMARY KEY);
 
 
 class VerificationRunTests(unittest.TestCase):
+    def test_visual_evidence_requires_three_image_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, result = prepare_profile_run(root, "visual")
+            with self.assertRaisesRegex(ValueError, "prototype_screenshot"):
+                record("visual-profile", root, "run-001", result, [])
+
+    def test_visual_evidence_roles_cannot_alias_one_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, result = prepare_profile_run(root, "visual")
+            image = root / ".dlv/inputs/same.png"
+            image.write_bytes(b"not-a-real-image-but-a-distinct-anchor-test")
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            payload["anchors"] = [
+                {"role": role, "path": str(image)}
+                for role in ("prototype_screenshot", "implementation_screenshot", "visual_diff")
+            ]
+            result.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "three distinct"):
+                record("visual-profile", root, "run-001", result, [])
+
+    def test_visual_evidence_rejects_text_renamed_as_png(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, result = prepare_profile_run(root, "visual")
+            anchors = []
+            anchor_dir = root / ".dlv" / "inputs"
+            for role in ("prototype_screenshot", "implementation_screenshot", "visual_diff"):
+                path = anchor_dir / f"{role}.png"
+                path.write_bytes(f"fake-{role}".encode())
+                anchors.append({"role": role, "path": str(path)})
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            payload["anchors"] = anchors
+            result.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "supported image"):
+                record("visual-profile", root, "run-001", result, [])
+
+    def test_runtime_evidence_requires_trace_role(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, result = prepare_profile_run(root, "runtime")
+            with self.assertRaisesRegex(ValueError, "runtime_trace anchor"):
+                record("runtime-profile", root, "run-001", result, [])
+
+    def test_runtime_evidence_binds_target_runtime_and_structured_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, result = prepare_profile_run(root, "runtime")
+            trace = root / ".dlv" / "inputs" / "runtime-trace.json"
+            trace.write_text(json.dumps({"runtime": "api", "action": "create task", "result_readback": {"status": "created"}}), encoding="utf-8")
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            payload["anchors"] = [{"role": "runtime_trace", "path": str(trace)}]
+            result.write_text(json.dumps(payload), encoding="utf-8")
+            with patch.object(verification_run, "run_bounded", return_value={
+                "exit_code": 0,
+                "stdout": json.dumps({"runtime": "wrong", "action": "create task", "result_readback": {"status": "created"}}),
+                "stderr": "",
+                "timed_out": False,
+            }):
+                with self.assertRaisesRegex(ValueError, "sealed target environment runtime"):
+                    record("runtime-profile", root, "run-001", result, [])
+            trace.write_text("not json", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "valid JSON"):
+                record("runtime-profile", root, "run-001", result, [])
+
+    def test_runtime_evidence_accepts_matching_structured_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, result = prepare_profile_run(root, "runtime")
+            trace = root / ".dlv" / "inputs" / "runtime-trace.json"
+            trace.write_text(json.dumps({"runtime": "api", "action": "create task", "result_readback": {"status": "created"}}), encoding="utf-8")
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            payload["anchors"] = [{"role": "runtime_trace", "path": str(trace)}]
+            result.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual("EVID-0001", record("runtime-profile", root, "run-001", result, []))
+
     def test_runner_timeout_terminates_descendant_processes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             started = time.monotonic()
@@ -373,6 +1009,8 @@ class VerificationRunTests(unittest.TestCase):
             metadata = json.loads((root / ".dlv" / "runs" / "preflight-block" / "run-001" / "run.json").read_text())
             self.assertEqual("blocked", blocked["stages"]["verification"]["status"])
             self.assertEqual("BLOCKED", metadata["preflight_verdict"])
+            self.assertTrue((state_path.parent / "verification.md").is_file())
+            self.assertIn("当前状态：`BLOCKED`", (state_path.parent / "verification.md").read_text(encoding="utf-8"))
 
     def test_start_rejects_environment_drift(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -486,7 +1124,7 @@ class VerificationRunTests(unittest.TestCase):
             write_state(state_path, content, state)
             with self.assertRaisesRegex(ValueError, "in_progress"):
                 record("kernel-test", root, "run-002", result_file(root), [])
-            with self.assertRaisesRegex(ValueError, "active in-progress"):
+            with self.assertRaisesRegex(ValueError, "active Verification Run"):
                 render("kernel-test", root, "run-001")
 
     def test_concurrent_recorders_preserve_unique_ids_chain_and_state_head(self) -> None:
@@ -689,6 +1327,145 @@ class VerificationRunTests(unittest.TestCase):
 
 
 class MigrationTests(unittest.TestCase):
+    def test_sql_comments_cannot_hide_uncommented_columns(self) -> None:
+        errors: list[str] = []
+        validate_database_section(
+            "```sql\nCREATE TABLE users (\n  id bigint, -- identifier (\n  secret text\n);\nCOMMENT ON COLUMN users.id IS 'id';\n```",
+            errors,
+        )
+        self.assertTrue(any("users.secret" in error for error in errors), errors)
+
+    def test_artifact_change_invalidates_quality_review_and_human_approval(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "review-stale", "--root", str(root)], check=True)
+            state_path = root / "delivery/review-stale/state.md"
+            architecture = state_path.parent / "architecture-design.md"
+            architecture.write_text("version one\n", encoding="utf-8")
+            content, state = extract_state(state_path)
+            state["stages"]["architecture"].update({"status": "completed", "fingerprint": hashlib.sha256(architecture.read_bytes()).hexdigest()})
+            state["quality_reviews"]["architecture"] = {"review_run_id": "architecture-review-01"}
+            state["approvals"]["architecture"] = {"stage": "architecture"}
+            write_state(state_path, content, state)
+            architecture.write_text("version two\n", encoding="utf-8")
+            invalidate_downstream.invalidate(root, "review-stale", None)
+            _, updated = extract_state(state_path)
+            self.assertIsNone(updated["quality_reviews"]["architecture"])
+            self.assertNotIn("architecture", updated["approvals"])
+            self.assertEqual("stale", updated["stages"]["architecture"]["status"])
+
+    def test_v7_to_v8_dry_run_is_non_mutating(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "v8-preview", "--root", str(root)], check=True)
+            state_path = root / "delivery/v8-preview/state.md"
+            content, state = extract_state(state_path)
+            state["schema_version"] = 7
+            write_state(state_path, content, state)
+            before = state_path.read_bytes()
+            result = subprocess.run([sys.executable, str(SCRIPTS / "upgrade_v7_to_v8.py"), "v8-preview", "--root", str(root)], capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertEqual(before, state_path.read_bytes())
+
+    def test_v7_to_v8_never_promotes_old_pass_or_approvals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "v8-upgrade", "--root", str(root)], check=True)
+            state_path = root / "delivery/v8-upgrade/state.md"
+            content, state = extract_state(state_path)
+            state["schema_version"] = 7
+            state["approvals"] = {"architecture": {"stage": "architecture"}}
+            state["quality_reviews"] = {"architecture": {"verdict": "PASS"}, "code_spec": {"verdict": "PASS"}}
+            for name in state["stages"]:
+                state["stages"][name]["status"] = "completed"
+            state["stages"]["verification"].update({"verdict": "PASS", "finalization": {"tool": "legacy"}})
+            state["proof_contract"] = contract()
+            (state_path.parent / "proof-contract.json").write_text(json.dumps(state["proof_contract"]), encoding="utf-8")
+            write_state(state_path, content, state)
+            result = subprocess.run([sys.executable, str(SCRIPTS / "upgrade_v7_to_v8.py"), "v8-upgrade", "--root", str(root), "--apply"], capture_output=True, text=True)
+            _, upgraded = extract_state(state_path)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertEqual(8, upgraded["schema_version"])
+            self.assertEqual({}, upgraded["approvals"])
+            self.assertEqual({"architecture": None, "code_spec": None}, upgraded["quality_reviews"])
+            self.assertIsNone(upgraded["stages"]["verification"]["verdict"])
+            self.assertIsNone(upgraded["stages"]["verification"]["finalization"])
+            self.assertEqual("stale", upgraded["proof_contract"]["status"])
+            self.assertEqual(contract()["environments"], upgraded["proof_contract"]["environments"])
+            self.assertEqual(contract()["obligations"], upgraded["proof_contract"]["obligations"])
+            self.assertFalse((state_path.parent / "proof-contract.json").exists())
+            self.assertEqual("open", upgraded["risks"][-1]["status"])
+
+    def test_v7_to_v8_write_failure_preserves_state_and_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "upgrade-atomic", "--root", str(root)], check=True)
+            state_path = root / "delivery/upgrade-atomic/state.md"
+            content, state = extract_state(state_path)
+            state["schema_version"] = 7
+            state["proof_contract"] = contract()
+            write_state(state_path, content, state)
+            snapshot = state_path.parent / "proof-contract.json"
+            snapshot.write_text(json.dumps(state["proof_contract"]), encoding="utf-8")
+            before = state_path.read_bytes()
+            with patch.object(upgrade_v7_to_v8, "write_state", side_effect=OSError("disk full")), patch(
+                "sys.argv", ["upgrade_v7_to_v8.py", "upgrade-atomic", "--root", str(root), "--apply"]
+            ):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    upgrade_v7_to_v8.main()
+            self.assertEqual(before, state_path.read_bytes())
+            self.assertTrue(snapshot.is_file())
+
+    def test_not_applicable_prototype_has_fingerprint_bound_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "product-receipt", "--root", str(root)], check=True)
+            state_path = root / "delivery/product-receipt/state.md"
+            content, state = extract_state(state_path)
+            state["requirement_review"].update({
+                "status": "completed",
+                "source_fingerprint": "b" * 64,
+                "confirmed_ids": ["SRC-01"],
+                "summary": {"goal": "goal", "users_scenarios": "users", "in_scope": "in", "out_scope": "out", "key_rules": "rules", "ui_impact": "none", "open_questions": "none"},
+                "approved_at": "2026-08-21T00:00:00+08:00",
+            })
+            state["approvals"]["requirement_review"] = {
+                "stage": "requirement_review", "artifact_sha256": requirement_review_digest(state["requirement_review"]),
+                "approved_by": "owner", "approval_reference": "ref", "approval_text_sha256": "a" * 64,
+                "approved_at": "2026-08-21T00:00:00+08:00",
+            }
+            write_state(state_path, content, state)
+            prd = state_path.parent / "prd.md"
+            prd.write_text("界面影响: none\n", encoding="utf-8")
+            args = argparse.Namespace(
+                feature_id="product-receipt", root=str(root), stage="product", approved_by="owner",
+                approval_reference="product-ref", approval_text_sha256="c" * 64,
+            )
+            approve_stage.approve(args)
+            _, updated = extract_state(state_path)
+            prd_sha = hashlib.sha256(prd.read_bytes()).hexdigest()
+            self.assertEqual("not_applicable", updated["stages"]["prototype"]["status"])
+            self.assertEqual(prototype_decision_digest(prd_sha), updated["approvals"]["prototype"]["artifact_sha256"])
+            updated["approvals"]["prototype"]["artifact_sha256"] = "0" * 64
+            errors: list[str] = []
+            validate_v8_gates(root, "product-receipt", state_path.parent, updated, errors)
+            self.assertTrue(any("approvals.prototype is stale" in error for error in errors), errors)
+
+    def test_current_stage_must_point_to_earliest_incomplete_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "stage-coherence", "--root", str(root)], check=True)
+            state_path = root / "delivery/stage-coherence/state.md"
+            content, state = extract_state(state_path)
+            state["current_stage"] = "code"
+            write_state(state_path, content, state)
+            completed = subprocess.run(
+                [sys.executable, str(SCRIPTS / "validate_feature.py"), "stage-coherence", "--root", str(root)],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(0, completed.returncode)
+            self.assertIn("earliest incomplete stage: prd", completed.stdout)
+
     def test_invalidation_clears_the_sealed_contract_and_active_verification_claim(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -700,6 +1477,19 @@ class MigrationTests(unittest.TestCase):
             self.assertIsNone(state["proof_contract"]["seal"])
             self.assertEqual("stale", state["stages"]["verification"]["status"])
             self.assertFalse((state_path.parent / "proof-contract.json").exists())
+
+    def test_invalidation_write_failure_preserves_sealed_contract_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path, _ = prepare(root)
+            snapshot = state_path.parent / "proof-contract.json"
+            before_state = state_path.read_bytes()
+            before_snapshot = snapshot.read_bytes()
+            with patch.object(invalidate_downstream, "write_state", side_effect=OSError("disk full")):
+                with self.assertRaisesRegex(OSError, "disk full"):
+                    invalidate_downstream.invalidate(root, "kernel-test", "code_spec")
+            self.assertEqual(before_state, state_path.read_bytes())
+            self.assertEqual(before_snapshot, snapshot.read_bytes())
 
     def test_upgrade_dry_run_is_non_mutating_and_wrong_schema_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -743,19 +1533,68 @@ class MigrationTests(unittest.TestCase):
 
 
 class FinalizationTests(unittest.TestCase):
+    def test_real_v8_delivery_finalizes_and_passes_independent_final_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feature_id = "real-finalization"
+            state_path = prepare_approved_delivery(root, feature_id)
+            content, state = extract_state(state_path)
+            code_spec_sha = state["stages"]["code_spec"]["fingerprint"]
+            state["stages"]["code"].update({
+                "status": "completed",
+                "inputs": {"code_spec": code_spec_sha, "repositories": {}},
+                "result": {"repository_fingerprint": repository_fingerprint(root, feature_id)},
+                "simplicity_gate": {
+                    name: {"status": "N/A", "reason": "fixture has no production code change"}
+                    for name in ("delete", "kiss", "dry", "responsibility", "dependency")
+                },
+                "approved_at": "2026-08-21T00:00:00+08:00",
+            })
+            state["current_stage"] = "verification"
+            write_state(state_path, content, state)
+            inputs = root / ".dlv" / "inputs"
+            environment = inputs / "final-environment.json"
+            environment.write_text(json.dumps(ENV_SPEC), encoding="utf-8")
+            (inputs / "runtime-observation.json").write_text(
+                json.dumps({"draft_count": 0, "http_status": 200}), encoding="utf-8"
+            )
+            start(feature_id, root, "run-001", [f"ENV-01={environment}"])
+            result = inputs / "final-result.json"
+            anchor = inputs / "final-anchor.log"
+            anchor.write_text("deterministic boundary observation\n", encoding="utf-8")
+            result.write_text(json.dumps({
+                "po_id": "PO-01", "proof_type": "boundary", "outcome": "evaluate",
+                "anchors": [str(anchor)],
+            }), encoding="utf-8")
+            self.assertEqual("EVID-0001", record(feature_id, root, "run-001", result, []))
+            finalized = subprocess.run(
+                [sys.executable, str(SCRIPTS / "finalize_delivery.py"), feature_id, "--root", str(root)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(0, finalized.returncode, finalized.stdout + finalized.stderr)
+            self.assertIn("DELIVERY COMPLETE", finalized.stdout)
+            independent = subprocess.run(
+                [sys.executable, str(SCRIPTS / "validate_feature.py"), feature_id, "--root", str(root), "--final"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(0, independent.returncode, independent.stdout + independent.stderr)
+            self.assertIn("DELIVERY COMPLETE", independent.stdout)
+
     def test_finalizer_cli_failure_rolls_back_generated_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_path, _ = prepare(root, "finalizer-cli-failure")
             record("finalizer-cli-failure", root, "run-001", result_file(root), [])
             before = state_path.read_text(encoding="utf-8")
+            report_path = state_path.parent / "verification.md"
+            before_report = report_path.read_text(encoding="utf-8")
             completed = subprocess.run(
                 [sys.executable, str(SCRIPTS / "finalize_delivery.py"), "finalizer-cli-failure", "--root", str(root)],
                 capture_output=True, text=True,
             )
             self.assertEqual(1, completed.returncode)
             self.assertEqual(before, state_path.read_text(encoding="utf-8"))
-            self.assertFalse((state_path.parent / "verification.md").exists())
+            self.assertEqual(before_report, report_path.read_text(encoding="utf-8"))
 
     def test_finalizer_binds_run_and_generated_report(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -775,6 +1614,13 @@ class FinalizationTests(unittest.TestCase):
             self.assertEqual("PASS", state["stages"]["verification"]["verdict"])
             self.assertEqual([], errors)
             self.assertIn("EVID-0001", (state_path.parent / "verification.md").read_text())
+
+            original_token = finalization_token(state)
+            state["approvals"] = {"prd": {"stage": "prd", "artifact_sha256": "a" * 64}}
+            self.assertNotEqual(original_token, finalization_token(state))
+            approval_tamper_errors: list[str] = []
+            validate_finalization(state, approval_tamper_errors)
+            self.assertTrue(any("token is stale" in error for error in approval_tamper_errors))
 
             state["stages"]["verification"]["finalization"]["finalized_at"] = "2099-01-01T00:00:00Z"
             tamper_errors: list[str] = []

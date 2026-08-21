@@ -104,7 +104,7 @@ def main() -> int:
 
     feature_dir.mkdir(parents=True, exist_ok=True)
     state = {
-        "schema_version": 7,
+        "schema_version": 8,
         "feature_id": args.feature_id,
         "current_stage": "prd",
         "requirement_review": {
@@ -114,6 +114,8 @@ def main() -> int:
             "summary": None,
             "approved_at": None,
         },
+        "approvals": {},
+        "quality_reviews": {"architecture": None, "code_spec": None},
         "architecture_review": {
             "status": "pending",
             "inputs": {"prd": None, "prototype": None, "repositories": {}},

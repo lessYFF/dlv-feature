@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render and finalize schema-v7 delivery from one fresh Verification Run."""
+"""Render and finalize schema-v8 delivery from one fresh Verification Run."""
 
 from __future__ import annotations
 
@@ -27,9 +27,12 @@ def timestamp() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
-def validate(scripts: Path, feature_id: str, root: Path) -> subprocess.CompletedProcess[str]:
+def validate(scripts: Path, feature_id: str, root: Path, *, final: bool = False) -> subprocess.CompletedProcess[str]:
+    command = [sys.executable, str(scripts / "validate_feature.py"), feature_id, "--root", str(root)]
+    if final:
+        command.append("--final")
     return subprocess.run(
-        [sys.executable, str(scripts / "validate_feature.py"), feature_id, "--root", str(root)],
+        command,
         capture_output=True, text=True,
     )
 
@@ -66,8 +69,8 @@ def main() -> int:
         print("error: state.md is required", file=sys.stderr)
         return 2
     content, state = extract_state(state_path)
-    if state.get("schema_version") != 7:
-        print("error: finalize_delivery.py only accepts schema_version=7", file=sys.stderr)
+    if state.get("schema_version") != 8:
+        print("error: finalize_delivery.py only accepts schema_version=8", file=sys.stderr)
         return 2
     run_id = state.get("stages", {}).get("verification", {}).get("active_run_id")
     if not isinstance(run_id, str) or not run_id:
@@ -123,7 +126,7 @@ def main() -> int:
             state["last_updated"] = timestamp()
             write_state(state_path, content, state)
             expected_state = current_text(state_path)
-            final = validate(Path(__file__).resolve().parent, args.feature_id, root)
+            final = validate(Path(__file__).resolve().parent, args.feature_id, root, final=True)
             if final.returncode != 0:
                 raise ValueError(final.stdout.strip() or final.stderr.strip())
         except Exception as exc:
@@ -135,7 +138,7 @@ def main() -> int:
             print(f"error: finalization failed; safe rollback attempted: {exc}{suffix}", file=sys.stderr)
             return 1
     print(final.stdout, end="")
-    print(f"finalized: {state_path}")
+    print(f"DELIVERY COMPLETE: {state_path}")
     return 0
 
 

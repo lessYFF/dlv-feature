@@ -1,21 +1,23 @@
 # DLV Feature
 
+Current plugin version: **0.4.0** (schema v8).
+
 DLV Feature is a Codex skill for delivering a feature through one proof-carrying chain:
 
 ```text
-Requirement Review → PRD ↔ Approved Prototype → Architecture → Code Spec + Proof Contract → Code → Verification → Deterministic Finalization
+Requirement Approval → PRD ↔ Prototype Product Approval → Architecture Quality Review + Human Approval → Code Spec Quality Review + Human Approval → Sealed Proof Contract → Code → Verification → Deterministic Finalization
 ```
 
-It keeps product behavior, approved visual intent, technical decisions, implementation scope, and verification evidence separate. Schema v7 adds an immutable structured Proof Contract (`ENV/PO/ASRT`), target-runtime preflight, independent Verification Runs, append-only evidence with hashed anchors, generated reports, structured risks, and one deterministic completion entrypoint. A document or agent can no longer self-award `completed`.
+It keeps product behavior, approved visual intent, technical decisions, implementation scope, and verification evidence separate. Schema v8 adds fingerprint-bound approval receipts, independent Architecture and Code Spec quality reviews, schema-focused commented SQL, typed visual/runtime evidence, a report from Verification start, and an explicit final validation mode. A document, build, or agent can no longer self-award `completed`.
 
-Existing schema-v6 deliveries require a conservative review before resuming:
+Existing schema-v7 deliveries require a conservative review before resuming:
 
 ```bash
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v6_to_v7.py <feature-id> --root <project-root>
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v6_to_v7.py <feature-id> --root <project-root> --apply
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v7_to_v8.py <feature-id> --root <project-root>
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v7_to_v8.py <feature-id> --root <project-root> --apply
 ```
 
-The first command is a dry run. The applied upgrade preserves approved product/architecture truth, marks unsupported Code Spec/downstream claims stale, and requires a freshly sealed contract and Verification Run.
+The first command is a dry run. The applied upgrade preserves documents, raw evidence, and the Proof Contract draft's ENV/PO/ASRT definitions, but invalidates all v7 approvals, quality verdicts, seals, PASS, and finalization. V8 requires fresh human confirmation and verification.
 
 ## Install from this repository marketplace
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a schema-v7 Verification Run and append-only Evidence Bundle."""
+"""Validate a schema-v8 Verification Run and append-only Evidence Bundle."""
 
 from __future__ import annotations
 
@@ -23,7 +23,14 @@ from delivery_proof import (
     run_dir,
     value_digest,
 )
-from verification_run import active_records, contract_maps, run_digest
+from verification_run import (
+    MAX_ANCHOR_BYTES,
+    active_records,
+    contract_maps,
+    is_supported_image,
+    load_runtime_trace,
+    run_digest,
+)
 
 EVIDENCE_ID = re.compile(r"^EVID-[0-9]{4,}$")
 STATUSES = {"passed", "failed", "blocked"}
@@ -90,7 +97,7 @@ def validate_verification_run(
         errors.append("sealed proof-contract.json is missing or disagrees with state")
     obligations, environments = contract_maps(contract if isinstance(contract, dict) else {})
     contract_digest = proof_contract_digest(contract)
-    if metadata.get("schema_version") != 7 or metadata.get("feature_id") != feature_id or metadata.get("run_id") != run_id:
+    if metadata.get("schema_version") != 8 or metadata.get("feature_id") != feature_id or metadata.get("run_id") != run_id:
         errors.append("run.json identity does not match state")
     if metadata.get("contract_digest") != contract_digest:
         errors.append("verification run has a stale Proof Contract")
@@ -167,8 +174,8 @@ def validate_verification_run(
         if evidence_id in seen:
             errors.append(f"duplicate evidence: {evidence_id}")
         seen.add(evidence_id)
-        if record.get("schema_version") != 7:
-            errors.append(f"{evidence_id} schema_version must be 7")
+        if record.get("schema_version") != 8:
+            errors.append(f"{evidence_id} schema_version must be 8")
         recorded_hash = record.get("record_hash")
         payload = {key: value for key, value in record.items() if key != "record_hash"}
         if record.get("previous_hash") != previous_hash or recorded_hash != value_digest(payload):
@@ -235,15 +242,26 @@ def validate_verification_run(
                 errors.append(f"{evidence_id} command disagrees with the sealed PO runner")
         if not isinstance(record.get("observation"), dict):
             errors.append(f"{evidence_id} observation must be a structured object")
+        elif record.get("proof_type") == "runtime":
+            contracted_environment = environments.get(environment_id, {})
+            expected_runtime = contracted_environment.get("spec", {}).get("runtime")
+            if record["observation"].get("runtime") != expected_runtime:
+                errors.append(f"{evidence_id} runtime does not match its sealed target environment")
         anchors = record.get("anchors")
         if not isinstance(anchors, list) or not anchors:
             errors.append(f"{evidence_id} has no anchors")
         else:
             generated_payloads: dict[str, Any] = {}
+            anchor_roles: set[str] = set()
+            role_counts: dict[str, int] = {}
+            role_paths: dict[str, Path] = {}
             for anchor in anchors:
                 if not isinstance(anchor, dict) or not isinstance(anchor.get("path"), str):
                     errors.append(f"{evidence_id} has an invalid anchor")
                     continue
+                if isinstance(anchor.get("role"), str):
+                    anchor_roles.add(anchor["role"])
+                    role_counts[anchor["role"]] = role_counts.get(anchor["role"], 0) + 1
                 path = (destination / anchor["path"]).resolve()
                 try:
                     path.relative_to(destination.resolve())
@@ -252,8 +270,12 @@ def validate_verification_run(
                     continue
                 if not path.is_file():
                     errors.append(f"{evidence_id} anchor is missing: {anchor['path']}")
+                elif path.stat().st_size > MAX_ANCHOR_BYTES:
+                    errors.append(f"{evidence_id} anchor exceeds the size limit: {anchor['path']}")
                 elif anchor.get("sha256") != file_digest(path):
                     errors.append(f"{evidence_id} anchor hash mismatch: {anchor['path']}")
+                elif isinstance(anchor.get("role"), str):
+                    role_paths[anchor["role"]] = path
                 elif anchor["path"].endswith("-command.json"):
                     generated_payloads["command"] = load_json(path)
                 elif anchor["path"].endswith("-observation.json"):
@@ -261,6 +283,29 @@ def validate_verification_run(
             for generated_name in ("command", "observation"):
                 if generated_payloads.get(generated_name) != record.get(generated_name):
                     errors.append(f"{evidence_id} generated {generated_name} anchor disagrees with the manifest")
+            if record.get("proof_type") == "visual":
+                visual_roles = {"prototype_screenshot", "implementation_screenshot", "visual_diff"}
+                if not visual_roles <= anchor_roles or any(role_counts.get(role) != 1 for role in visual_roles):
+                    errors.append(f"{evidence_id} visual evidence requires exactly one anchor per screenshot/diff role")
+                visual_paths = [role_paths.get(role) for role in visual_roles]
+                if None not in visual_paths and len(set(visual_paths)) != len(visual_roles):
+                    errors.append(f"{evidence_id} visual screenshot/diff roles must use distinct files")
+                for role in visual_roles:
+                    path = role_paths.get(role)
+                    if path is not None and not is_supported_image(path):
+                        errors.append(f"{evidence_id} {role} is not a supported image")
+            if record.get("proof_type") == "runtime":
+                if role_counts.get("runtime_trace") != 1:
+                    errors.append(f"{evidence_id} runtime evidence requires exactly one runtime_trace role")
+                trace_path = role_paths.get("runtime_trace")
+                if trace_path is not None:
+                    try:
+                        trace = load_runtime_trace(trace_path)
+                    except ValueError as exc:
+                        errors.append(f"{evidence_id} {exc}")
+                    else:
+                        if trace != record.get("observation"):
+                            errors.append(f"{evidence_id} runtime_trace does not match its observation")
         replaced = record.get("supersedes")
         if not isinstance(replaced, list) or not all(isinstance(item, str) for item in replaced):
             errors.append(f"{evidence_id}.supersedes must be an array")

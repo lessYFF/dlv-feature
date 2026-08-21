@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create schema-v7 verification runs, append evidence, and render reports."""
+"""Create schema-v8 verification runs, append evidence, and render reports."""
 
 from __future__ import annotations
 
@@ -43,6 +43,31 @@ MAX_ANCHOR_BYTES = 10_485_760
 
 def timestamp() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def is_supported_image(path: Path) -> bool:
+    """Accept only PNG, JPEG, or WebP bytes, regardless of filename extension."""
+    try:
+        with path.open("rb") as handle:
+            header = handle.read(16)
+    except OSError:
+        return False
+    return (
+        header.startswith(b"\x89PNG\r\n\x1a\n")
+        or header.startswith(b"\xff\xd8\xff")
+        or (len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP")
+    )
+
+
+def load_runtime_trace(path: Path) -> dict[str, Any]:
+    """Load the structured trace that must mirror the runner-derived observation."""
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"runtime_trace anchor must be valid JSON: {path}") from exc
+    if not isinstance(value, dict):
+        raise ValueError(f"runtime_trace anchor must contain a JSON object: {path}")
+    return value
 
 
 def redact_text(value: str) -> str:
@@ -201,8 +226,8 @@ def start(feature_id: str, root: Path, run_id: str, environment_args: list[str])
 def _start_locked(feature_id: str, root: Path, run_id: str, environment_args: list[str]) -> Path:
     state_path = root / "delivery" / feature_id / "state.md"
     content, state = extract_state(state_path)
-    if state.get("schema_version") != 7:
-        raise ValueError("verification runs require schema_version=7")
+    if state.get("schema_version") != 8:
+        raise ValueError("verification runs require schema_version=8")
     contract = state.get("proof_contract")
     if not isinstance(contract, dict) or contract.get("status") != "completed":
         raise ValueError("proof contract must be completed and sealed before starting Verification")
@@ -266,7 +291,7 @@ def _start_locked(feature_id: str, root: Path, run_id: str, environment_args: li
                 "sha256": file_digest(result_path),
             })
     metadata = {
-        "schema_version": 7,
+        "schema_version": 8,
         "feature_id": feature_id,
         "run_id": run_id,
         "created_at": timestamp(),
@@ -293,6 +318,7 @@ def _start_locked(feature_id: str, root: Path, run_id: str, environment_args: li
     state["current_stage"] = "verification"
     state["last_updated"] = timestamp()
     write_state(state_path, content, state)
+    render_locked(feature_id, root, run_id)
     if metadata["preflight_verdict"] != "PASS":
         raise ValueError(f"environment preflight blocked run: {destination}")
     return destination
@@ -420,7 +446,7 @@ def _record_locked(feature_id: str, root: Path, run_id: str, result_path: Path, 
             "timed_out": completed["timed_out"],
         }
         adapter = command_input.get("observation_adapter")
-        if adapter == "json_stdout":
+        if adapter in {"json_stdout", "visual_bundle", "runtime_trace"}:
             try:
                 observation = json.loads(completed["stdout"])
             except json.JSONDecodeError as exc:
@@ -434,6 +460,46 @@ def _record_locked(feature_id: str, root: Path, run_id: str, result_path: Path, 
     else:
         command = {"argv": command_input["argv"], "cwd": command_cwd.relative_to(root).as_posix() or ".", "exit_code": None, "stdout": "", "stderr": ""}
         observation = {"blocked_reason": result.get("blocked_reason")}
+    proof_type = obligation.get("proof_type")
+    if requested_outcome == "evaluate" and proof_type == "visual":
+        required = {
+            "viewport", "dpr", "font_fingerprints", "pixel_diff_ratio",
+            "geometry_diff_max", "forbidden_elements_count",
+        }
+        missing = sorted(required - observation.keys())
+        if missing:
+            raise ValueError(f"visual_bundle observation missing: {', '.join(missing)}")
+        if not isinstance(observation["viewport"], (str, dict)) or not observation["viewport"]:
+            raise ValueError("visual_bundle viewport must be concrete")
+        if not isinstance(observation["dpr"], (int, float)) or isinstance(observation["dpr"], bool) or observation["dpr"] <= 0:
+            raise ValueError("visual_bundle dpr must be a positive number")
+        fonts = observation["font_fingerprints"]
+        if not isinstance(fonts, list) or not fonts or not all(isinstance(value, str) and value for value in fonts):
+            raise ValueError("visual_bundle font_fingerprints must be a non-empty string array")
+        pixel = observation["pixel_diff_ratio"]
+        geometry = observation["geometry_diff_max"]
+        forbidden = observation["forbidden_elements_count"]
+        if not isinstance(pixel, (int, float)) or isinstance(pixel, bool) or not 0 <= pixel <= 1:
+            raise ValueError("visual_bundle pixel_diff_ratio must be between 0 and 1")
+        if not isinstance(geometry, (int, float)) or isinstance(geometry, bool) or geometry < 0:
+            raise ValueError("visual_bundle geometry_diff_max must be non-negative")
+        if not isinstance(forbidden, int) or isinstance(forbidden, bool) or forbidden < 0:
+            raise ValueError("visual_bundle forbidden_elements_count must be a non-negative integer")
+    if requested_outcome == "evaluate" and proof_type == "runtime":
+        required = {"runtime", "action", "result_readback"}
+        missing = sorted(required - observation.keys())
+        if missing:
+            raise ValueError(f"runtime_trace observation missing: {', '.join(missing)}")
+        if not all(isinstance(observation[field], str) and observation[field].strip() for field in ("runtime", "action")):
+            raise ValueError("runtime_trace runtime and action must be concrete")
+        environment_id = obligation.get("environment_id")
+        snapshot = metadata.get("environments", {}).get(environment_id)
+        expected_runtime = snapshot.get("spec", {}).get("runtime") if isinstance(snapshot, dict) else None
+        if observation["runtime"] != expected_runtime:
+            raise ValueError("runtime_trace runtime must match the sealed target environment runtime")
+        readback = observation["result_readback"]
+        if readback is None or readback == "" or readback == {} or readback == []:
+            raise ValueError("runtime_trace result_readback must be non-empty")
     evidence_source = {"command": command, "observation": observation}
 
     assertion_contract = {
@@ -489,25 +555,58 @@ def _record_locked(feature_id: str, root: Path, run_id: str, result_path: Path, 
         target = anchor_dir / f"{evidence_id.lower()}-{name}"
         atomic_write_text(target, payload)
         stored_anchors.append({"path": target.relative_to(destination).as_posix(), "sha256": file_digest(target), "size": target.stat().st_size})
-    for index, raw in enumerate(anchors, 1):
-        source = Path(str(raw)).expanduser().resolve()
+    roles: set[str] = set()
+    role_counts: dict[str, int] = {}
+    normalized_anchors: list[tuple[str | None, Path]] = []
+    for raw in anchors:
+        if isinstance(raw, dict):
+            role = raw.get("role")
+            source_value = raw.get("path")
+            if not isinstance(role, str) or not role.strip() or not isinstance(source_value, str):
+                raise ValueError("structured anchors require role and path")
+            roles.add(role)
+            role_counts[role] = role_counts.get(role, 0) + 1
+            normalized_anchors.append((role, Path(source_value).expanduser().resolve()))
+        else:
+            normalized_anchors.append((None, Path(str(raw)).expanduser().resolve()))
+    if requested_outcome == "evaluate" and proof_type == "visual":
+        required_roles = {"prototype_screenshot", "implementation_screenshot", "visual_diff"}
+        if not required_roles <= roles:
+            raise ValueError("visual evidence requires prototype_screenshot, implementation_screenshot, and visual_diff anchors")
+        if any(role_counts.get(role) != 1 for role in required_roles):
+            raise ValueError("visual evidence requires exactly one anchor for each screenshot/diff role")
+        visual_sources = {source for role, source in normalized_anchors if role in required_roles}
+        if len(visual_sources) != len(required_roles):
+            raise ValueError("visual evidence requires three distinct screenshot/diff anchor files")
+    if requested_outcome == "evaluate" and proof_type == "runtime":
+        if role_counts.get("runtime_trace") != 1:
+            raise ValueError("runtime evidence requires exactly one runtime_trace anchor")
+    for index, (role, source) in enumerate(normalized_anchors, 1):
         if not source.is_file():
             raise ValueError(f"anchor does not exist: {source}")
         if source.stat().st_size > MAX_ANCHOR_BYTES:
             raise ValueError(f"anchor exceeds {MAX_ANCHOR_BYTES} bytes: {source}")
+        if role in {"prototype_screenshot", "implementation_screenshot", "visual_diff"}:
+            if source.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"} or not is_supported_image(source):
+                raise ValueError(f"visual anchor must contain a supported image: {source}")
+        if role == "runtime_trace" and load_runtime_trace(source) != observation:
+            raise ValueError("runtime_trace anchor must match the runner-derived observation")
         target = anchor_dir / f"{evidence_id.lower()}-{index}-{source.name}"
         shutil.copyfile(source, target)
         target.chmod(0o600)
-        stored_anchors.append({
+        stored = {
             "path": target.relative_to(destination).as_posix(),
             "sha256": file_digest(target),
             "size": target.stat().st_size,
-        })
+        }
+        if role is not None:
+            stored["role"] = role
+        stored_anchors.append(stored)
 
     environment_id = obligation.get("environment_id")
     snapshot = metadata.get("environments", {}).get(environment_id)
     record_value = {
-        "schema_version": 7,
+        "schema_version": 8,
         "evidence_id": evidence_id,
         "recorded_at": timestamp(),
         "po_id": po_id,
@@ -528,7 +627,7 @@ def _record_locked(feature_id: str, root: Path, run_id: str, result_path: Path, 
     record_value["previous_hash"] = previous_hash
     record_value["record_hash"] = value_digest(record_value)
     atomic_write_text(destination / "pending-record.json", json.dumps({
-        "schema_version": 7,
+        "schema_version": 8,
         "request_digest": value_digest({"result": result, "supersedes": supersedes}),
         "previous_count": len(existing),
         "previous_head": previous_hash,
@@ -571,8 +670,8 @@ def render(feature_id: str, root: Path, run_id: str) -> Path:
 def render_locked(feature_id: str, root: Path, run_id: str) -> Path:
     state = extract_state(root / "delivery" / feature_id / "state.md")[1]
     verification = state.get("stages", {}).get("verification", {})
-    if verification.get("active_run_id") != run_id or verification.get("status") != "in_progress":
-        raise ValueError("only the active in-progress Verification Run may render the report")
+    if verification.get("active_run_id") != run_id or verification.get("status") not in {"in_progress", "blocked"}:
+        raise ValueError("only the active Verification Run may render the report")
     contract = state.get("proof_contract", {})
     obligations, _ = contract_maps(contract if isinstance(contract, dict) else {})
     destination = run_dir(root, feature_id, run_id)
@@ -580,6 +679,9 @@ def render_locked(feature_id: str, root: Path, run_id: str) -> Path:
     records = load_manifest(destination / "evidence.jsonl")
     active = active_records(records)
     risks = state.get("risks", []) if isinstance(state.get("risks"), list) else []
+    display_status = verification.get("verdict") or (
+        "BLOCKED" if verification.get("status") == "blocked" else "PENDING"
+    )
     rows = []
     for item in active:
         assertions = ", ".join(
@@ -606,7 +708,7 @@ def render_locked(feature_id: str, root: Path, run_id: str) -> Path:
         ", ".join(assertion.get("id", "") for assertion in item.get("assertions", [])),
     )) + " |" for po_id, item in obligations.items()]
     risk_rows = ["| " + " | ".join(md_cell(item.get(key)) for key in (
-        "id", "type", "severity", "status", "statement", "owner",
+        "id", "type", "severity", "status", "statement", "owner", "accepted_by", "acceptance_reference",
     )) + " |" for item in risks if isinstance(item, dict)]
     title = feature_id.replace("-", " ") + " 功能"
     content = f"""# {title} — 测试与验收报告
@@ -666,13 +768,13 @@ def render_locked(feature_id: str, root: Path, run_id: str) -> Path:
 
 ## 7. 问题与风险
 
-| 风险 | 类型 | 严重度 | 状态 | 描述 | Owner |
-|---|---|---|---|---|---|
-{chr(10).join(risk_rows) if risk_rows else '| — | residual | low | closed | 无已知未解决风险 | — |'}
+| 风险 | 类型 | 严重度 | 状态 | 描述 | Owner | 接受人 | 接受依据 |
+|---|---|---|---|---|---|---|---|
+{chr(10).join(risk_rows) if risk_rows else '| — | residual | low | closed | 无已知未解决风险 | — | — | — |'}
 
 ## 8. 验收结论
 
-最终裁决由 `finalize_delivery.py` 在 fresh run、全断言通过且无 open blocker 时写入；当前状态：`{state.get('stages', {}).get('verification', {}).get('verdict') or 'PENDING'}`。
+最终裁决由 `finalize_delivery.py` 在 fresh run、全断言通过且无 open blocker 时写入；当前状态：`{display_status}`。
 """
     output = root / "delivery" / feature_id / "verification.md"
     atomic_write_text(output, content)
