@@ -9,7 +9,7 @@
 1. 为每个 `ENV-*` 生成与合同 `spec` 完全一致的 JSON；其中 `preflight` 命令必须能核对目标工具、运行时、服务、端口或凭证可用性。
 2. 用 `verification_run.py start` 创建唯一 run。脚本核对合同 seal、Git 代码指纹和环境 spec，并实际执行全部 preflight。validator 会从每个 contracted check 及其哈希锚点重算身份、argv、exit code 和状态，不信任顶层 PASS 汇总。失败形成 blocked run，不修改业务代码规避环境。
 3. 按 PO 声明的 `visual/runtime/boundary/invariant/artifact` 强度执行完整任务。source、mock、build、DOM 存在不能代替更高层结果。
-4. 命令的 `argv/cwd/observation_adapter/timeout_seconds` 固化在 sealed PO runner。每次执行的 result 只写 `po_id/proof_type/outcome/blocked_reason/anchors/supersedes`；禁止调用方替换命令或写 exit code、stdout/stderr、observation、status、skip 或 assertion_results。recorder 实际执行 sealed runner，从 stdout 解析 observation，再按 `ASRT-*` oracle source 计算断言与 PO 状态。
+4. 命令的 `argv/cwd/observation_adapter/timeout_seconds` 固化在 sealed PO runner。每次执行的 result 只写 `po_id/proof_type/outcome/blocked_reason/anchors`；历史替代关系只能通过 recorder 的 `--supersedes EVID-*` 参数声明。禁止调用方替换命令或在 result 中写 exit code、stdout/stderr、observation、status、skip、assertion_results 或 supersedes。recorder 实际执行 sealed runner，从 stdout 解析 observation，再按 `ASRT-*` oracle source 计算断言与 PO 状态。
 5. 只用 `verification_run.py record` 追加。脚本用跨平台 run lock 串行化 writer，限制执行时间和保留输出大小，清理常见 secret，分配 `EVID-*`、以权限 `0600` 复制有大小上限的锚点、记录 SHA-256，并通过 `pending-record.json` 写前日志完成 JSONL + state head 事务。进程中断后同一 result 重试会幂等恢复。禁止直接编辑 manifest。
 6. 失败重跑不删除历史；新记录必须用 `--supersedes EVID-*` 明确替代同一 PO 的旧记录。未替代的 failed/blocked 与并存多条 active evidence 都阻止 PASS。
 

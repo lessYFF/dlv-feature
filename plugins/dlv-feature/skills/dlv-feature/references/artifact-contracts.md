@@ -108,7 +108,7 @@ CREATE INDEX idx_follow_up_completed_result
 
 `.dlv/runs/{feature-id}/{run-id}/run.json` 由 start 命令创建，包含：schema/feature/run identity、创建时间、contract digest、code fingerprint、每个 ENV 的结构化 snapshot/digest、preflight 结果及其锚点哈希。run 不进入代码 fingerprint。
 
-`evidence.jsonl` 仅由 record 命令 append，每行一个 canonical JSON object。调用方只提供 PO identity、`evaluate|blocked` outcome、可选 blocked reason、额外 anchors 和 supersedes；recorder 只能执行 sealed PO runner，并生成 `command/observation/status/assertion_results/previous_hash/record_hash`：
+`evidence.jsonl` 仅由 record 命令 append，每行一个 canonical JSON object。result JSON 只提供 PO identity、`evaluate|blocked` outcome、可选 blocked reason 和额外 anchors；supersedes 只通过 record CLI 的 `--supersedes EVID-*` 参数声明。recorder 只能执行 sealed PO runner，并生成 `command/observation/status/assertion_results/previous_hash/record_hash`：
 
 ```json
 {
@@ -121,13 +121,14 @@ CREATE INDEX idx_follow_up_completed_result
   "code_fingerprint": "<sha256>",
   "environment_id": "ENV-01",
   "environment_digest": "<sha256>",
-  "command": {"argv": ["python3", "tests/verify_task_kpi.py", "--json"], "cwd": ".", "exit_code": 0, "timed_out": false},
+  "command": {"argv": ["python3", "tests/verify_task_kpi.py", "--json"], "cwd": ".", "exit_code": 0, "stdout": "{\"draft_kpi_count\": 0}", "stderr": "", "timed_out": false},
   "assertion_results": [
     {"assertion_id": "ASRT-01", "status": "passed", "actual": 0}
   ],
   "observation": {"draft_kpi_count": 0},
   "anchors": [
-    {"path": "anchors/evid-0001-1-result.json", "sha256": "<sha256>", "size": 128}
+    {"path": "anchors/evid-0001-command.json", "sha256": "<sha256>", "size": 256},
+    {"path": "anchors/evid-0001-observation.json", "sha256": "<sha256>", "size": 32}
   ],
   "supersedes": [],
   "previous_hash": "<sha256>",

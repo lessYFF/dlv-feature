@@ -122,7 +122,7 @@ Any contract mutation breaks its seal. To change it, invalidate Code Spec and cr
      --environment ENV-01=/abs/env-01.json
    ```
 
-3. Execute the strongest applicable check through the recorder. Result JSON contains only `po_id`, `proof_type`, `outcome=evaluate|blocked`, optional `blocked_reason`, optional extra file anchors, and `supersedes`; command argv/cwd/adapter are immutable fields of the sealed PO runner. Do not provide command, command results, observation, PASS/FAIL, or assertion results. The recorder executes the sealed runner with a bounded timeout/output capture, derives observation, resolves each oracle source, and computes the verdict.
+3. Execute the strongest applicable check through the recorder. Result JSON contains only `po_id`, `proof_type`, `outcome=evaluate|blocked`, optional `blocked_reason`, and optional extra file anchors; command argv/cwd/adapter are immutable fields of the sealed PO runner. Do not provide command, command results, observation, PASS/FAIL, assertion results, or supersession claims in the result file. The recorder executes the sealed runner with a bounded timeout/output capture, derives observation, resolves each oracle source, and computes the verdict.
 4. Append it through the recorder; the recorder assigns `EVID-*`, copies anchors, hashes them, and never rewrites history:
 
    ```bash
