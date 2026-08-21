@@ -16,7 +16,7 @@
    - UI 影响：`visible / non_visible / none`；
    - 待决问题与推荐项（推荐不是事实）。
 4. 用户修改时更新摘要；未明确确认前不得创建完整 `prd.md`。
-5. 确认后将 `requirement_review.status=completed`，保存 `source_fingerprint`、`confirmed_ids`、压缩摘要和 `approved_at`。
+5. 确认通过 `approve_stage.py requirement_review` 写入指纹绑定回执；回执包含批准人、引用、确认文本 SHA-256 和时间，脚本才将 review 置为 completed。
 
 ## PRD 生成
 
@@ -52,4 +52,4 @@ PRD UI 初稿 ↔ 原型实验 → 差异收口 → 最终 PRD
 
 ## 批准与状态
 
-展示目标、IN/OUT、关键规则、验收、UI/原型结论、需求追踪和 gaps。明确批准后存储 PRD 指纹和时间，设置 `prd=completed`；Prototype 已生成则记录完成，否则设为 `not_applicable`，两种情况的 `stages.prototype.inputs.prd` 都必须记录当前 PRD 指纹；进入 Architecture。
+展示目标、IN/OUT、关键规则、验收、UI/原型结论、需求追踪和 gaps。使用 `approve_stage.py product` 做一次产品确认：同时绑定最终 PRD 与 Prototype 决策的独立指纹、批准人、引用、确认文本 SHA-256 和时间。脚本设置 `prd=completed`；Prototype 已生成则 receipt 绑定 HTML 指纹，否则设为 `not_applicable` 且 receipt 绑定 `{status:not_applicable, prd_sha256}` 的规范化 digest。两种情况的 `stages.prototype.inputs.prd` 都记录当前 PRD 指纹；进入 Architecture。任一产品产物或不做原型的依据改变都必须重新确认。

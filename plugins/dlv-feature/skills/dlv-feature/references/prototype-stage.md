@@ -31,6 +31,6 @@
 - 每个 UI `AC-* / EX-*` 都能定位到一个具体控件、动作或可见状态，不能只由 Story 容器笼统覆盖；
 - PRD 指纹、HTML 指纹、真实来源、Story、状态、视口、禁止元素和偏差写入 `state.md -> stages.prototype.contract`，并声明 `visual_truth=true`；
 - PRD 与原型差异已收口；
-- 用户批准当前 UI 意图。
+- 用户在最终 Product Gate 中与 PRD 一次性批准当前 UI 意图，并分别绑定两个产物指纹。
 
 完成后回到 PRD 最终确认门，不直接进入 Architecture。无需对文本 PRD 做像素比较；最终实现必须在同视口、状态、数据、字体和终端条件下与批准原型进行结构、关键几何和感知视觉 diff。原型变化导致 PRD 同步时，刷新 PRD 指纹并按上游变化传播 stale。

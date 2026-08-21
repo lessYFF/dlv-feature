@@ -8,7 +8,9 @@ description: Run a repository-agnostic, proof-carrying feature delivery workflow
 Deliver one feature through one truth chain:
 
 ```text
-Requirement Review → PRD ↔ Prototype → Architecture → Code Spec
+Requirement Review approval → PRD ↔ Prototype product approval
+→ Architecture → Architecture Quality Review → human approval
+→ Code Spec + Proof Contract draft → Code Spec Quality Review → human approval
 → Immutable Proof Contract → Code → Verification Run → Evidence Bundle → Verdict
 ```
 
@@ -48,14 +50,14 @@ Immutable Truth → Structured Assertion → Machine Evidence → Deterministic 
    ```
 
 6. Read the JSON state block, then load only the current stage guide and direct inputs.
-7. Require `schema_version=7`. For an existing v6 delivery, preview and then apply the conservative upgrade only after approval:
+7. Require `schema_version=8`. For an existing v7 delivery, preview and then apply the conservative upgrade:
 
    ```bash
-   python3 <skill-dir>/scripts/upgrade_v6_to_v7.py <feature-id> --root <project-root>
-   python3 <skill-dir>/scripts/upgrade_v6_to_v7.py <feature-id> --root <project-root> --apply
+   python3 <skill-dir>/scripts/upgrade_v7_to_v8.py <feature-id> --root <project-root>
+   python3 <skill-dir>/scripts/upgrade_v7_to_v8.py <feature-id> --root <project-root> --apply
    ```
 
-   The upgrade preserves earlier product/architecture truth, stales Code Spec and downstream claims, and requires a new structured Proof Contract and fresh run.
+   The upgrade preserves documents and raw evidence, but never promotes v7 approvals, quality verdicts, Proof Contract seals, PASS, or finalization into v8.
 
 ## Artifacts
 
@@ -80,11 +82,13 @@ Execution evidence stays outside the truth documents:
 ├── evidence.jsonl        # append-only, script-generated
 ├── preflight/*.json
 └── anchors/*             # copied evidence with SHA-256
+
+.dlv/reviews/{feature-id}/{review-run-id}.json  # immutable quality-review record
 ```
 
 Do not hand-edit run metadata, the manifest, or generated Verification. Do not create parallel matrices, capsules, checklists, snapshots, or informal evidence ledgers.
 
-Formal Markdown uses concise Chinese titles, a TOC before numbered sections, and only applicable sections. Architecture database shape must be shown with fenced `sql` DDL (`CREATE/ALTER TABLE`, constraints, and indexes); never use a Markdown field table as a schema substitute.
+Formal Markdown uses concise Chinese titles, a TOC before numbered sections, and only applicable sections. Architecture database shape uses commented fenced `sql` schema DDL: columns, types, null/default, constraints and indexes. It must not contain migration execution machinery such as `DO`, `EXECUTE`, loops, tenant iteration, DML, schema creation/drop, or migration numbering.
 
 ## Stage Routing
 
@@ -98,15 +102,34 @@ Formal Markdown uses concise Chinese titles, a TOC before numbered sections, and
 
 Visible UI work also reads [prototype-stage.md](references/prototype-stage.md) during PRD. Follow [workflow.md](references/workflow.md) for transitions and [artifact-contracts.md](references/artifact-contracts.md) for schemas.
 
+## Human confirmations
+
+Every confirmation writes an exact fingerprint-bound receipt. Hash the actual confirmation text, never a paraphrase supplied by the agent:
+
+```bash
+python3 <skill-dir>/scripts/approve_stage.py requirement_review <feature-id> --root <project-root> --approved-by <identity> --approval-reference <ref> --approval-text-sha256 <sha256>
+python3 <skill-dir>/scripts/approve_stage.py product <feature-id> --root <project-root> --approved-by <identity> --approval-reference <ref> --approval-text-sha256 <sha256>
+```
+
+The Product command approves the final PRD and either the exact Prototype or an explicit not-applicable decision. Architecture and Code Spec confirmations occur only after their quality reviews, as described below.
+
 ## Proof Contract
 
 Each `PO-*` has exactly one proof type (`visual`, `runtime`, `boundary`, `invariant`, or `artifact`), one `ENV-*`, explicit upstream `trace_ids`, and one or more `ASRT-*` assertions. Each assertion has a description and structured oracle (`kind`, JSON-pointer `source`, `operator`, and expected value where applicable). Free-text `expected` and caller-supplied assertion status are not a contract.
 
-Each `ENV-*` contains a structured target spec and executable preflight commands. After Code Spec approval, seal once:
+Each `ENV-*` contains a structured target spec and executable preflight commands. Architecture and Code Spec each require an independent quality review before human approval. Review findings use `ARQ-*` or `CSQ-*`; open critical/major findings forbid `PASS`:
 
 ```bash
-python3 <skill-dir>/scripts/seal_proof_contract.py <feature-id> --root <project-root> \
-  --approved-by <identity> --approval-reference <review-or-message-id>
+python3 <skill-dir>/scripts/quality_review.py architecture <feature-id> --root <project-root> --run-id <run-id> --result /abs/review.json
+python3 <skill-dir>/scripts/approve_stage.py architecture <feature-id> --root <project-root> --approved-by <identity> --approval-reference <ref> --approval-text-sha256 <sha256>
+python3 <skill-dir>/scripts/quality_review.py code_spec <feature-id> --root <project-root> --run-id <run-id> --result /abs/review.json
+python3 <skill-dir>/scripts/approve_stage.py code_spec <feature-id> --root <project-root> --approved-by <identity> --approval-reference <ref> --approval-text-sha256 <sha256>
+```
+
+The Code Spec approval binds the exact Code Spec, quality review, and Proof Contract draft, and authorizes implementation within that scope. Then seal once without accepting new approval arguments:
+
+```bash
+python3 <skill-dir>/scripts/seal_proof_contract.py <feature-id> --root <project-root>
 ```
 
 Any contract mutation breaks its seal. To change it, invalidate Code Spec and create a new contract; never reseal a completed contract in place.
@@ -136,7 +159,7 @@ Any contract mutation breaks its seal. To change it, invalidate Code Spec and cr
    ... record ... --supersedes EVID-0001
    ```
 
-6. Render is optional during iteration and only accepts the active in-progress run; it shares the feature/run locks with recorder and finalizer. The finalizer always regenerates the report:
+6. Start immediately generates a pending or blocked `verification.md`; render can refresh the active report during iteration. The finalizer always regenerates it:
 
    ```bash
    python3 <skill-dir>/scripts/verification_run.py render <feature-id> --root <project-root> --run-id <run-id>
@@ -158,7 +181,7 @@ Environment/tool/network/credential failures are `blocked`, never PASS and never
 ## Authorization and Recovery
 
 - Documentation writes stay under `delivery/{feature-id}/`; machine run data stays under `.dlv/runs/`.
-- Require explicit approval for requirement review, final PRD, material architecture decisions, Code Spec/Proof Contract, product-code scope, durable tests, and external mutations.
+- Use exactly four delivery confirmation points: requirement review; final PRD plus Prototype decision; Architecture after a fresh PASS Architecture Quality Review; Code Spec plus Proof Contract draft after a fresh PASS Code Spec Quality Review. The fourth confirmation authorizes implementation within the bound scope. External mutations still require their own authorization.
 - Keep approved PRD, Architecture, Code Spec, and Proof Contract immutable. Plan/actual differences are evidence, not retroactive plan edits.
 - Preserve unrelated user changes and avoid destructive Git operations.
 - Recover from `state.md → current artifact/contract → active run → manifest/anchors → repository evidence`.
@@ -177,6 +200,7 @@ Do not set Verification to completed or PASS by hand. The finalizer locks the ac
 
 ```bash
 python3 <skill-dir>/scripts/finalize_delivery.py <feature-id> --root <project-root>
+python3 <skill-dir>/scripts/validate_feature.py <feature-id> --root <project-root> --final
 ```
 
 Finish only when all stages are fresh, every contracted assertion has current passing evidence, boundary/runtime missions pass, and no open blocker remains. Report changed code, executed checks, residual risks, and artifact paths; never claim deployment without deployment evidence.

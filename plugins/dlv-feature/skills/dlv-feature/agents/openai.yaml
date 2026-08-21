@@ -1,4 +1,4 @@
 interface:
   display_name: "DLV Feature"
   short_description: "以证明义务、视觉一致性和真实运行时证据驱动端到端功能交付"
-  default_prompt: "Use $dlv-feature to deliver this feature with schema-v7 sealed assertions, a fresh target-runtime Verification Run, hashed evidence, and deterministic finalization."
+  default_prompt: "Use $dlv-feature to deliver this feature with schema-v8 fingerprint-bound approvals, Architecture and Code Spec quality reviews, typed target-runtime evidence, and deterministic finalization."
