@@ -1,264 +1,319 @@
 #!/usr/bin/env python3
-"""Validate exact verification evidence, including executable boundary proofs."""
+"""Validate a schema-v7 Verification Run and append-only Evidence Bundle."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import sys
 from pathlib import Path
 from typing import Any
 
-from delivery_proof import code_result_digest, proof_contract_digest, value_digest
-
-
-EVIDENCE_ID = re.compile(r"^EVID-[0-9]+$")
-TRACE_ID = re.compile(
-    r"\b(?:AC|EX)-[0-9]+\b|\bR-D[0-9]{2,}-[0-9]+\b|\bT-B[0-9]{2,}-[0-9]+\b|"
-    r"\bB[0-9]{2,}\b|\b(?:CONTRACT|SHAPE)-[A-Za-z0-9][A-Za-z0-9-]*\b|\bBP-[0-9]+\b|\bPO-[0-9]+\b"
+from delivery_proof import (
+    MISSING,
+    extract_state,
+    evaluate_oracle,
+    file_digest,
+    load_json,
+    load_manifest,
+    proof_contract_digest,
+    repository_fingerprint,
+    resolve_source,
+    run_dir,
+    value_digest,
 )
-RANGE_ID = re.compile(
-    r"\b(?:AC|EX|FR|BR|R-D[0-9]{2,}|T-B[0-9]{2,}|B|BP)-[0-9]+\s*"
-    r"(?:~|～|—|–|\.\.|至|-(?![A-Za-z]))\s*(?:(?:AC|EX|FR|BR|BP)-)?[0-9]+\b"
-)
-STATUSES = {"passed", "failed", "blocked", "skipped", "stale"}
-PROOF_TYPES = {"visual", "runtime", "boundary", "invariant", "artifact"}
-REQUIRED_HEADERS = {
-    "证据", "证明义务", "覆盖", "证明类型", "环境", "指纹",
-    "命令或步骤", "状态", "退出码", "观察结果", "锚点",
-}
-DIRECT_PROBE = re.compile(r"(?:\bdirect\b|直接|curl|http|postman|api\s*(?:call|请求)|playwright)", re.I)
-OBSERVED_BOUNDARY = re.compile(
-    r"(?:\b(?:200|201|400|401|403|404|409|500)\b|status|状态|payload|响应|body|"
-    r"零写入|zero\s+(?:write|side effect)|service\s+not\s+invoked|未调用|"
-    r"敏感字段|absent|不包含|快照|source|来源变更|扰动)",
-    re.I,
-)
-PROOF_SIGNALS = {
-    "visual": re.compile(r"(?:screenshot|截图|pixel|像素|visual\s*diff|视觉差异|overlay)", re.I),
-    "runtime": re.compile(r"(?:playwright|开发者工具|devtools|真机|runtime|运行时|点击|click)", re.I),
-    "boundary": DIRECT_PROBE,
-    "invariant": re.compile(r"(?:test|测试|query|查询|assert|断言|invariant|不变量)", re.I),
-    "artifact": re.compile(r"(?:build|构建|bundle|dist|artifact|产物|hash|哈希)", re.I),
-}
-FINGERPRINT = re.compile(r"\b(truth|code|env)=([0-9a-f]{64})\b")
+from verification_run import active_records, contract_maps, run_digest
+
+EVIDENCE_ID = re.compile(r"^EVID-[0-9]{4,}$")
+STATUSES = {"passed", "failed", "blocked"}
 
 
-def _read_state(feature_dir: Path) -> dict[str, Any]:
-    content = (feature_dir / "state.md").read_text(encoding="utf-8")
-    match = re.search(r"<!-- DLV_STATE_START -->\s*```json\s*\n([\s\S]*?)\n```\s*<!-- DLV_STATE_END -->", content)
-    if not match:
-        raise ValueError("state.md has no valid DLV JSON block")
-    return json.loads(match.group(1))
-
-
-def _sections(text: str) -> dict[str, str]:
-    matches = list(re.finditer(r"(?m)^##\s+(.+?)\s*$", text))
-    return {
-        match.group(1).strip(): text[match.end(): matches[index + 1].start() if index + 1 < len(matches) else len(text)].strip()
-        for index, match in enumerate(matches)
-    }
-
-
-def _tables(content: str) -> list[tuple[list[str], list[list[str]]]]:
-    lines, result, index = content.splitlines(), [], 0
-    separator = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$")
-    while index + 1 < len(lines):
-        if "|" not in lines[index] or not separator.fullmatch(lines[index + 1]):
-            index += 1
+def validate_risks(state: dict[str, Any], errors: list[str]) -> None:
+    risks = state.get("risks")
+    if not isinstance(risks, list):
+        errors.append("risks must be an array")
+        return
+    seen: set[str] = set()
+    for index, item in enumerate(risks):
+        prefix = f"risks[{index}]"
+        if not isinstance(item, dict):
+            errors.append(f"{prefix} must be an object")
             continue
-        headers = [cell.strip() for cell in lines[index].strip().strip("|").split("|")]
-        rows: list[list[str]] = []
-        index += 2
-        while index < len(lines) and "|" in lines[index] and lines[index].strip():
-            row = [cell.strip() for cell in lines[index].strip().strip("|").split("|")]
-            if len(row) == len(headers):
-                rows.append(row)
-            index += 1
-        result.append((headers, rows))
-    return result
+        risk_id = item.get("id")
+        if not isinstance(risk_id, str) or not re.fullmatch(r"RISK-[0-9]+", risk_id):
+            errors.append(f"{prefix}.id must use RISK-nn")
+        elif risk_id in seen:
+            errors.append(f"duplicate risk: {risk_id}")
+        else:
+            seen.add(risk_id)
+        if item.get("type") not in {"blocker", "residual"}:
+            errors.append(f"{prefix}.type must be blocker or residual")
+        if item.get("severity") not in {"critical", "high", "medium", "low"}:
+            errors.append(f"{prefix}.severity is invalid")
+        if item.get("status") not in {"open", "mitigated", "accepted", "closed"}:
+            errors.append(f"{prefix}.status is invalid")
+        for field in ("statement", "owner"):
+            if not isinstance(item.get(field), str) or not item[field].strip():
+                errors.append(f"{prefix}.{field} must be concrete")
+        if item.get("type") == "blocker":
+            if item.get("status") not in {"open", "mitigated", "closed"}:
+                errors.append(f"blocker risk cannot be accepted: {risk_id}")
+            if item.get("status") == "open":
+                errors.append(f"open blocker prevents PASS: {risk_id}")
+        if item.get("type") == "residual" and item.get("status") == "accepted" and not item.get("accepted_by"):
+            errors.append(f"accepted residual risk requires accepted_by: {risk_id}")
 
 
-def _short_or_verdict(value: str) -> bool:
-    cleaned = re.sub(r"[`*\s]", "", value)
-    return len(cleaned) < 4 or bool(re.fullmatch(r"(?i)(?:pass|passed|测试通过|成功|通过|ok|见上|n/?a|-)", value))
-
-
-def validate_verification_evidence(
-    verification_text: str,
-    required_ids: set[str],
-    boundary_ids: set[str],
-    verdict: Any,
+def validate_verification_run(
+    root: Path,
+    feature_id: str,
+    state: dict[str, Any],
     errors: list[str],
-    *,
-    proof_obligations: dict[str, dict[str, Any]] | None = None,
-    expected_fingerprints: dict[str, str] | None = None,
-) -> None:
-    if not verification_text:
-        return
-    if RANGE_ID.search(verification_text):
-        errors.append("verification.md must enumerate exact IDs; range evidence is forbidden")
-    sections = _sections(verification_text)
-    execution, trace = sections.get("5. 执行结果", ""), sections.get("6. 验收追踪", "")
-    tables = [(headers, rows) for headers, rows in _tables(execution) if REQUIRED_HEADERS <= set(headers)]
-    if not tables:
-        errors.append("verification.md 执行结果 requires an evidence table with exact headers: 证据/覆盖/环境/命令或步骤/状态/退出码/观察结果/锚点")
-        return
-
-    rows_by_id: dict[str, dict[str, str]] = {}
-    coverage: dict[str, set[str]] = {}
-    obligation_coverage: dict[str, set[str]] = {}
-    proof_obligations = proof_obligations or {}
-    expected_fingerprints = expected_fingerprints or {}
-    for headers, rows in tables:
-        for row in rows:
-            values = dict(zip(headers, row))
-            evidence = values["证据"].strip("` ")
-            if not EVIDENCE_ID.fullmatch(evidence):
-                errors.append(f"verification evidence row has invalid ID: {values['证据']}")
+) -> tuple[str, str | None]:
+    verification = state.get("stages", {}).get("verification", {})
+    run_id = verification.get("active_run_id")
+    if not isinstance(run_id, str) or not run_id:
+        errors.append("verification requires active_run_id")
+        return "BLOCKED", None
+    destination = run_dir(root, feature_id, run_id)
+    metadata_path = destination / "run.json"
+    manifest_path = destination / "evidence.jsonl"
+    if not metadata_path.is_file() or not manifest_path.is_file():
+        errors.append(f"verification run is incomplete: {destination}")
+        return "BLOCKED", None
+    metadata = load_json(metadata_path)
+    records = load_manifest(manifest_path)
+    contract = state.get("proof_contract", {})
+    contract_artifact = root / "delivery" / feature_id / "proof-contract.json"
+    if not contract_artifact.is_file() or load_json(contract_artifact) != contract:
+        errors.append("sealed proof-contract.json is missing or disagrees with state")
+    obligations, environments = contract_maps(contract if isinstance(contract, dict) else {})
+    contract_digest = proof_contract_digest(contract)
+    if metadata.get("schema_version") != 7 or metadata.get("feature_id") != feature_id or metadata.get("run_id") != run_id:
+        errors.append("run.json identity does not match state")
+    if metadata.get("contract_digest") != contract_digest:
+        errors.append("verification run has a stale Proof Contract")
+    if metadata.get("preflight_verdict") != "PASS":
+        errors.append("verification run environment preflight is BLOCKED")
+    preflight = metadata.get("preflight")
+    expected_preflight = {
+        (environment_id, check.get("id")): check
+        for environment_id, environment in environments.items()
+        for check in environment.get("spec", {}).get("preflight", [])
+        if isinstance(check, dict)
+    }
+    if not isinstance(preflight, list) or not preflight:
+        errors.append("verification run has no machine-executed preflight evidence")
+    else:
+        seen_preflight: set[tuple[Any, Any]] = set()
+        for item in preflight:
+            if not isinstance(item, dict):
+                errors.append("verification run has malformed preflight evidence")
                 continue
-            if evidence in rows_by_id:
-                errors.append(f"duplicate verification evidence ID: {evidence}")
+            identity = (item.get("environment_id"), item.get("check_id"))
+            check = expected_preflight.get(identity)
+            if check is None or identity in seen_preflight:
+                errors.append(f"preflight identity is unknown or duplicated: {identity}")
                 continue
-            rows_by_id[evidence] = values
-            status = values["状态"].strip("` ").lower()
-            if status not in STATUSES:
-                errors.append(f"{evidence} has invalid status: {values['状态']}")
-            command, observed, anchor = values["命令或步骤"].strip(), values["观察结果"].strip(), values["锚点"].strip()
-            if _short_or_verdict(command):
-                errors.append(f"{evidence} requires an exact command or reproducible manual step")
-            if _short_or_verdict(observed):
-                errors.append(f"{evidence} requires a concrete observed result, not a verdict label")
-            if len(re.sub(r"[`*\s]", "", anchor)) < 3 or anchor in {"-", "见上", "N/A"}:
-                errors.append(f"{evidence} requires a concrete evidence anchor")
-            exit_code = values["退出码"].strip("` ")
-            explained_na = bool(re.search(r"(?i)n/?a.+(?:原因|reason|无进程退出码|人工|环境|阻塞|跳过)", exit_code))
-            if status in {"passed", "failed"} and not re.fullmatch(r"[0-9]+", exit_code) and not explained_na:
-                errors.append(f"{evidence} requires a numeric exit code or N/A plus a tool-specific reason")
-            if status in {"blocked", "skipped", "stale"} and not explained_na:
-                errors.append(f"{evidence} {status} result requires N/A plus a reason in 退出码")
-            proof_type = values["证明类型"].strip("` ").lower()
-            if proof_type not in PROOF_TYPES:
-                errors.append(f"{evidence} has invalid proof type: {values['证明类型']}")
-            elif not PROOF_SIGNALS[proof_type].search(command):
-                errors.append(f"{evidence} command/step does not demonstrate {proof_type} proof execution")
-            obligation_ids = set(re.findall(r"\bPO-[0-9]+\b", values["证明义务"]))
-            if not obligation_ids:
-                errors.append(f"{evidence} must cite at least one PO-* proof obligation")
-            for obligation_id in obligation_ids:
-                obligation_coverage.setdefault(obligation_id, set()).add(evidence)
-                obligation = proof_obligations.get(obligation_id)
-                if obligation is None:
-                    errors.append(f"{evidence} cites unknown proof obligation: {obligation_id}")
-                elif obligation.get("proof_type") != proof_type:
-                    errors.append(
-                        f"{evidence} proof type {proof_type} does not match {obligation_id} "
-                        f"type {obligation.get('proof_type')}"
-                    )
-            fingerprints = dict(FINGERPRINT.findall(values["指纹"]))
-            if set(fingerprints) != {"truth", "code", "env"}:
-                errors.append(f"{evidence} fingerprints must contain truth=<sha256> code=<sha256> env=<sha256>")
-            else:
-                environment = values["环境"].strip()
-                if fingerprints["env"] != value_digest(environment):
-                    errors.append(f"{evidence} env fingerprint does not match its environment description")
-                for key in ("truth", "code"):
-                    if expected_fingerprints.get(key) and fingerprints[key] != expected_fingerprints[key]:
-                        errors.append(f"{evidence} has stale {key} fingerprint")
-                for obligation_id in obligation_ids:
-                    obligation = proof_obligations.get(obligation_id)
-                    if obligation is not None and obligation.get("environment") != environment:
-                        errors.append(f"{evidence} environment does not match {obligation_id} target environment")
-            for trace_id in set(TRACE_ID.findall(values["覆盖"])):
-                coverage.setdefault(trace_id, set()).add(evidence)
-            if not TRACE_ID.findall(values["覆盖"]):
-                errors.append(f"{evidence} must cover at least one exact traceability ID")
-
-    missing = required_ids - set(coverage)
-    if missing:
-        errors.append(f"verification evidence does not cover exact IDs: {', '.join(sorted(missing))}")
-    for required in sorted(required_ids):
-        if not any(required in line and re.search(r"\bEVID-[0-9]+\b", line) for line in trace.splitlines()):
-            errors.append(f"verification trace row for {required} lacks an exact EVID-* reference")
-    if verdict == "PASS":
-        for obligation_id, obligation in sorted(proof_obligations.items()):
-            evidence_ids = obligation_coverage.get(obligation_id, set())
-            statuses = {
-                rows_by_id[item]["状态"].strip("` ").lower()
-                for item in evidence_ids
-            }
-            passed = [
-                rows_by_id[item]
-                for item in evidence_ids
-                if rows_by_id[item]["状态"].strip("` ").lower() == "passed"
-            ]
-            skipped = [
-                rows_by_id[item]
-                for item in evidence_ids
-                if rows_by_id[item]["状态"].strip("` ").lower() == "skipped"
-            ]
-            if passed:
-                unresolved = statuses - {"passed"}
-                if unresolved:
-                    errors.append(
-                        f"PASS verdict has unresolved evidence for {obligation_id}: {', '.join(sorted(unresolved))}"
-                    )
+            seen_preflight.add(identity)
+            if item.get("status") != "passed":
+                errors.append(f"preflight check is not passed: {identity}")
+            anchor = (destination / str(item.get("anchor"))).resolve()
+            try:
+                anchor.relative_to(destination.resolve())
+            except ValueError:
+                errors.append("preflight anchor escapes the run directory")
                 continue
-            if statuses == {"skipped"} and not obligation.get("critical") and skipped and all(
-                re.search(r"(?:批准|approved)", row["观察结果"], re.I) for row in skipped
+            if not anchor.is_file() or item.get("sha256") != file_digest(anchor):
+                errors.append(f"preflight anchor is missing or stale: {item.get('anchor')}")
+                continue
+            anchor_value = load_json(anchor)
+            if (
+                anchor_value.get("environment_id") != identity[0]
+                or anchor_value.get("check_id") != identity[1]
+                or anchor_value.get("argv") != check.get("argv")
+                or anchor_value.get("exit_code") != 0
+                or anchor_value.get("status") != "passed"
             ):
+                errors.append(f"preflight anchor disagrees with its contracted check: {identity}")
+        if seen_preflight != set(expected_preflight):
+            errors.append("preflight evidence does not exactly cover contracted checks")
+    current_code = repository_fingerprint(root, feature_id)
+    if metadata.get("code_fingerprint") != current_code:
+        errors.append("verification run has stale code")
+    snapshots = metadata.get("environments")
+    if not isinstance(snapshots, dict) or set(snapshots) != set(environments):
+        errors.append("run environment snapshots do not exactly cover contracted environments")
+        snapshots = {}
+    for environment_id, environment in environments.items():
+        snapshot = snapshots.get(environment_id)
+        if not isinstance(snapshot, dict):
+            continue
+        if snapshot.get("spec") != environment.get("spec"):
+            errors.append(f"run environment {environment_id} is stale")
+        if snapshot.get("digest") != value_digest(environment.get("spec")):
+            errors.append(f"run environment {environment_id} digest is invalid")
+
+    seen: set[str] = set()
+    superseded: set[str] = set()
+    previous_hash = "0" * 64
+    for index, record in enumerate(records):
+        prefix = f"evidence[{index}]"
+        evidence_id = record.get("evidence_id")
+        if not isinstance(evidence_id, str) or not EVIDENCE_ID.fullmatch(evidence_id):
+            errors.append(f"{prefix}.evidence_id is invalid")
+            continue
+        if evidence_id in seen:
+            errors.append(f"duplicate evidence: {evidence_id}")
+        seen.add(evidence_id)
+        if record.get("schema_version") != 7:
+            errors.append(f"{evidence_id} schema_version must be 7")
+        recorded_hash = record.get("record_hash")
+        payload = {key: value for key, value in record.items() if key != "record_hash"}
+        if record.get("previous_hash") != previous_hash or recorded_hash != value_digest(payload):
+            errors.append(f"{evidence_id} breaks the append-only evidence hash chain")
+        if isinstance(recorded_hash, str):
+            previous_hash = recorded_hash
+        po_id = record.get("po_id")
+        obligation = obligations.get(po_id)
+        if obligation is None:
+            errors.append(f"{evidence_id} cites unknown proof obligation: {po_id}")
+            continue
+        if record.get("proof_type") != obligation.get("proof_type"):
+            errors.append(f"{evidence_id} proof type does not match {po_id}")
+        if record.get("status") not in STATUSES:
+            errors.append(f"{evidence_id} status is invalid")
+        if record.get("contract_digest") != contract_digest:
+            errors.append(f"{evidence_id} has stale contract fingerprint")
+        if record.get("code_fingerprint") != current_code:
+            errors.append(f"{evidence_id} has stale code fingerprint")
+        environment_id = obligation.get("environment_id")
+        snapshot = snapshots.get(environment_id, {}) if isinstance(snapshots, dict) else {}
+        if record.get("environment_id") != environment_id or record.get("environment_digest") != snapshot.get("digest"):
+            errors.append(f"{evidence_id} has stale environment fingerprint")
+        expected_assertions = {item.get("id") for item in obligation.get("assertions", []) if isinstance(item, dict)}
+        assertion_results = record.get("assertion_results")
+        if not isinstance(assertion_results, list):
+            errors.append(f"{evidence_id}.assertion_results must be an array")
+            assertion_results = []
+        actual_assertions = {item.get("assertion_id") for item in assertion_results if isinstance(item, dict)}
+        if actual_assertions != expected_assertions:
+            errors.append(f"{evidence_id} does not exactly cover contracted assertions")
+        assertion_contract = {
+            item.get("id"): item for item in obligation.get("assertions", []) if isinstance(item, dict)
+        }
+        for result in assertion_results:
+            if not isinstance(result, dict) or result.get("assertion_id") not in assertion_contract:
                 continue
-            qualifier = "critical " if obligation.get("critical") else ""
-            errors.append(f"PASS verdict requires fresh passed evidence for {qualifier}{obligation_id}")
-        for boundary_id in sorted(boundary_ids):
-            evidence_ids = coverage.get(boundary_id, set())
-            passed_rows = [rows_by_id[item] for item in evidence_ids if rows_by_id[item]["状态"].strip("` ").lower() == "passed"]
-            if not passed_rows:
-                errors.append(f"PASS verdict requires passed executable evidence for {boundary_id}")
-                continue
-            if not any(DIRECT_PROBE.search(row["命令或步骤"]) for row in passed_rows):
-                errors.append(f"{boundary_id} requires passed direct-entry/API/runtime evidence")
-            if not any(OBSERVED_BOUNDARY.search(row["观察结果"]) for row in passed_rows):
-                errors.append(f"{boundary_id} requires observed status/payload/zero-write/snapshot result")
+            oracle = assertion_contract[result["assertion_id"]].get("oracle", {})
+            actual = resolve_source(record, oracle.get("source", ""))
+            present = actual is not MISSING
+            stored_actual = None if actual is MISSING else actual
+            if (
+                result.get("present") is not present
+                or result.get("actual") != stored_actual
+                or type(result.get("actual")) is not type(stored_actual)
+            ):
+                errors.append(f"{evidence_id} assertion {result.get('assertion_id')} actual disagrees with its contracted source")
+            computed = evaluate_oracle(actual, oracle)
+            expected_status = "passed" if computed else "failed"
+            if record.get("status") in {"passed", "failed"} and result.get("status") != expected_status:
+                errors.append(f"{evidence_id} assertion {result.get('assertion_id')} status disagrees with its oracle")
+        if record.get("status") == "passed" and any(item.get("status") != "passed" for item in assertion_results):
+            errors.append(f"{evidence_id} is passed while an assertion is not passed")
+        command = record.get("command")
+        if not isinstance(command, dict) or not isinstance(command.get("argv"), list) or not command["argv"]:
+            errors.append(f"{evidence_id} has no exact argv")
+        else:
+            runner = obligation.get("runner", {})
+            try:
+                expected_cwd = (root / str(runner.get("cwd", "."))).resolve().relative_to(root.resolve()).as_posix() or "."
+            except ValueError:
+                expected_cwd = "<outside-root>"
+            if command.get("argv") != runner.get("argv") or command.get("cwd") != expected_cwd:
+                errors.append(f"{evidence_id} command disagrees with the sealed PO runner")
+        if not isinstance(record.get("observation"), dict):
+            errors.append(f"{evidence_id} observation must be a structured object")
+        anchors = record.get("anchors")
+        if not isinstance(anchors, list) or not anchors:
+            errors.append(f"{evidence_id} has no anchors")
+        else:
+            generated_payloads: dict[str, Any] = {}
+            for anchor in anchors:
+                if not isinstance(anchor, dict) or not isinstance(anchor.get("path"), str):
+                    errors.append(f"{evidence_id} has an invalid anchor")
+                    continue
+                path = (destination / anchor["path"]).resolve()
+                try:
+                    path.relative_to(destination.resolve())
+                except ValueError:
+                    errors.append(f"{evidence_id} anchor escapes the run directory")
+                    continue
+                if not path.is_file():
+                    errors.append(f"{evidence_id} anchor is missing: {anchor['path']}")
+                elif anchor.get("sha256") != file_digest(path):
+                    errors.append(f"{evidence_id} anchor hash mismatch: {anchor['path']}")
+                elif anchor["path"].endswith("-command.json"):
+                    generated_payloads["command"] = load_json(path)
+                elif anchor["path"].endswith("-observation.json"):
+                    generated_payloads["observation"] = load_json(path)
+            for generated_name in ("command", "observation"):
+                if generated_payloads.get(generated_name) != record.get(generated_name):
+                    errors.append(f"{evidence_id} generated {generated_name} anchor disagrees with the manifest")
+        replaced = record.get("supersedes")
+        if not isinstance(replaced, list) or not all(isinstance(item, str) for item in replaced):
+            errors.append(f"{evidence_id}.supersedes must be an array")
+            replaced = []
+        if set(replaced) - seen:
+            errors.append(f"{evidence_id} supersedes future or unknown evidence")
+        if set(replaced) & superseded:
+            errors.append(f"{evidence_id} supersedes evidence that was already superseded")
+        for old_id in replaced:
+            old = next((item for item in records[:index] if item.get("evidence_id") == old_id), None)
+            if old and old.get("po_id") != po_id:
+                errors.append(f"{evidence_id} supersedes evidence for another obligation")
+        superseded |= set(replaced)
+
+    active = active_records(records)
+    verification_state = state.get("stages", {}).get("verification", {})
+    expected_head = records[-1].get("record_hash") if records else "0" * 64
+    if verification_state.get("evidence_count") != len(records) or verification_state.get("evidence_head") != expected_head:
+        errors.append("evidence manifest disagrees with the state-anchored append-only head")
+    for po_id, obligation in obligations.items():
+        current = [record for record in active if record.get("po_id") == po_id]
+        if len(current) != 1:
+            errors.append(f"{po_id} requires exactly one active evidence record; found {len(current)}")
+            continue
+        status = current[0].get("status")
+        if status == "passed":
+            continue
+        errors.append(f"{po_id} has no fresh passed evidence")
+    validate_risks(state, errors)
+    digest = run_digest(destination)
+    return ("PASS" if not errors else "BLOCKED"), digest
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("feature_dir")
+    parser.add_argument("feature_id")
+    parser.add_argument("--root", default=".")
+    parser.add_argument("--run-id")
     args = parser.parse_args()
+    root = Path(args.root).expanduser().resolve()
     errors: list[str] = []
     try:
-        feature_dir = Path(args.feature_dir).expanduser().resolve()
-        state = _read_state(feature_dir)
-        prd = (feature_dir / "prd.md").read_text(encoding="utf-8") if (feature_dir / "prd.md").is_file() else ""
-        code_spec = (feature_dir / "code-spec.md").read_text(encoding="utf-8") if (feature_dir / "code-spec.md").is_file() else ""
-        verification = (feature_dir / "verification.md").read_text(encoding="utf-8") if (feature_dir / "verification.md").is_file() else ""
-        boundary_ids = {
-            item.get("id") for item in state.get("architecture_review", {}).get("boundary_proofs", {}).get("proofs", [])
-            if isinstance(item, dict) and isinstance(item.get("id"), str)
-        }
-        required = set(re.findall(r"\b(?:AC|EX)-[0-9]+\b", prd)) | set(TRACE_ID.findall(code_spec)) | boundary_ids
-        validate_verification_evidence(
-            verification,
-            required,
-            boundary_ids,
-            state.get("stages", {}).get("verification", {}).get("verdict"),
-            errors,
-            proof_obligations={
-                item.get("id"): item
-                for item in state.get("proof_contract", {}).get("obligations", [])
-                if isinstance(item, dict) and isinstance(item.get("id"), str)
-            },
-            expected_fingerprints={
-                "truth": proof_contract_digest(state.get("proof_contract")),
-                "code": code_result_digest(state),
-            },
-        )
-    except (OSError, UnicodeError, ValueError, json.JSONDecodeError, AttributeError) as exc:
+        state_path = root / "delivery" / args.feature_id / "state.md"
+        _, state = extract_state(state_path)
+        if args.run_id:
+            state.setdefault("stages", {}).setdefault("verification", {})["active_run_id"] = args.run_id
+        verdict, digest = validate_verification_run(root, args.feature_id, state, errors)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
         errors.append(str(exc))
+        verdict, digest = "BLOCKED", None
     for error in errors:
         print(f"ERROR: {error}")
-    print("VALID" if not errors else f"INVALID: {len(errors)} error(s)")
+    print(json.dumps({"verdict": verdict, "run_digest": digest, "errors": len(errors)}, sort_keys=True))
     return 0 if not errors else 1
 
 

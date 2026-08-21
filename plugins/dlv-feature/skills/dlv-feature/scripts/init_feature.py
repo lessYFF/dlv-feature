@@ -48,6 +48,10 @@ def stage_state(name: str) -> dict:
                     "proof_contract": None,
                     "repositories": {},
                 },
+                "active_run_id": None,
+                "run_digest": None,
+                "evidence_count": 0,
+                "evidence_head": None,
                 "verdict": None,
                 "finalization": None,
             }
@@ -100,7 +104,7 @@ def main() -> int:
 
     feature_dir.mkdir(parents=True, exist_ok=True)
     state = {
-        "schema_version": 6,
+        "schema_version": 7,
         "feature_id": args.feature_id,
         "current_stage": "prd",
         "requirement_review": {
@@ -132,11 +136,14 @@ def main() -> int:
         "proof_contract": {
             "status": "pending",
             "code_spec_fingerprint": None,
+            "environments": [],
             "obligations": [],
-            "verdict": "PENDING",
+            "approval": None,
+            "sealed_at": None,
+            "seal": None,
         },
         "stages": {name: stage_state(name) for name in STAGES},
-        "blockers": [],
+        "risks": [],
         "last_updated": timestamp(),
     }
     state_path.write_text(render_state(state), encoding="utf-8")

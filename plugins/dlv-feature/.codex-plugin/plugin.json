@@ -1,6 +1,6 @@
 {
   "name": "dlv-feature",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A proof-carrying end-to-end feature delivery workflow for Codex.",
   "author": {
     "name": "lessYFF",
@@ -13,13 +13,13 @@
   "interface": {
     "displayName": "DLV Feature",
     "shortDescription": "Deliver features with evidence-backed gates.",
-    "longDescription": "Guides a feature from requirement review through PRD, architecture, code specification, implementation, and verified delivery.",
+    "longDescription": "Guides a feature from requirement review through implementation and a schema-v7 proof kernel with sealed assertions, target-runtime runs, append-only evidence, and deterministic delivery.",
     "developerName": "lessYFF",
     "category": "Productivity",
-    "capabilities": ["Feature planning", "Visual parity", "Runtime missions", "Deterministic verification"],
+    "capabilities": ["Feature planning", "Sealed proof contracts", "Verification runs", "Append-only evidence", "Deterministic verification"],
     "websiteURL": "https://github.com/lessYFF/dlv-feature",
     "defaultPrompt": [
-      "Use $dlv-feature to deliver this feature with fresh truth, typed proof obligations, target-runtime mission evidence, and deterministic finalization."
+      "Use $dlv-feature to deliver this feature with schema-v7 sealed assertions, a fresh target-runtime Verification Run, hashed evidence, and deterministic finalization."
     ]
   }
 }

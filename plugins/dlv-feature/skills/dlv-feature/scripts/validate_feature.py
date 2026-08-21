@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from validate_boundary_proofs import validate_boundary_proofs
-from validate_verification_evidence import validate_verification_evidence
+from validate_verification_evidence import validate_verification_run
 from delivery_proof import (
     code_result_digest,
     proof_contract_digest,
@@ -32,7 +32,7 @@ ARTIFACTS = {
     "code_spec": "code-spec.md",
     "verification": "verification.md",
 }
-ALLOWED_FILES = {"state.md", *ARTIFACTS.values()}
+ALLOWED_FILES = {"state.md", "proof-contract.json", *ARTIFACTS.values()}
 STATE_START = "<!-- DLV_STATE_START -->"
 STATE_END = "<!-- DLV_STATE_END -->"
 FORBIDDEN_GOVERNANCE = re.compile(
@@ -279,6 +279,19 @@ def reports_legacy_bypass(content: str) -> bool:
     return False
 
 
+def validate_database_section(content: str, errors: list[str]) -> None:
+    """Require executable SQL shape and reject Markdown field-table schemas."""
+    sql_blocks = re.findall(r"```sql\s*\n([\s\S]*?)```", content, re.I)
+    executable_sql = "\n".join(sql_blocks)
+    executable_sql = re.sub(r"/\*[\s\S]*?\*/", " ", executable_sql)
+    executable_sql = re.sub(r"(?m)--[^\n]*$", " ", executable_sql)
+    executable_sql = re.sub(r"'(?:''|[^'])*'", "''", executable_sql)
+    if not re.search(r"\b(?:CREATE|ALTER)\s+(?:TABLE|INDEX)\b", executable_sql, re.I):
+        errors.append("architecture database design requires fenced SQL DDL (CREATE/ALTER TABLE or INDEX)")
+    if has_markdown_table(content):
+        errors.append("architecture database section must use SQL DDL, not Markdown schema tables")
+
+
 def validate_readability(stage: str, sections: dict[str, str], errors: list[str]) -> None:
     name = ARTIFACTS[stage]
     for heading, content in sections.items():
@@ -300,7 +313,8 @@ def validate_readability(stage: str, sections: dict[str, str], errors: list[str]
         for heading in ("2. 现状", "3. 方案", "5. 接口", "8. 质量保障", "9. 影响范围", "11. 需求追踪"):
             require_structure(sections, heading, ("table",), name, errors)
         require_structure(sections, "4. 流程", ("mermaid",), name, errors)
-        require_structure(sections, "6. 数据", ("table", "mermaid"), name, errors)
+        # Database structure is executable architecture, not a prose field matrix.
+        # DATA-* sections are checked below for fenced SQL DDL.
         require_structure(sections, "7. 前端", ("table", "mermaid"), name, errors)
         require_structure(sections, "10. 发布与回滚", ("ordered-list",), name, errors)
         if "10. 发布与回滚" in sections and not has_markdown_table(sections["10. 发布与回滚"]):
@@ -937,6 +951,8 @@ def validate_semantics(
             errors.append("API-* requires architecture section ## 5. 接口")
         if ids(docs["architecture"], "DATA") and "6. 数据" not in sections["architecture"]:
             errors.append("DATA-* requires architecture section ## 6. 数据")
+        if "6. 数据" in sections["architecture"]:
+            validate_database_section(sections["architecture"]["6. 数据"], errors)
         if ids(docs["architecture"], "DATA"):
             data_section = sections["architecture"].get("6. 数据", "")
             required_terms = {
@@ -957,8 +973,6 @@ def validate_semantics(
             missing_terms = [term for term, patterns in required_terms.items() if not contains_any(data_section, patterns)]
             if missing_terms:
                 errors.append(f"architecture database design missing semantics: {', '.join(missing_terms)}")
-            if "erDiagram" not in data_section and not re.search(r"(?m)^\s*\|.*字段.*\|", data_section):
-                errors.append("architecture data model change requires ER diagram or field relationship table")
         if (ids(docs["architecture"], "UI") or ids(docs["architecture"], "SHAPE")) and "7. 前端" not in sections["architecture"]:
             errors.append("UI/SHAPE architecture requires section ## 7. 前端")
         if product.get("US") and not (ids(docs["architecture"], "UI") or ids(docs["architecture"], "SHAPE")):
@@ -1084,15 +1098,8 @@ def validate_semantics(
         verdict = stages.get("verification", {}).get("verdict")
         if verdict and verdict not in sections["verification"].get("8. 验收结论", ""):
             errors.append("verification.md 验收结论 does not contain state verdict")
-        validate_verification_evidence(
-            docs["verification"],
-            required | boundary_ids,
-            boundary_ids,
-            verdict,
-            errors,
-            proof_obligations=proof_obligations,
-            expected_fingerprints=proof_fingerprints,
-        )
+        # verification.md is a generated view. The Evidence Bundle validator,
+        # invoked by main(), owns evidence coverage and the verdict.
 
 
 def report(errors: list[str], warnings: list[str]) -> int:
@@ -1125,15 +1132,15 @@ def main() -> int:
     state = extract_state(state_path, errors)
     if state is None:
         return report(errors, warnings)
-    if state.get("schema_version") != 6:
-        errors.append("state.md schema_version must be 6; compatibility with older schemas is intentionally unsupported")
+    if state.get("schema_version") != 7:
+        errors.append("state.md schema_version must be 7; run upgrade_v6_to_v7.py for v6 deliveries")
         return report(errors, warnings)
     if state.get("feature_id") != args.feature_id:
         errors.append("state.md feature_id does not match directory/argument")
     if state.get("current_stage") not in STAGES:
         errors.append("invalid current_stage")
-    if not isinstance(state.get("blockers"), list):
-        errors.append("blockers must be an array")
+    if not isinstance(state.get("risks"), list):
+        errors.append("risks must be an array")
     stages = state.get("stages")
     if not isinstance(stages, dict):
         errors.append("stages must be an object")
@@ -1204,6 +1211,17 @@ def main() -> int:
             prototype.get("status") == "completed",
             errors,
         )
+        contract_artifact = feature_dir / "proof-contract.json"
+        if not contract_artifact.is_file():
+            errors.append("completed Proof Contract requires sealed proof-contract.json")
+        else:
+            try:
+                artifact_contract = json.loads(contract_artifact.read_text(encoding="utf-8"))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                errors.append(f"cannot read proof-contract.json: {exc}")
+            else:
+                if artifact_contract != state.get("proof_contract"):
+                    errors.append("proof-contract.json disagrees with state Proof Contract")
     proof_fp = proof_contract_digest(state.get("proof_contract"))
     verification_inputs = stages.get("verification", {}).get("inputs")
     if stages.get("verification", {}).get("status") == "completed" and isinstance(verification_inputs, dict):
@@ -1234,6 +1252,19 @@ def main() -> int:
         errors.append("invalid verification verdict")
     if stages.get("verification", {}).get("status") == "completed" and verdict != "PASS":
         errors.append("completed verification requires PASS verdict")
+    if stages.get("verification", {}).get("status") in {"in_progress", "completed"}:
+        run_errors: list[str] = []
+        try:
+            run_verdict, current_run_digest = validate_verification_run(root, args.feature_id, state, run_errors)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            run_errors.append(str(exc))
+            run_verdict, current_run_digest = "BLOCKED", None
+        errors.extend(run_errors)
+        if verdict == "PASS" and run_verdict != "PASS":
+            errors.append("verification verdict PASS disagrees with the active Verification Run")
+        recorded_run_digest = stages.get("verification", {}).get("run_digest")
+        if recorded_run_digest is not None and recorded_run_digest != current_run_digest:
+            errors.append("verification run_digest is stale")
     validate_finalization(state, errors)
 
     validate_semantics(

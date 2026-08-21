@@ -6,7 +6,7 @@
 
 ## 分批实现
 
-每批只加载自身、引用锚点、有界源码/测试和一跳依赖；复核事实冲突即返回上游。先执行目标环境 preflight，再写最小有效测试、运行 red（例外须批准）、写最小实现、运行目标与回归、只在范围内重构，并把实际文件/符号、red/green、质量审查和 diff 核对记录进 `verification.md`。环境失败标 blocked，不以业务改动兼容错误工具链。
+每批只加载自身、引用锚点、有界源码/测试和一跳依赖；复核事实冲突即返回上游。先检查本批工具链，再写最小有效测试、运行 red（例外须批准）、写最小实现、运行目标与回归、只在范围内重构。实际文件/符号、red/green、质量审查和 diff 核对作为后续结构化 evidence 输入，不手写进 `verification.md`。环境失败标 blocked，不以业务改动兼容错误工具链。
 
 ### Boundary Delta Audit
 
@@ -20,4 +20,4 @@
 
 Delete、KISS、DRY、Responsibility、Dependency 必须逐项 `PASS/FAIL/N/A` 并有证据；单实现接口、一次性工厂、推测性扩展点默认失败，KISS 高于仪式化 SOLID。任一 FAIL 阻断 Code 完成。
 
-完成时核对完整 diff 的越界修改、迁移安全、密钥、调试代码、未处理错误、Boundary Delta 和 `PO-*` 可执行性；Code Spec 保持不可变，计划—实际差异放 verification。实际依赖超出批准闭包时使 Code Spec stale，不在 Verification 中补写理由绕过。所有批次已执行、所有适用 BP 已核对、每个 PO 仍可执行且无阻断偏差后，运行 `python3 <skill-dir>/scripts/delivery_proof.py repository-fingerprint <feature-id> --root <project-root>`，把输出写入 `stages.code.result.repository_fingerprint`，才可标记 `code=completed`。不得手填或复用旧指纹。
+完成时核对完整 diff 的越界修改、迁移安全、密钥、调试代码、未处理错误、Boundary Delta 和 `PO-*` 可执行性；Code Spec 与已封存 Proof Contract 保持不可变。实际依赖超出批准闭包时使 Code Spec stale，不在 Verification 中补写理由绕过。所有批次已执行、所有适用 BP 已核对、每个 PO 仍可执行且无阻断偏差后，运行 `python3 <skill-dir>/scripts/delivery_proof.py repository-fingerprint <feature-id> --root <project-root>`，把输出写入 `stages.code.result.repository_fingerprint`，才可标记 `code=completed`。不得手填或复用旧指纹；`delivery/` 与 `.dlv/` 不进入代码指纹。
