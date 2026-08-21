@@ -123,7 +123,7 @@ CREATE INDEX idx_follow_up_completed_result
   "environment_digest": "<sha256>",
   "command": {"argv": ["python3", "tests/verify_task_kpi.py", "--json"], "cwd": ".", "exit_code": 0, "stdout": "{\"draft_kpi_count\": 0}", "stderr": "", "timed_out": false},
   "assertion_results": [
-    {"assertion_id": "ASRT-01", "status": "passed", "actual": 0}
+    {"assertion_id": "ASRT-01", "status": "passed", "present": true, "actual": 0}
   ],
   "observation": {"draft_kpi_count": 0},
   "anchors": [
