@@ -2,117 +2,154 @@
 
 ## 通用规则
 
-只持久化 `state.md`、`prd.md`、`architecture-design.md`、`code-spec.md`、`verification.md` 与适用的 `prototype.html`。正式文档用简洁中文标题、目录在编号正文前；不创建 request/matrix/manifest/capsule/checklist/evidence sidecar。所有 ID 精确枚举，禁止范围。
+产品/技术真值只持久化为 `state.md`、`prd.md`、`architecture-design.md`、`code-spec.md`、sealed `proof-contract.json`、适用的 `prototype.html`；`verification.md` 是生成视图。运行证据只放 `.dlv/runs/{feature-id}/{run-id}/`。不创建平行 request/matrix/capsule/checklist/snapshot/test-plan 或手写 evidence ledger。所有 ID 精确枚举，禁止范围。
 
-## state.md
+## state.md（schema v7）
 
-状态块外只允许标题和维护提示。仅接受 schema v6；禁止兼容更早版本。v6 在既有状态上增加最小 Proof Contract，并要求 Verification finalization：
+状态块外只允许标题和维护提示。v7 的关键结构如下；完整 stage 形态以 `init_feature.py` 为准：
 
 ```json
 {
-  "schema_version": 6,
+  "schema_version": 7,
   "feature_id": "feature-id",
-  "current_stage": "prd",
-  "requirement_review": {"status": "pending", "source_fingerprint": null, "confirmed_ids": [], "summary": null, "approved_at": null},
-  "architecture_review": {
-    "status": "pending",
-    "inputs": {"prd": null, "prototype": null, "repositories": {}},
-    "existing_capabilities": [], "fact_owners": [], "additions": [], "api_decisions": [],
-    "isolation": {"applicable": false, "verdict": "N/A"},
-    "concurrency": {"applicable": false, "verdict": "N/A"},
-    "rule_variants": {"applicable": false, "verdict": "N/A"},
-    "boundary_proofs": {
-      "applicable": true,
-      "reason": "新增计划团读取与导出边界",
-      "proofs": [{
-        "id": "BP-01", "fact": "完成快照导出", "owner": "PlanExportService",
-        "product_ids": ["AC-01"],
-        "authorization": "plan-product:view AND product.status=ACTIVE",
-        "entrypoints": [{"route": "GET /api/products/{id}/plan-pdf-data", "symbol": "ProductController.planPdfData", "guard": "requireProductViewPermission before source read"}],
-        "lineage": {"selector": "product.publishedVersionId", "source": "completed plan snapshot", "forbidden": ["sourceQuoteId current quote"]},
-        "projection": {"safe_when_denied": ["403 without quote DTO"], "sensitive": ["cost", "client contact"]},
-        "probes": ["direct GET without product permission returns 403 and no service read", "mutate source quote then verify PDF still selects completed snapshot"],
-        "verdict": "PASS"
-      }],
-      "verdict": "PASS"
-    },
-    "material_decisions": [], "approved_at": null
-  },
+  "current_stage": "code_spec",
   "proof_contract": {
     "status": "completed",
     "code_spec_fingerprint": "<sha256>",
-    "obligations": [{
-      "id": "PO-01",
-      "product_ids": ["AC-01"],
-      "proof_type": "runtime",
-      "surface": "wechat-mini-program",
-      "environment": "wechat-mini-program lib=3.16.1 devtools=1.06.2504010",
-      "critical": true,
-      "expected": "点击复制后读取剪贴板与批准话术完全一致",
-      "states": ["promotion-ready"]
-    }],
-    "verdict": "PASS"
+    "environments": [
+      {
+        "id": "ENV-01",
+        "target": "postgres integration runtime",
+        "spec": {
+          "runtime": "postgres",
+          "version": "16.4",
+          "preflight": [
+            {"id": "database-ready", "argv": ["pg_isready", "-h", "127.0.0.1"]}
+          ]
+        }
+      }
+    ],
+    "obligations": [
+      {
+        "id": "PO-01",
+        "product_ids": ["AC-01"],
+        "trace_ids": ["BP-01", "R-D01-01", "T-B01-01", "B01"],
+        "proof_type": "boundary",
+        "surface": "POST /api/tasks/draft",
+        "environment_id": "ENV-01",
+        "critical": true,
+        "runner": {
+          "argv": ["python3", "tests/verify_task_kpi.py", "--json"],
+          "cwd": ".",
+          "observation_adapter": "json_stdout",
+          "timeout_seconds": 300
+        },
+        "assertions": [
+          {
+            "id": "ASRT-01",
+            "description": "草稿结果不进入完成 KPI",
+            "oracle": {"kind": "json_path", "source": "/observation/draft_kpi_count", "operator": "eq", "expected": 0}
+          }
+        ]
+      }
+    ],
+    "approval": {"approved_by": "product-owner", "reference": "review-message-42"},
+    "sealed_at": "2026-08-21T10:00:00+08:00",
+    "seal": "<sha256>"
   },
   "stages": {
     "verification": {
       "status": "in_progress",
+      "active_run_id": "run-20260821-01",
+      "run_digest": null,
+      "evidence_count": 0,
+      "evidence_head": "0000000000000000000000000000000000000000000000000000000000000000",
       "fingerprint": null,
-      "inputs": {
-        "prd": null, "prototype": null, "architecture": null, "code_spec": null,
-        "code_result": null, "proof_contract": null, "repositories": {}
-      },
       "verdict": null,
       "finalization": null
     }
   },
-  "blockers": [], "last_updated": "2026-01-01T00:00:00+08:00"
+  "risks": [
+    {
+      "id": "RISK-01",
+      "type": "residual",
+      "severity": "low",
+      "status": "accepted",
+      "statement": "生产历史重复数据需发布前只读预检",
+      "owner": "release-owner",
+      "accepted_by": "product-owner"
+    }
+  ]
 }
 ```
 
-其余 stage 形态由 `init_feature.py` 生成，不从示例反推。`architecture_review` 保存压缩裁决，不复制详细方案。每个 material `ADD-*` 必须由 `MAT-*` 的 `addition_ids` 精确批准。`boundary_proofs` 是唯一跨边界保证结构；一个 BP 覆盖事实 owner、入口、授权、lineage、projection 与实际 probe，不得恢复 `CC/RB/MP` 平行结构。`proof_contract` 只保存 `PO-*` 最小声明，不复制测试步骤；测试步骤只在 Code Spec 与 Verification 中出现。
+Proof Contract 的 seal 由 `seal_proof_contract.py` 基于除 seal 字段本身之外的完整合同（含 status、approval、sealed_at、runner）生成，同时写一次性 `proof-contract.json` 快照。state 与快照必须逐字段一致。seal 后任何 metadata、environment、PO、runner、trace 或 assertion 改动都会使合同无效；不能手工更新 seal 来掩盖变化，必须从 Code Spec 失效并重审。该本地 seal 是内容完整性锚，不是敌对写权限下的身份签名；需要抵抗能同步修改代码与全部本地产物的主体时，必须增加外部签名/远端 attestation。
 
-## PRD 合同
+风险只有一份结构化真值。`type=blocker|residual`，`status=open|mitigated|accepted|closed`；open blocker 阻断，accepted residual 必须有 `accepted_by`。
 
-标题为 `# {功能名} — 产品需求文档（PRD）`。目录后按需使用：概述、背景、目标与范围、角色与场景、功能需求、业务规则、非功能需求、UI 需求、异常与边界、需求追踪。`SRC/FR/BR/AC/EX/US` 可追溯且不虚构未确认事实；可见 UI 必须有原型合同或明确不适用理由。
+## 文档合同
 
-## 技术方案合同
+PRD 标题为 `# {功能名} — 产品需求文档（PRD）`，维护 `SRC/FR/BR/AC/EX/US`。Architecture 标题为 `# {功能名} — 技术方案`，维护 `ARCH/FLOW/API/DATA/UI/IMPACT/BP`。Code Spec 标题为 `# {功能名} — 代码实现规格（Code Spec）`，维护 `D/R/T/B/ENV/PO/ASRT` 映射。三者均有目录、编号章节、精确追踪和批准指纹。
 
-标题为 `# {功能名} — 技术方案`。目录后按需使用：
+Architecture 的数据库章节必须用 fenced `sql` 写 DDL。列、类型、NULL/default、约束、FK、索引只能以 SQL 为结构真值；禁止 Markdown schema 表。例如：
 
-1. 概述
-2. 现状
-3. 方案
-4. 流程
-5. 接口
-6. 数据
-7. 前端
-8. 质量保障
-9. 影响范围
-10. 发布与回滚
-11. 需求追踪
+```sql
+ALTER TABLE sales_follow_up_task
+    ADD COLUMN completed_at timestamptz;
 
-“现状”必须给出可复用能力、事实所有者、API/事务/权限边界和系统性缺口。“方案”包含 `ARCH-*`、复用/扩展/替换/新增裁决、被拒绝方案、材料批准和规则分派。“质量保障”逐项消费 `BP-*`，包括完整授权表达式、Service guard-before-write、version/source selector、forbidden sources、denied projection、direct negative probes、租户/并发/规则变体。`DATA-*` 明确正典/快照、冻结时点、事务、锁、约束、迁移与回滚；`IMPACT-*` 仅能标 `verified|proposed`。
+CREATE INDEX idx_follow_up_completed_result
+    ON sales_follow_up_task (completed_at, result_code)
+    WHERE status = 'COMPLETED';
+```
 
-## Code Spec 合同
+正文只补充事实所有权、快照、事务、锁、容量、迁移和回滚，不重复表格字段清单。
 
-标题为 `# {功能名} — 代码实现规格（Code Spec）`。目录后使用：概述、实现映射、后端实现、前端实现、接口与数据实现、规则与异常、测试规格、实现批次、变更控制。`Dxx/R-Dxx-xx/T-Bxx-xx/Bxx/PO-*` 映射产品与架构 ID、路径、符号、最小写入范围和可观察结果。每个 `BP-*` 必须进入至少一个 D、R、T、B，并包含 direct API、缺权限、零副作用、投影与适用的来源扰动/历史快照精确断言。每个 `AC/EX` 至少被一个 `PO-*` 覆盖；每个 `PO-*` 同时进入实现映射、测试规格和实现批次。
+## Verification Run 合同
 
-## 验证合同
+`.dlv/runs/{feature-id}/{run-id}/run.json` 由 start 命令创建，包含：schema/feature/run identity、创建时间、contract digest、code fingerprint、每个 ENV 的结构化 snapshot/digest、preflight 结果及其锚点哈希。run 不进入代码 fingerprint。
 
-标题为 `# {功能名} — 测试与验收报告`。目录后使用：概述、范围与环境、计划—实际核对、质量门、执行结果、验收追踪、问题与风险、验收结论。执行结果表必须为：
+`evidence.jsonl` 仅由 record 命令 append，每行一个 canonical JSON object。result JSON 只提供 PO identity、`evaluate|blocked` outcome、可选 blocked reason 和额外 anchors；supersedes 只通过 record CLI 的 `--supersedes EVID-*` 参数声明。recorder 只能执行 sealed PO runner，并生成 `command/observation/status/assertion_results/previous_hash/record_hash`：
 
-| 证据 | 证明义务 | 覆盖 | 证明类型 | 环境 | 指纹 | 命令或步骤 | 状态 | 退出码 | 观察结果 | 锚点 |
-|---|---|---|---|---|---|---|---|---|---|---|
+```json
+{
+  "schema_version": 7,
+  "evidence_id": "EVID-0001",
+  "po_id": "PO-01",
+  "proof_type": "boundary",
+  "status": "passed",
+  "contract_digest": "<sha256>",
+  "code_fingerprint": "<sha256>",
+  "environment_id": "ENV-01",
+  "environment_digest": "<sha256>",
+  "command": {"argv": ["python3", "tests/verify_task_kpi.py", "--json"], "cwd": ".", "exit_code": 0, "stdout": "{\"draft_kpi_count\": 0}", "stderr": "", "timed_out": false},
+  "assertion_results": [
+    {"assertion_id": "ASRT-01", "status": "passed", "present": true, "actual": 0}
+  ],
+  "observation": {"draft_kpi_count": 0},
+  "anchors": [
+    {"path": "anchors/evid-0001-command.json", "sha256": "<sha256>", "size": 256},
+    {"path": "anchors/evid-0001-observation.json", "sha256": "<sha256>", "size": 32}
+  ],
+  "supersedes": [],
+  "previous_hash": "<sha256>",
+  "record_hash": "<sha256>"
+}
+```
 
-每个 `EVID-*` 精确覆盖上游 ID 与 `PO-*`，证明类型必须匹配 Proof Contract。环境列必须与对应 PO 冻结的 `environment` 完全一致；指纹固定写为 `truth=<sha256> code=<sha256> env=<sha256>`，其中 env 是环境列规范字符串的 SHA-256。每个 BP 的 PASS 至少有 direct-entry/API/runtime 的 passed 证据，观察结果必须包含 HTTP/status、payload 字段、zero write/service-not-invoked 或 snapshot/source perturbation 的具体结果；禁止泛化 PASS、ID 范围和用较低证据层替代声明结果。同一 PO 存在 failed、blocked、stale 或未批准 skip 时不得 PASS。大文件放既有测试/CI 制品存储，锚点记录稳定引用与哈希。
+每个 PO 最终恰有一条 active evidence。failed/blocked 不可被后来的 PASS 默默覆盖；必须由同 PO 新 evidence 显式 `supersedes`。所有 skip 均禁止。每个 anchor 必须在 run 内存在且 hash 一致。manifest 逐条 hash-chain，state 保存 count/head；start/record/render/finalizer 统一按 feature lock → run lock 的顺序串行，recorder 在 append 前写 `pending-record.json`，中断后可确定性重放 manifest/state head，成功后删除 journal。命令默认 300 秒超时、保留的 stdout/stderr 各不超过 1 MiB并清理常见 secret；额外 anchor 最大 10 MiB，复制后权限为 `0600`。这些机制发现误编辑和普通重写，但不声称抵抗可同时修改 validator、state 和全部本地 artifact 的恶意主体。
 
-## 交付硬门
+## 生成报告与 Finalization
 
-- Truth：candidate/gap 不进入写入范围；技术事实有锚点。
-- Context：批次预算受控；超限有证据关系。
-- Simplicity：Delete、KISS、DRY、Responsibility、Dependency 均通过或合理 N/A。
-- Boundary Proof：每个关键 access/owner/lineage/projection/lifecycle 变化有完整 `BP-*`。
-- Evidence Integrity：`EVID-*` 有精确命令/步骤、环境、退出码、观察结果与锚点。
-- Mission：每个 critical `PO-*` 有类型匹配、指纹 fresh 的 passed 证据；视觉 proof 使用批准原型，runtime proof 执行目标终端真实任务。
+`verification.md` 固定由 bundle 渲染，包含 run/contract/code digest、计划—实际核对、证明义务、active evidence、assertion actual、anchor hash、结构化风险和当前裁决。它可删除重建，不能作为 evidence 输入。
 
-直接输入变更以文件字节 SHA-256 使下游 stale；Code 完成时必须把脚本对真实 Git 工作区计算的 `repository_fingerprint` 写入 `stages.code.result`，后续代码变化自动令 Code 与 Verification stale。环境变化使关联证据 stale。无批准、verdict 非 PASS、critical PO 缺证据、矛盾证据未解决或 finalization token 不匹配时不得完成。Verification completed 只能由 `finalize_delivery.py` 写入。
+`finalize_delivery.py` 是唯一完成入口：持有 `.run.lock` → 恢复 pending transaction → 验证 run → 写临时 PASS/run digest → 生成报告并 fingerprint → 完整 validate → 写 completed/token → 再 validate。任一步失败使用 compare-and-swap 回滚原 `state.md` 和 `verification.md`；检测到外部并发编辑时保留外部内容并明确报错。
+
+## 硬门
+
+- 合同：Code Spec fingerprint fresh，seal 匹配，AC/EX 全覆盖，ENV/PO/ASRT 结构完整。
+- 环境：每个 ENV spec 精确匹配，所有 preflight 实际执行并通过。
+- 代码：Git worktree fingerprint 与 Code result/run 完全一致。
+- 证据：类型匹配、断言精确覆盖、active evidence 唯一、锚点存在且 hash 匹配。
+- 边界：BP 的 direct negative/zero-side-effect/projection/lineage 进入 PO trace 和 assertion。
+- 风险：无 open blocker；accepted residual 有批准人。
+- 报告：仅由当前 run 生成，fingerprint 与 finalization token fresh。

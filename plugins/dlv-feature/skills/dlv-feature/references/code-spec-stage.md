@@ -28,10 +28,12 @@
 | `invariant` | 服务/数据库状态转换、跨事实一致性、租户和历史数据不变量 |
 | `artifact` | build、目录隔离、配置、bundle、产物哈希、console/lifecycle 或发布健康 |
 
-每项写入 `state.md -> proof_contract.obligations`：`id/product_ids/proof_type/surface/environment/critical/expected/states`。`environment` 必须冻结该义务实际验收的目标运行时与关键版本，不得只写 local/dev/test。核心 CTA、权限、安全、数据完整性和发布阻断项必须 `critical=true`；它们不能降级为人工或 conditional。批准 Code Spec 时同时冻结 `proof_contract.code_spec_fingerprint` 并令 verdict=PASS。
+先定义可复用 `ENV-*`：`id/target/spec`。`spec` 是结构化运行时事实，并包含至少一个可执行 `preflight`（`id/argv`），不得只写 local/dev/test。再定义 `PO-*`：`id/product_ids/trace_ids/proof_type/surface/environment_id/critical/assertions`。每个 `ASRT-*` 使用 `description + oracle.kind + oracle.source + oracle.operator + oracle.expected`；source 以 JSON Pointer 从 recorder 保存的 `/command/*` 或 `/observation/*` 取实际值，`exists/absent` 可省 expected。禁止用自由文本 `expected` 或执行方自报 status 代替机器裁决。
+
+一个 PO 只覆盖一个 persona 边界和一个主要副作用；若角色、状态或副作用需要不同 oracle，拆成多个 PO。核心 CTA、权限、安全、数据完整性和发布阻断项必须 `critical=true`，不能降级为人工或 conditional。Code Spec 获批并写入指纹后运行 `seal_proof_contract.py` 一次；seal 后合同不可原地修改，变化必须从 Code Spec 失效并重新审批。
 
 ## 实现批次与对齐门
 
 每个 `Bxx` 是唯一最小执行边界：目标（至少一条 `R-*` 和 `AC/EX`）、架构锚点、仓库与基线、候选路径、源码/测试必读、允许与排除范围、依赖深度、test-first red/green/回归命令、消费的 `BP-*` 精确断言、完成/回滚条件、Simplicity 合同和超限理由。默认预算 3 仓库、20 路径、8 源码、4 测试/配置、1 hop。
 
-技术方案的每个影响项必须被消费；Code Spec 不得新增未批准的表、接口、组件、依赖、公共抽象或写入目标。每个 `BP-*` 必须进入至少一个 `Dxx`、`T-*` 和 `Bxx`；每个 `PO-*` 必须进入实现映射、测试规格和实现批次。缺口返回上游并传播 stale。用户批准后记录指纹并进入 Code；批准不等于授权写业务代码。
+技术方案的每个影响项必须被消费；Code Spec 不得新增未批准的表、接口、组件、依赖、公共抽象或写入目标。每个 `BP-*` 必须进入至少一个 `Dxx`、`T-*` 和 `Bxx`；每个 `PO-*` 必须进入实现映射、测试规格和实现批次，`trace_ids` 必须精确枚举这些上游 ID。缺口返回上游并传播 stale。用户批准并封存合同后进入 Code；批准不等于授权写业务代码。

@@ -2,22 +2,31 @@
 
 ## 目标与输入
 
-独立判断实际实现是否满足批准行为和技术合同，不把计划报告为通过。只从变化批次和 `AC/EX/R/T/B/BP/PO` 开始，沿缺失断言、调用/依赖、事实所有权或失败测试关系扩展。
+独立判断实际实现是否满足 sealed Proof Contract，不把计划、关键词或手写报告当作证据。输入只有 fresh 产品/技术真值、代码指纹、`ENV/PO/ASRT` 合同、结构化风险和真实执行产物。
 
-## 计划与执行
+## Verification Run
 
-1. 建立 `AC/EX/R/T/B/CONTRACT/SHAPE/BP → PO → exact check → EVID-*` 追踪；逐项枚举，禁止 ID 范围。
-2. 先执行目标环境 preflight，再按 `visual/runtime/boundary/invariant/artifact` 的声明结果选择证据；source、mock、build、DOM 存在不能替代更高层结果。
-3. 每次执行生成唯一 `EVID-*`：证明义务、精确覆盖、证明类型、环境、`truth/code/env` 指纹、命令/可复现步骤、退出码、状态、具体观察结果和锚点。环境不可用是 blocked，不是 pass。
-4. 每个 `BP-*` 以真实角色执行 direct API/真实入口负向路径：缺 action permission、缺 entity/product-line permission、适用的错数据范围/租户/生命周期；断言 Service not invoked 或 zero write，以及 denied payload 不含 sensitive fields。
-5. 适用 lineage 的 BP 执行来源扰动：source mutation、draft mutation、recomplete/history 后分别断言选择的完成快照；禁止以来源当前对象替代。
-6. `visual` 在相同终端、视口、DPR、字体、数据和状态下比较批准原型与实现：结构和禁止元素零偏差、关键几何阈值、感知 diff；动态区域只允许有界 mask。
-7. `runtime` 执行完整用户任务并观察副作用；复制必须回读剪贴板，登录必须验证回跳上下文，切换/关闭必须验证旧异步结果不回填。
-8. `artifact` 检查构建输出隔离、配置、console、生命周期、bundle/性能预算和发布健康；跨系统证据串联真实输入输出。
-9. 审查完整 diff 的 Truth、Context、Simplicity、Boundary Proof、安全和稳健性。
+1. 为每个 `ENV-*` 生成与合同 `spec` 完全一致的 JSON；其中 `preflight` 命令必须能核对目标工具、运行时、服务、端口或凭证可用性。
+2. 用 `verification_run.py start` 创建唯一 run。脚本核对合同 seal、Git 代码指纹和环境 spec，并实际执行全部 preflight。validator 会从每个 contracted check 及其哈希锚点重算身份、argv、exit code 和状态，不信任顶层 PASS 汇总。失败形成 blocked run，不修改业务代码规避环境。
+3. 按 PO 声明的 `visual/runtime/boundary/invariant/artifact` 强度执行完整任务。source、mock、build、DOM 存在不能代替更高层结果。
+4. 命令的 `argv/cwd/observation_adapter/timeout_seconds` 固化在 sealed PO runner。每次执行的 result 只写 `po_id/proof_type/outcome/blocked_reason/anchors`；历史替代关系只能通过 recorder 的 `--supersedes EVID-*` 参数声明。禁止调用方替换命令或在 result 中写 exit code、stdout/stderr、observation、status、skip、assertion_results 或 supersedes。recorder 实际执行 sealed runner，从 stdout 解析 observation，再按 `ASRT-*` oracle source 计算断言与 PO 状态。
+5. 只用 `verification_run.py record` 追加。脚本用跨平台 run lock 串行化 writer，限制执行时间和保留输出大小，清理常见 secret，分配 `EVID-*`、以权限 `0600` 复制有大小上限的锚点、记录 SHA-256，并通过 `pending-record.json` 写前日志完成 JSONL + state head 事务。进程中断后同一 result 重试会幂等恢复。禁止直接编辑 manifest。
+6. 失败重跑不删除历史；新记录必须用 `--supersedes EVID-*` 明确替代同一 PO 的旧记录。未替代的 failed/blocked 与并存多条 active evidence 都阻止 PASS。
 
-## 裁决
+## 证明强度
 
-`PASS` 仅在每个 critical `PO-*` 有类型匹配且指纹 fresh 的 passed `EVID-*`、每个适用 `BP-*` 有通过的 direct/runtime 证据、无阻断失败/不安全残余时成立。非关键项只可凭明确批准理由 skipped；其余为 `BLOCKED`。不再使用 `CONDITIONAL` 完成交付。
+- Boundary：真实角色执行 direct API/真实入口；覆盖缺 action/entity 权限、错租户/生命周期、zero write/service-not-invoked、denied payload 和适用的 lineage/source 扰动。
+- Visual：批准原型与实现使用相同终端、视口、DPR、字体、数据和状态；结构/禁止元素零偏差，关键几何和感知 diff 有界。
+- Runtime：执行完整用户动作并读取副作用；剪贴板、回跳、异步切换等必须回读结果。
+- Invariant：观察数据库/服务状态和跨事实一致性，不只断言 HTTP 成功。
+- Artifact：检查真实 build、输出隔离、配置、console、生命周期、bundle/性能或发布健康。
 
-按 `artifact-contracts.md` 写 `verification.md`。执行结果表固定为“证据｜证明义务｜覆盖｜证明类型｜环境｜指纹｜命令或步骤｜状态｜退出码｜观察结果｜锚点”；每个上游 ID 与 PO 映射 fresh `EVID-*` 或阻断说明。先保持 Verification `in_progress` 并运行 `validate_feature.py`；verdict=PASS 后只能运行 `finalize_delivery.py` 收口。
+## 问题与风险
+
+问题统一写入 `state.md -> risks[]`，字段为 `id/type/severity/status/statement/owner`；`type=blocker|residual`。open blocker 阻止 PASS。residual risk 只有 `mitigated/closed`，或带 `accepted_by` 的 `accepted` 才可收口。不要在 `verification.md` 中维护第二份风险真值。
+
+## 裁决与报告
+
+`validate_verification_evidence.py` 直接校验 run identity、sealed contract snapshot、contract/code/env freshness、sealed runner 一致性、preflight 逐项重算、hash-chain 与 state head、结构化断言重算、锚点存在性与哈希、PO 唯一 active evidence 和风险。`verification.md` 仅由 active in-progress run 在 feature/run 双锁内生成，可随时重建。本地 hash-chain 防普通篡改和误编辑；拥有代码、state、validator 与全部 artifact 写权限的恶意主体不在本地 proof kernel 的真实性威胁模型内，这类场景必须接外部签名或远端 attestation。
+
+不要手填 PASS 或 completed。运行 `finalize_delivery.py`；它持有同一 run lock，先恢复中断事务，再独立计算 verdict、生成报告、写入 run digest/fingerprint/finalization token，并进行第二次完整校验。失败时只在文件仍等于 finalizer 自己最后写入内容时回滚，绝不覆盖并发编辑。`CONDITIONAL` 不是完成裁决。

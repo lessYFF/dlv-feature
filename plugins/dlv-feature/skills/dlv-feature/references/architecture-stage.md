@@ -49,4 +49,23 @@
 
 预审批准后，技术方案必须覆盖 `FR/BR/AC/EX/US → ARCH/FLOW/API/DATA/UI/IMPACT`，明确事实所有者、快照时点、事务、迁移/回滚、失败模式和用户可见结果；适用时用流程/时序/状态图表达复杂关系。质量保障逐项消费 `BP-*`、隔离、并发与规则变体。
 
+### 数据库章节硬约束
+
+只要技术方案存在“6. 数据”章节，无论是否已分配 `DATA-*`，都必须用 fenced `sql` 展示实际或 proposed DDL，包括 `CREATE/ALTER TABLE`、列类型、NULL/default、PK/FK/unique/check、索引及必要注释。例如：
+
+```sql
+CREATE TABLE sales_follow_up_task (
+    id bigint PRIMARY KEY,
+    status varchar(32) NOT NULL,
+    result_code varchar(64),
+    CONSTRAINT ck_task_result_requires_completion
+        CHECK (result_code IS NULL OR status = 'COMPLETED')
+);
+
+CREATE INDEX idx_sales_follow_up_task_status_result
+    ON sales_follow_up_task (status, result_code);
+```
+
+SQL 后用短段落说明正典、快照时点、事务、锁顺序、容量、迁移与回滚。禁止用 Markdown 的“字段｜类型｜约束”表格模拟 schema；ER/流程图可补充关系，但不能替代 SQL。校验器会硬阻断缺少 DDL 或出现 schema Markdown 表的技术方案。
+
 完成条件：输入 fresh；新增举证、隔离、并发、规则分派无 blocker；所有适用 `BP-*` 的入口、授权、lineage、projection 与 probe 完整且被技术方案消费；无第二事实源、fail-open 隔离、旧入口写旁路或散落规则。技术事实有仓库/基线/路径/符号锚点，新目标标为 proposed。通过后保存指纹并进入 Code Spec。

@@ -6,16 +6,16 @@ DLV Feature is a Codex skill for delivering a feature through one proof-carrying
 Requirement Review → PRD ↔ Approved Prototype → Architecture → Code Spec + Proof Contract → Code → Verification → Deterministic Finalization
 ```
 
-It keeps product behavior, approved visual intent, technical decisions, implementation scope, and verification evidence separate. Schema v6 adds typed `PO-*` obligations (`visual`, `runtime`, `boundary`, `invariant`, and `artifact`), automatic stale propagation, target-runtime mission evidence, and a single deterministic completion entrypoint. A document or agent can no longer self-award `completed`.
+It keeps product behavior, approved visual intent, technical decisions, implementation scope, and verification evidence separate. Schema v7 adds an immutable structured Proof Contract (`ENV/PO/ASRT`), target-runtime preflight, independent Verification Runs, append-only evidence with hashed anchors, generated reports, structured risks, and one deterministic completion entrypoint. A document or agent can no longer self-award `completed`.
 
-Existing schema-v5 deliveries require a conservative review before resuming:
+Existing schema-v6 deliveries require a conservative review before resuming:
 
 ```bash
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v5_to_v6.py <feature-id> --root <project-root>
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v5_to_v6.py <feature-id> --root <project-root> --apply
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v6_to_v7.py <feature-id> --root <project-root>
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v6_to_v7.py <feature-id> --root <project-root> --apply
 ```
 
-The first command is a dry run. The applied upgrade preserves earlier truth where safe, marks unsupported downstream claims stale, and requires a fresh Proof Contract and Verification.
+The first command is a dry run. The applied upgrade preserves approved product/architecture truth, marks unsupported Code Spec/downstream claims stale, and requires a freshly sealed contract and Verification Run.
 
 ## Install from this repository marketplace
 
