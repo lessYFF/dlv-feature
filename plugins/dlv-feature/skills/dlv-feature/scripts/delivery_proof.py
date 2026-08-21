@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic proof-kernel helpers for dlv-feature schema v7."""
+"""Deterministic proof-kernel helpers for dlv-feature schema v8."""
 
 from __future__ import annotations
 
@@ -31,6 +31,18 @@ TRACE_ID = re.compile(
     r"(?:CONTRACT|SHAPE)-[A-Za-z0-9][A-Za-z0-9-]*)$"
 )
 PROOF_TYPES = {"visual", "runtime", "boundary", "invariant", "artifact"}
+VISUAL_RUNTIMES = {"browser", "chromium", "firefox", "webkit", "wechat-devtools", "wechat-device", "ios", "android"}
+RUNTIME_RUNTIMES = VISUAL_RUNTIMES | {
+    "api", "service", "node", "java", "jvm", "python", "ruby", "go", "dotnet",
+    "postgres", "mysql", "sqlite", "redis", "native",
+}
+PROFILE_ADAPTERS = {
+    "visual": {"visual_bundle"},
+    "runtime": {"runtime_trace"},
+    "boundary": {"json_stdout", "none"},
+    "invariant": {"json_stdout", "none"},
+    "artifact": {"json_stdout", "none"},
+}
 ORACLE_KINDS = {
     "exit_code", "http_status", "json_path", "text", "file_hash",
     "screenshot_diff", "side_effect", "state",
@@ -295,8 +307,11 @@ def validate_proof_contract(
     if not isinstance(contract.get("sealed_at"), str) or not contract["sealed_at"].strip():
         errors.append(f"{location}.sealed_at is required")
     approval = contract.get("approval")
-    if not isinstance(approval, dict) or not all(isinstance(approval.get(key), str) and approval[key].strip() for key in ("approved_by", "reference")):
-        errors.append(f"{location}.approval requires approved_by and reference")
+    approval_fields = ("approved_by", "reference", "approval_text_sha256", "quality_review_run_id")
+    if not isinstance(approval, dict) or not all(isinstance(approval.get(key), str) and approval[key].strip() for key in approval_fields):
+        errors.append(f"{location}.approval requires a fingerprint-bound Code Spec approval receipt")
+    elif not SHA256.fullmatch(approval["approval_text_sha256"]):
+        errors.append(f"{location}.approval.approval_text_sha256 must be a lowercase SHA-256 fingerprint")
 
     environments = contract.get("environments")
     environment_map: dict[str, dict[str, Any]] = {}
@@ -328,6 +343,8 @@ def validate_proof_contract(
                         errors.append(f"{check_prefix}.argv must be a non-empty string array")
                     elif "timeout_seconds" in check and (not isinstance(check["timeout_seconds"], int) or not 1 <= check["timeout_seconds"] <= 3600):
                         errors.append(f"{check_prefix}.timeout_seconds must be an integer from 1 to 3600")
+            if not isinstance(item.get("spec"), dict) or not isinstance(item.get("spec", {}).get("runtime"), str):
+                errors.append(f"{prefix}.spec.runtime must be concrete")
             if not isinstance(item.get("target"), str) or not item["target"].strip():
                 errors.append(f"{prefix}.target must be concrete")
             environment_map[environment_id] = item
@@ -378,6 +395,12 @@ def validate_proof_contract(
             errors.append(f"{prefix}.expected is forbidden; use structured assertions")
         if item.get("environment_id") not in environment_map:
             errors.append(f"{prefix}.environment_id must reference a contracted ENV-*")
+        environment = environment_map.get(item.get("environment_id"), {})
+        runtime = environment.get("spec", {}).get("runtime") if isinstance(environment, dict) else None
+        if proof_type == "visual" and runtime not in VISUAL_RUNTIMES:
+            errors.append(f"{prefix} visual proof requires a browser, developer-tool, or device runtime")
+        if proof_type == "runtime" and runtime not in RUNTIME_RUNTIMES:
+            errors.append(f"{prefix} runtime proof cannot use a build-only runtime")
         runner = item.get("runner")
         if not isinstance(runner, dict):
             errors.append(f"{prefix}.runner must bind argv, cwd, and observation_adapter")
@@ -387,8 +410,8 @@ def validate_proof_contract(
                 errors.append(f"{prefix}.runner.argv must be a non-empty string array")
             if not isinstance(runner.get("cwd"), str) or not runner["cwd"].strip():
                 errors.append(f"{prefix}.runner.cwd must be concrete")
-            if runner.get("observation_adapter") not in {"json_stdout", "none"}:
-                errors.append(f"{prefix}.runner.observation_adapter is invalid")
+            if runner.get("observation_adapter") not in PROFILE_ADAPTERS.get(str(proof_type), set()):
+                errors.append(f"{prefix}.runner.observation_adapter does not match proof_type={proof_type}")
             if "timeout_seconds" in runner and (not isinstance(runner["timeout_seconds"], int) or not 1 <= runner["timeout_seconds"] <= 3600):
                 errors.append(f"{prefix}.runner.timeout_seconds must be an integer from 1 to 3600")
         assertions = item.get("assertions")
@@ -421,6 +444,19 @@ def validate_proof_contract(
                 errors.append(f"{assertion_prefix}.oracle.source must select command or observation data")
             if oracle.get("operator") not in {"exists", "absent"} and "expected" not in oracle:
                 errors.append(f"{assertion_prefix}.oracle.expected is required")
+        assertion_sources = {
+            item.get("oracle", {}).get("source") for item in assertions if isinstance(item, dict)
+        }
+        if proof_type == "visual":
+            required_sources = {
+                "/observation/pixel_diff_ratio",
+                "/observation/geometry_diff_max",
+                "/observation/forbidden_elements_count",
+            }
+            if not required_sources <= assertion_sources:
+                errors.append(f"{prefix} visual assertions must cover pixel, geometry, and forbidden-element results")
+        if proof_type == "runtime" and "/observation/result_readback" not in assertion_sources:
+            errors.append(f"{prefix} runtime assertions must prove /observation/result_readback")
 
     missing = acceptance_ids - coverage
     if missing:
@@ -437,6 +473,8 @@ def finalization_payload(state: dict[str, Any]) -> dict[str, Any]:
         "schema_version": state.get("schema_version"),
         "feature_id": state.get("feature_id"),
         "truth": {name: stages.get(name, {}).get("fingerprint") for name in ("prd", "prototype", "architecture", "code_spec")},
+        "approvals": value_digest(state.get("approvals", {})),
+        "quality_reviews": value_digest(state.get("quality_reviews", {})),
         "code_result": code_result_digest(state),
         "proof_contract": proof_contract_digest(state.get("proof_contract")),
         "run_id": verification.get("active_run_id"),

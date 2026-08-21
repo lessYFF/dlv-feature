@@ -19,6 +19,13 @@ from delivery_proof import (
     validate_finalization,
     validate_proof_contract,
 )
+from quality_gates import (
+    proof_contract_draft_digest,
+    prototype_decision_digest,
+    requirement_review_digest,
+    validate_approval_receipt,
+    validate_quality_review,
+)
 
 
 FEATURE_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
@@ -279,15 +286,153 @@ def reports_legacy_bypass(content: str) -> bool:
     return False
 
 
+def mask_sql_comments(sql: str) -> str:
+    """Replace SQL comments with spaces while preserving offsets and newlines."""
+    chars = list(sql)
+    index = 0
+    quote: str | None = None
+    while index < len(chars):
+        if quote:
+            if chars[index] == quote:
+                if index + 1 < len(chars) and chars[index + 1] == quote:
+                    index += 2
+                    continue
+                quote = None
+            index += 1
+            continue
+        if chars[index] in {"'", '"'}:
+            quote = chars[index]
+            index += 1
+            continue
+        if chars[index:index + 2] == ["-", "-"]:
+            while index < len(chars) and chars[index] != "\n":
+                chars[index] = " "
+                index += 1
+            continue
+        if chars[index:index + 2] == ["/", "*"]:
+            chars[index:index + 2] = [" ", " "]
+            index += 2
+            while index < len(chars):
+                if chars[index:index + 2] == ["*", "/"]:
+                    chars[index:index + 2] = [" ", " "]
+                    index += 2
+                    break
+                if chars[index] != "\n":
+                    chars[index] = " "
+                index += 1
+            continue
+        index += 1
+    return "".join(chars)
+
+
+def sql_table_blocks(sql: str) -> list[tuple[str, str]]:
+    """Extract CREATE TABLE bodies while respecting nested type/constraint parentheses."""
+    pattern = re.compile(r"\bCREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+([\w.\"]+)\s*\(", re.I)
+    masked = mask_sql_comments(sql)
+    blocks: list[tuple[str, str]] = []
+    for match in pattern.finditer(masked):
+        depth = 1
+        index = match.end()
+        quote: str | None = None
+        while index < len(masked) and depth:
+            char = masked[index]
+            if quote:
+                if char == quote:
+                    if index + 1 < len(masked) and masked[index + 1] == quote:
+                        index += 2
+                        continue
+                    quote = None
+            elif char in {"'", '"'}:
+                quote = char
+            elif char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+            index += 1
+        if depth == 0:
+            blocks.append((match.group(1).strip('"'), sql[match.end():index - 1]))
+    return blocks
+
+
+def split_sql_definitions(body: str) -> list[str]:
+    definitions: list[str] = []
+    start = 0
+    depth = 0
+    quote: str | None = None
+    masked = mask_sql_comments(body)
+    for index, char in enumerate(masked):
+        if quote:
+            if char == quote and (index + 1 >= len(body) or body[index + 1] != quote):
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "(":
+            depth += 1
+        elif char == ")" and depth:
+            depth -= 1
+        elif char == "," and depth == 0:
+            definitions.append(body[start:index])
+            start = index + 1
+    definitions.append(body[start:])
+    return definitions
+
+
 def validate_database_section(content: str, errors: list[str]) -> None:
-    """Require executable SQL shape and reject Markdown field-table schemas."""
+    """Require a schema-focused SQL sketch, never migration execution machinery."""
     sql_blocks = re.findall(r"```sql\s*\n([\s\S]*?)```", content, re.I)
-    executable_sql = "\n".join(sql_blocks)
-    executable_sql = re.sub(r"/\*[\s\S]*?\*/", " ", executable_sql)
-    executable_sql = re.sub(r"(?m)--[^\n]*$", " ", executable_sql)
+    if re.search(r"\bV[0-9]+__[A-Za-z0-9_-]+\b", "\n".join(sql_blocks), re.I):
+        errors.append("architecture database design must not contain migration numbering")
+    raw_sql = "\n".join(sql_blocks)
+    executable_sql = mask_sql_comments(raw_sql)
     executable_sql = re.sub(r"'(?:''|[^'])*'", "''", executable_sql)
-    if not re.search(r"\b(?:CREATE|ALTER)\s+(?:TABLE|INDEX)\b", executable_sql, re.I):
-        errors.append("architecture database design requires fenced SQL DDL (CREATE/ALTER TABLE or INDEX)")
+    if not re.search(r"\b(?:CREATE|ALTER)\s+TABLE\b", executable_sql, re.I):
+        errors.append("architecture database design requires fenced SQL DDL schema")
+    forbidden = re.search(
+        r"\b(?:DO|EXECUTE|LOOP|CREATE\s+SCHEMA|DROP|INSERT|UPDATE|DELETE)\b|\bFOR\s+\w+\s+IN\b",
+        executable_sql,
+        re.I,
+    )
+    if forbidden:
+        errors.append("architecture database design must not contain migration execution logic")
+    comment_targets = {
+        (table.strip('"').lower(), column.strip('"').lower())
+        for table, column in re.findall(r"COMMENT\s+ON\s+COLUMN\s+([\w.\"]+)\.([\w\"]+)", executable_sql, re.I)
+    }
+    table_blocks = sql_table_blocks(raw_sql)
+    uncommented: list[str] = []
+    for table, body in table_blocks:
+        inline_commented = {
+            match.group(1).strip('"').lower()
+            for line in body.splitlines()
+            if (match := re.match(r'\s*("?[A-Za-z_][\w]*"?)\s+[A-Za-z]', line))
+            and re.search(r"--\s*\S", line)
+        }
+        for definition in split_sql_definitions(body):
+            stripped = re.sub(r"^(?:\s*--[^\n]*\n)+", "", definition).strip()
+            if not stripped or re.match(r"(?i)^(?:CONSTRAINT|PRIMARY|FOREIGN|UNIQUE|CHECK)\b", stripped):
+                continue
+            match = re.match(r'("?[A-Za-z_][\w]*"?)\s+[A-Za-z]', stripped)
+            if not match:
+                continue
+            column = match.group(1).strip('"')
+            if column.lower() not in inline_commented and (table.lower(), column.lower()) not in comment_targets:
+                uncommented.append(f"{table}.{column}")
+    for match in re.finditer(
+        r"ALTER\s+TABLE\s+([\w.\"]+)\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(\"?[A-Za-z_][\w]*\"?)([^;\n]*)",
+        executable_sql,
+        re.I,
+    ):
+        table = match.group(1).strip('"')
+        column = match.group(2).strip('"')
+        line_end = raw_sql.find("\n", match.end())
+        if line_end < 0:
+            line_end = len(raw_sql)
+        raw_line_tail = raw_sql[match.start(3):line_end]
+        if not re.search(r"--\s*\S", raw_line_tail) and (table.lower(), column.lower()) not in comment_targets:
+            uncommented.append(f"{table}.{column}")
+    if uncommented:
+        errors.append("architecture SQL columns require comments: " + ", ".join(uncommented))
     if has_markdown_table(content):
         errors.append("architecture database section must use SQL DDL, not Markdown schema tables")
 
@@ -313,8 +458,7 @@ def validate_readability(stage: str, sections: dict[str, str], errors: list[str]
         for heading in ("2. 现状", "3. 方案", "5. 接口", "8. 质量保障", "9. 影响范围", "11. 需求追踪"):
             require_structure(sections, heading, ("table",), name, errors)
         require_structure(sections, "4. 流程", ("mermaid",), name, errors)
-        # Database structure is executable architecture, not a prose field matrix.
-        # DATA-* sections are checked below for fenced SQL DDL.
+        # Database structure is a commented schema contract, not migration machinery.
         require_structure(sections, "7. 前端", ("table", "mermaid"), name, errors)
         require_structure(sections, "10. 发布与回滚", ("ordered-list",), name, errors)
         if "10. 发布与回滚" in sections and not has_markdown_table(sections["10. 发布与回滚"]):
@@ -1102,7 +1246,89 @@ def validate_semantics(
         # invoked by main(), owns evidence coverage and the verdict.
 
 
-def report(errors: list[str], warnings: list[str]) -> int:
+def validate_v8_gates(
+    root: Path,
+    feature_id: str,
+    feature_dir: Path,
+    state: dict[str, Any],
+    errors: list[str],
+) -> None:
+    approvals = state.get("approvals")
+    if not isinstance(approvals, dict):
+        errors.append("approvals must be an object")
+        approvals = {}
+    reviews = state.get("quality_reviews")
+    if not isinstance(reviews, dict):
+        errors.append("quality_reviews must be an object")
+        reviews = {}
+    else:
+        unknown = set(reviews) - {"architecture", "code_spec"}
+        if unknown:
+            errors.append(f"quality_reviews contains unknown keys: {', '.join(sorted(unknown))}")
+
+    requirement = state.get("requirement_review")
+    if isinstance(requirement, dict) and requirement.get("status") == "completed":
+        validate_approval_receipt(
+            approvals.get("requirement_review"),
+            "requirement_review",
+            requirement_review_digest(requirement),
+            errors,
+        )
+
+    stages = state.get("stages", {})
+    for stage, artifact_name in (("prd", "prd.md"), ("prototype", "prototype.html")):
+        if stages.get(stage, {}).get("status") != "completed":
+            continue
+        path = feature_dir / artifact_name
+        if path.is_file():
+            validate_approval_receipt(approvals.get(stage), stage, digest(path), errors)
+    if stages.get("prototype", {}).get("status") == "not_applicable":
+        prd_fingerprint = stages.get("prd", {}).get("fingerprint")
+        if isinstance(prd_fingerprint, str) and SHA256.fullmatch(prd_fingerprint):
+            validate_approval_receipt(
+                approvals.get("prototype"),
+                "prototype",
+                prototype_decision_digest(prd_fingerprint),
+                errors,
+            )
+
+    for review_type in ("architecture", "code_spec"):
+        summary = reviews.get(review_type)
+        stage_completed = stages.get(review_type, {}).get("status") == "completed"
+        receipt = approvals.get(review_type)
+        if summary is None and not stage_completed and receipt is None:
+            continue
+        review_errors: list[str] = []
+        review = validate_quality_review(
+            root,
+            feature_id,
+            review_type,
+            state,
+            review_errors,
+            require_pass=stage_completed or receipt is not None,
+        )
+        errors.extend(review_errors)
+        artifact_name = "architecture-design.md" if review_type == "architecture" else "code-spec.md"
+        artifact_path = feature_dir / artifact_name
+        if receipt is not None or stage_completed:
+            if artifact_path.is_file():
+                validate_approval_receipt(
+                    receipt,
+                    review_type,
+                    digest(artifact_path),
+                    errors,
+                    review=review,
+                    proof_contract_sha256=(
+                        proof_contract_draft_digest(state.get("proof_contract"))
+                        if review_type == "code_spec"
+                        else None
+                    ),
+                )
+            else:
+                errors.append(f"{review_type} approval requires {artifact_name}")
+
+
+def report(errors: list[str], warnings: list[str], *, final: bool = False) -> int:
     for warning in warnings:
         print(f"WARN: {warning}")
     for error in errors:
@@ -1110,7 +1336,8 @@ def report(errors: list[str], warnings: list[str]) -> int:
     if errors:
         print(f"INVALID: {len(errors)} error(s), {len(warnings)} warning(s)")
         return 1
-    print(f"VALID: 0 errors, {len(warnings)} warning(s)")
+    status = "DELIVERY COMPLETE" if final else "VALID INTERMEDIATE"
+    print(f"{status}: 0 errors, {len(warnings)} warning(s)")
     return 0
 
 
@@ -1118,6 +1345,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("feature_id")
     parser.add_argument("--root", default=".")
+    parser.add_argument("--final", action="store_true", help="Require a finalized PASS delivery")
     args = parser.parse_args()
     errors: list[str] = []
     warnings: list[str] = []
@@ -1128,13 +1356,13 @@ def main() -> int:
     state_path = feature_dir / "state.md"
     if not state_path.is_file():
         errors.append(f"missing state file: {state_path}")
-        return report(errors, warnings)
+        return report(errors, warnings, final=args.final)
     state = extract_state(state_path, errors)
     if state is None:
-        return report(errors, warnings)
-    if state.get("schema_version") != 7:
-        errors.append("state.md schema_version must be 7; run upgrade_v6_to_v7.py for v6 deliveries")
-        return report(errors, warnings)
+        return report(errors, warnings, final=args.final)
+    if state.get("schema_version") != 8:
+        errors.append("state.md schema_version must be 8; run upgrade_v7_to_v8.py for v7 deliveries")
+        return report(errors, warnings, final=args.final)
     if state.get("feature_id") != args.feature_id:
         errors.append("state.md feature_id does not match directory/argument")
     if state.get("current_stage") not in STAGES:
@@ -1144,7 +1372,8 @@ def main() -> int:
     stages = state.get("stages")
     if not isinstance(stages, dict):
         errors.append("stages must be an object")
-        return report(errors, warnings)
+        return report(errors, warnings, final=args.final)
+    validate_v8_gates(root, args.feature_id, feature_dir, state, errors)
     confirmed_src = validate_requirement_review(state.get("requirement_review"), stages, errors)
     prd_fp = stages.get("prd", {}).get("fingerprint")
     prototype_item = stages.get("prototype", {})
@@ -1178,6 +1407,22 @@ def main() -> int:
                     errors.append(f"completed stage {name} requires a lowercase SHA-256 fingerprint")
                 elif expected != actual:
                     errors.append(f"fingerprint mismatch for {artifact_name}")
+
+    stage_objects_valid = all(
+        isinstance(stages.get(name), dict) and stages[name].get("status") in STATUSES
+        for name in STAGES
+    )
+    if stage_objects_valid:
+        expected_current = "verification"
+        for name in STAGES:
+            complete = {"completed", "not_applicable"} if name == "prototype" else {"completed"}
+            if stages[name]["status"] not in complete:
+                expected_current = name
+                break
+        if state.get("current_stage") != expected_current:
+            errors.append(
+                f"current_stage must be the earliest incomplete stage: {expected_current}"
+            )
 
     prereqs = {"architecture": ("prd", "prototype"), "code_spec": ("architecture",), "code": ("code_spec",), "verification": ("code",)}
     for name, required in prereqs.items():
@@ -1252,7 +1497,8 @@ def main() -> int:
         errors.append("invalid verification verdict")
     if stages.get("verification", {}).get("status") == "completed" and verdict != "PASS":
         errors.append("completed verification requires PASS verdict")
-    if stages.get("verification", {}).get("status") in {"in_progress", "completed"}:
+    verification_status = stages.get("verification", {}).get("status")
+    if verification_status in {"in_progress", "completed"}:
         run_errors: list[str] = []
         try:
             run_verdict, current_run_digest = validate_verification_run(root, args.feature_id, state, run_errors)
@@ -1265,7 +1511,30 @@ def main() -> int:
         recorded_run_digest = stages.get("verification", {}).get("run_digest")
         if recorded_run_digest is not None and recorded_run_digest != current_run_digest:
             errors.append("verification run_digest is stale")
+    elif verification_status == "blocked":
+        report_path = feature_dir / "verification.md"
+        if not report_path.is_file() or report_path.stat().st_size == 0:
+            errors.append("blocked Verification Run requires generated verification.md")
     validate_finalization(state, errors)
+
+    if args.final:
+        incomplete = [
+            name for name in ("prd", "architecture", "code_spec", "code", "verification")
+            if stages.get(name, {}).get("status") != "completed"
+        ]
+        if stages.get("prototype", {}).get("status") not in {"completed", "not_applicable"}:
+            incomplete.append("prototype")
+        if state.get("requirement_review", {}).get("status") != "completed":
+            incomplete.insert(0, "requirement_review")
+        if incomplete:
+            errors.append("final validation requires completed stages: " + ", ".join(incomplete))
+        if verdict != "PASS":
+            errors.append("final validation requires verification verdict PASS")
+        if state.get("current_stage") != "verification":
+            errors.append("final validation requires current_stage=verification")
+        verification_path = feature_dir / "verification.md"
+        if not verification_path.is_file():
+            errors.append("final validation requires verification.md")
 
     validate_semantics(
         feature_dir,
@@ -1284,7 +1553,7 @@ def main() -> int:
                 errors.append(f"unexpected directory in minimal feature artifact set: {entry.name}/")
     if not state.get("last_updated"):
         warnings.append("state.md has no last_updated timestamp")
-    return report(errors, warnings)
+    return report(errors, warnings, final=args.final)
 
 
 if __name__ == "__main__":

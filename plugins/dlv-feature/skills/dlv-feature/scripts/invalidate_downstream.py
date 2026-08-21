@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Mark changed schema-v7 truth/code and downstream runs stale."""
+"""Mark changed schema-v8 truth/code and downstream runs stale."""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -31,8 +32,9 @@ def invalidate(root: Path, feature_id: str, from_stage: str | None) -> str:
         raise ValueError(f"missing {state_path}")
     with exclusive_file_lock(root / ".dlv" / "runs" / feature_id / ".feature.lock"):
         content, state = extract_state(state_path)
-        if state.get("schema_version") != 7:
-            raise ValueError("invalidate_downstream.py only accepts schema_version=7")
+        if state.get("schema_version") != 8:
+            raise ValueError("invalidate_downstream.py only accepts schema_version=8")
+        original_state = copy.deepcopy(state)
         stages = state.get("stages", {})
         changed: list[str] = [from_stage] if from_stage else []
         for stage, name in ARTIFACTS.items():
@@ -55,14 +57,37 @@ def invalidate(root: Path, feature_id: str, from_stage: str | None) -> str:
                 item["status"] = "stale"
             if stage == "verification" and isinstance(item, dict):
                 item.update({"finalization": None, "verdict": None, "run_digest": None})
-        if start <= ORDER.index("code_spec"):
+        remove_contract_snapshot = start <= ORDER.index("code_spec")
+        if remove_contract_snapshot:
             contract = state.get("proof_contract")
             if isinstance(contract, dict):
                 contract.update({"status": "stale", "seal": None, "sealed_at": None, "approval": None})
-            (state_path.parent / "proof-contract.json").unlink(missing_ok=True)
+        approvals = state.setdefault("approvals", {})
+        quality_reviews = state.setdefault("quality_reviews", {"architecture": None, "code_spec": None})
+        if start <= ORDER.index("prd"):
+            for key in ("prd", "prototype", "architecture", "code_spec"):
+                approvals.pop(key, None)
+            quality_reviews.update({"architecture": None, "code_spec": None})
+        elif start <= ORDER.index("prototype"):
+            for key in ("prd", "prototype", "architecture", "code_spec"):
+                approvals.pop(key, None)
+            quality_reviews.update({"architecture": None, "code_spec": None})
+        elif start <= ORDER.index("architecture"):
+            for key in ("architecture", "code_spec"):
+                approvals.pop(key, None)
+            quality_reviews.update({"architecture": None, "code_spec": None})
+        elif start <= ORDER.index("code_spec"):
+            approvals.pop("code_spec", None)
+            quality_reviews["code_spec"] = None
         state["current_stage"] = ORDER[start]
         state["last_updated"] = timestamp()
         write_state(state_path, content, state)
+        if remove_contract_snapshot:
+            try:
+                (state_path.parent / "proof-contract.json").unlink(missing_ok=True)
+            except OSError:
+                write_state(state_path, content, original_state)
+                raise
         return f"stale from {ORDER[start]}: {', '.join(ORDER[start:])}"
 
 
