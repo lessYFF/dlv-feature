@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Create schema-v8 verification runs, append evidence, and render reports."""
+"""Create Verification-schema-v8 runs for delivery-schema-v9 features."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import signal
 import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import threading
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -39,6 +43,7 @@ RUN_ID = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_CAPTURE_BYTES = 1_048_576
 MAX_ANCHOR_BYTES = 10_485_760
+MAX_VISUAL_PIXELS = 16_777_216
 
 
 def timestamp() -> str:
@@ -57,6 +62,142 @@ def is_supported_image(path: Path) -> bool:
         or header.startswith(b"\xff\xd8\xff")
         or (len(header) >= 12 and header[:4] == b"RIFF" and header[8:12] == b"WEBP")
     )
+
+
+def copy_bounded_anchor(source: Path, target: Path) -> None:
+    """Snapshot one source file through a single open descriptor before inspecting or hashing it."""
+    if not source.is_file():
+        raise ValueError(f"anchor does not exist: {source}")
+    descriptor, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    total = 0
+    try:
+        with source.open("rb") as reader, os.fdopen(descriptor, "wb") as writer:
+            while chunk := reader.read(65_536):
+                total += len(chunk)
+                if total > MAX_ANCHOR_BYTES:
+                    raise ValueError(f"anchor exceeds {MAX_ANCHOR_BYTES} bytes: {source}")
+                writer.write(chunk)
+            writer.flush()
+            os.fsync(writer.fileno())
+        os.replace(temporary, target)
+        target.chmod(0o600)
+    except BaseException:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        Path(temporary).unlink(missing_ok=True)
+        raise
+
+
+def load_png_rgba(path: Path) -> tuple[int, int, bytes]:
+    """Decode a non-interlaced 8-bit PNG with stdlib so visual metrics are not caller-asserted."""
+    if path.stat().st_size > MAX_ANCHOR_BYTES:
+        raise ValueError(f"visual PNG exceeds {MAX_ANCHOR_BYTES} bytes: {path}")
+    data = path.read_bytes()
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise ValueError(f"pixel comparison requires PNG screenshots: {path}")
+    offset = 8
+    width = height = bit_depth = color_type = interlace = None
+    seen_ihdr = False
+    compressed = bytearray()
+    while offset + 12 <= len(data):
+        length = struct.unpack(">I", data[offset:offset + 4])[0]
+        chunk_type = data[offset + 4:offset + 8]
+        chunk_data = data[offset + 8:offset + 8 + length]
+        crc_end = offset + 12 + length
+        if crc_end > len(data):
+            raise ValueError(f"truncated PNG chunk: {path}")
+        expected_crc = struct.unpack(">I", data[offset + 8 + length:crc_end])[0]
+        if zlib.crc32(chunk_type + chunk_data) & 0xFFFFFFFF != expected_crc:
+            raise ValueError(f"PNG CRC mismatch: {path}")
+        if chunk_type == b"IHDR":
+            if seen_ihdr or len(chunk_data) != 13:
+                raise ValueError(f"PNG requires exactly one 13-byte IHDR chunk: {path}")
+            seen_ihdr = True
+            width, height, bit_depth, color_type, _, _, interlace = struct.unpack(">IIBBBBB", chunk_data)
+        elif chunk_type == b"IDAT":
+            compressed.extend(chunk_data)
+        elif chunk_type == b"IEND":
+            break
+        offset = crc_end
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}.get(color_type)
+    if not width or not height or bit_depth != 8 or channels is None or interlace != 0:
+        raise ValueError(f"pixel comparison requires non-interlaced 8-bit RGB/RGBA/gray PNG: {path}")
+    if width * height > MAX_VISUAL_PIXELS:
+        raise ValueError(f"visual PNG exceeds {MAX_VISUAL_PIXELS} pixels: {path}")
+    expected_size = height * (width * channels + 1)
+    try:
+        decompressor = zlib.decompressobj()
+        raw = decompressor.decompress(bytes(compressed), expected_size + 1)
+        remaining = expected_size + 1 - len(raw)
+        if remaining > 0:
+            raw += decompressor.flush(remaining)
+    except zlib.error as exc:
+        raise ValueError(f"invalid PNG image data: {path}") from exc
+    stride = width * channels
+    if len(raw) != expected_size or decompressor.unconsumed_tail or not decompressor.eof:
+        raise ValueError(f"PNG scanline size mismatch: {path}")
+    rows: list[bytearray] = []
+    cursor = 0
+    prior = bytearray(stride)
+    for _ in range(height):
+        filter_type = raw[cursor]
+        cursor += 1
+        scan = bytearray(raw[cursor:cursor + stride])
+        cursor += stride
+        for index in range(stride):
+            left = scan[index - channels] if index >= channels else 0
+            up = prior[index]
+            upper_left = prior[index - channels] if index >= channels else 0
+            if filter_type == 1:
+                scan[index] = (scan[index] + left) & 0xFF
+            elif filter_type == 2:
+                scan[index] = (scan[index] + up) & 0xFF
+            elif filter_type == 3:
+                scan[index] = (scan[index] + ((left + up) // 2)) & 0xFF
+            elif filter_type == 4:
+                estimate = left + up - upper_left
+                distances = (abs(estimate - left), abs(estimate - up), abs(estimate - upper_left))
+                predictor = (left, up, upper_left)[distances.index(min(distances))]
+                scan[index] = (scan[index] + predictor) & 0xFF
+            elif filter_type != 0:
+                raise ValueError(f"unsupported PNG filter: {filter_type}")
+        rows.append(scan)
+        prior = scan
+    rgba = bytearray()
+    for row in rows:
+        for index in range(0, len(row), channels):
+            pixel = row[index:index + channels]
+            if color_type == 6:
+                rgba.extend(pixel)
+            elif color_type == 2:
+                rgba.extend((*pixel, 255))
+            elif color_type == 4:
+                rgba.extend((pixel[0], pixel[0], pixel[0], pixel[1]))
+            else:
+                rgba.extend((pixel[0], pixel[0], pixel[0], 255))
+    return width, height, bytes(rgba)
+
+
+def computed_visual_metrics(anchors: list[tuple[str | None, Path]]) -> tuple[float, int]:
+    by_role = {role: path for role, path in anchors if role is not None}
+    prototype_width, prototype_height, prototype = load_png_rgba(by_role["prototype_screenshot"])
+    implementation_width, implementation_height, implementation = load_png_rgba(by_role["implementation_screenshot"])
+    diff_width, diff_height, diff = load_png_rgba(by_role["visual_diff"])
+    if (diff_width, diff_height) != (implementation_width, implementation_height):
+        raise ValueError("visual_diff dimensions must match the implementation screenshot")
+    if any(diff[index:index + 3] != b"\x00\x00\x00" for index in range(0, len(diff), 4)):
+        raise ValueError("visual_diff must contain zero RGB difference pixels")
+    geometry = max(abs(prototype_width - implementation_width), abs(prototype_height - implementation_height))
+    if geometry:
+        return 1.0, geometry
+    pixel_count = prototype_width * prototype_height
+    different = sum(
+        prototype[index:index + 4] != implementation[index:index + 4]
+        for index in range(0, len(prototype), 4)
+    )
+    return different / pixel_count, 0
 
 
 def load_runtime_trace(path: Path) -> dict[str, Any]:
@@ -226,8 +367,8 @@ def start(feature_id: str, root: Path, run_id: str, environment_args: list[str])
 def _start_locked(feature_id: str, root: Path, run_id: str, environment_args: list[str]) -> Path:
     state_path = root / "delivery" / feature_id / "state.md"
     content, state = extract_state(state_path)
-    if state.get("schema_version") != 8:
-        raise ValueError("verification runs require schema_version=8")
+    if state.get("schema_version") != 9:
+        raise ValueError("verification runs require schema_version=9")
     contract = state.get("proof_contract")
     if not isinstance(contract, dict) or contract.get("status") != "completed":
         raise ValueError("proof contract must be completed and sealed before starting Verification")
@@ -500,6 +641,71 @@ def _record_locked(feature_id: str, root: Path, run_id: str, result_path: Path, 
         readback = observation["result_readback"]
         if readback is None or readback == "" or readback == {} or readback == []:
             raise ValueError("runtime_trace result_readback must be non-empty")
+    existing = load_manifest(destination / "evidence.jsonl")
+    current_head = existing[-1].get("record_hash") if existing else "0" * 64
+    if verification_state.get("evidence_count") != len(existing) or verification_state.get("evidence_head") != current_head:
+        raise ValueError("evidence manifest disagrees with the state-anchored append-only head")
+    evidence_id = f"EVID-{len(existing) + 1:04d}"
+    existing_ids = {item.get("evidence_id") for item in existing}
+    if set(supersedes) - existing_ids:
+        raise ValueError("supersedes references unknown evidence")
+    already_superseded = {item for record in existing for item in record.get("supersedes", [])}
+    if set(supersedes) & already_superseded:
+        raise ValueError("evidence can only be superseded once")
+    if any(item.get("po_id") != po_id for item in existing if item.get("evidence_id") in supersedes):
+        raise ValueError("evidence may only supersede the same proof obligation")
+
+    anchors = result.get("anchors", [])
+    if not isinstance(anchors, list):
+        raise ValueError("anchors must be an array")
+    roles: set[str] = set()
+    role_counts: dict[str, int] = {}
+    role_source_paths: dict[str, Path] = {}
+    normalized_anchors: list[tuple[str | None, Path]] = []
+    captured_anchors: list[dict[str, Any]] = []
+    anchor_dir = destination / "anchors"
+    anchor_dir.mkdir(exist_ok=True)
+    for index, raw in enumerate(anchors, 1):
+        if isinstance(raw, dict):
+            role = raw.get("role")
+            source_value = raw.get("path")
+            if not isinstance(role, str) or not role.strip() or not isinstance(source_value, str):
+                raise ValueError("structured anchors require role and path")
+            roles.add(role)
+            role_counts[role] = role_counts.get(role, 0) + 1
+            source = Path(source_value).expanduser().resolve()
+            role_source_paths[role] = source
+        else:
+            role = None
+            source = Path(str(raw)).expanduser().resolve()
+        target = anchor_dir / f"{evidence_id.lower()}-{index}-{source.name}"
+        copy_bounded_anchor(source, target)
+        normalized_anchors.append((role, target))
+        stored = {
+            "path": target.relative_to(destination).as_posix(),
+            "sha256": file_digest(target),
+            "size": target.stat().st_size,
+        }
+        if role is not None:
+            stored["role"] = role
+        captured_anchors.append(stored)
+    if requested_outcome == "evaluate" and proof_type == "visual":
+        required_roles = {"prototype_screenshot", "implementation_screenshot", "visual_diff"}
+        if not required_roles <= roles:
+            raise ValueError("visual evidence requires prototype_screenshot, implementation_screenshot, and visual_diff anchors")
+        if any(role_counts.get(role) != 1 for role in required_roles):
+            raise ValueError("visual evidence requires exactly one anchor for each screenshot/diff role")
+        visual_sources = {role_source_paths[role] for role in required_roles if role in role_source_paths}
+        if len(visual_sources) != len(required_roles):
+            raise ValueError("visual evidence requires three distinct screenshot/diff anchor files")
+        for role, source in normalized_anchors:
+            if role in required_roles and (not source.is_file() or source.suffix.lower() != ".png"):
+                raise ValueError(f"visual pixel comparison requires a PNG anchor: {source}")
+        computed_pixel, computed_geometry = computed_visual_metrics(normalized_anchors)
+        if observation["pixel_diff_ratio"] != computed_pixel:
+            raise ValueError("visual_bundle pixel_diff_ratio disagrees with the screenshot pixels")
+        if observation["geometry_diff_max"] != computed_geometry:
+            raise ValueError("visual_bundle geometry_diff_max disagrees with the screenshot dimensions")
     evidence_source = {"command": command, "observation": observation}
 
     assertion_contract = {
@@ -527,26 +733,7 @@ def _record_locked(feature_id: str, root: Path, run_id: str, result_path: Path, 
         else ("passed" if all(item["status"] == "passed" for item in computed_results) else "failed")
     )
 
-    existing = load_manifest(destination / "evidence.jsonl")
-    current_head = existing[-1].get("record_hash") if existing else "0" * 64
-    if verification_state.get("evidence_count") != len(existing) or verification_state.get("evidence_head") != current_head:
-        raise ValueError("evidence manifest disagrees with the state-anchored append-only head")
-    evidence_id = f"EVID-{len(existing) + 1:04d}"
-    existing_ids = {item.get("evidence_id") for item in existing}
-    if set(supersedes) - existing_ids:
-        raise ValueError("supersedes references unknown evidence")
-    already_superseded = {item for record in existing for item in record.get("supersedes", [])}
-    if set(supersedes) & already_superseded:
-        raise ValueError("evidence can only be superseded once")
-    if any(item.get("po_id") != po_id for item in existing if item.get("evidence_id") in supersedes):
-        raise ValueError("evidence may only supersede the same proof obligation")
-
-    anchors = result.get("anchors", [])
-    if not isinstance(anchors, list):
-        raise ValueError("anchors must be an array")
     stored_anchors: list[dict[str, Any]] = []
-    anchor_dir = destination / "anchors"
-    anchor_dir.mkdir(exist_ok=True)
     generated = {
         "command.json": json.dumps(command, ensure_ascii=False, indent=2) + "\n",
         "observation.json": json.dumps(observation, ensure_ascii=False, indent=2) + "\n",
@@ -555,53 +742,16 @@ def _record_locked(feature_id: str, root: Path, run_id: str, result_path: Path, 
         target = anchor_dir / f"{evidence_id.lower()}-{name}"
         atomic_write_text(target, payload)
         stored_anchors.append({"path": target.relative_to(destination).as_posix(), "sha256": file_digest(target), "size": target.stat().st_size})
-    roles: set[str] = set()
-    role_counts: dict[str, int] = {}
-    normalized_anchors: list[tuple[str | None, Path]] = []
-    for raw in anchors:
-        if isinstance(raw, dict):
-            role = raw.get("role")
-            source_value = raw.get("path")
-            if not isinstance(role, str) or not role.strip() or not isinstance(source_value, str):
-                raise ValueError("structured anchors require role and path")
-            roles.add(role)
-            role_counts[role] = role_counts.get(role, 0) + 1
-            normalized_anchors.append((role, Path(source_value).expanduser().resolve()))
-        else:
-            normalized_anchors.append((None, Path(str(raw)).expanduser().resolve()))
-    if requested_outcome == "evaluate" and proof_type == "visual":
-        required_roles = {"prototype_screenshot", "implementation_screenshot", "visual_diff"}
-        if not required_roles <= roles:
-            raise ValueError("visual evidence requires prototype_screenshot, implementation_screenshot, and visual_diff anchors")
-        if any(role_counts.get(role) != 1 for role in required_roles):
-            raise ValueError("visual evidence requires exactly one anchor for each screenshot/diff role")
-        visual_sources = {source for role, source in normalized_anchors if role in required_roles}
-        if len(visual_sources) != len(required_roles):
-            raise ValueError("visual evidence requires three distinct screenshot/diff anchor files")
     if requested_outcome == "evaluate" and proof_type == "runtime":
         if role_counts.get("runtime_trace") != 1:
             raise ValueError("runtime evidence requires exactly one runtime_trace anchor")
-    for index, (role, source) in enumerate(normalized_anchors, 1):
-        if not source.is_file():
-            raise ValueError(f"anchor does not exist: {source}")
-        if source.stat().st_size > MAX_ANCHOR_BYTES:
-            raise ValueError(f"anchor exceeds {MAX_ANCHOR_BYTES} bytes: {source}")
+    for role, source in normalized_anchors:
         if role in {"prototype_screenshot", "implementation_screenshot", "visual_diff"}:
             if source.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"} or not is_supported_image(source):
                 raise ValueError(f"visual anchor must contain a supported image: {source}")
         if role == "runtime_trace" and load_runtime_trace(source) != observation:
             raise ValueError("runtime_trace anchor must match the runner-derived observation")
-        target = anchor_dir / f"{evidence_id.lower()}-{index}-{source.name}"
-        shutil.copyfile(source, target)
-        target.chmod(0o600)
-        stored = {
-            "path": target.relative_to(destination).as_posix(),
-            "sha256": file_digest(target),
-            "size": target.stat().st_size,
-        }
-        if role is not None:
-            stored["role"] = role
-        stored_anchors.append(stored)
+    stored_anchors.extend(captured_anchors)
 
     environment_id = obligation.get("environment_id")
     snapshot = metadata.get("environments", {}).get(environment_id)

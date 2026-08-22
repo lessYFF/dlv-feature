@@ -20,10 +20,6 @@ from delivery_proof import (
     validate_proof_contract,
 )
 from quality_gates import (
-    proof_contract_draft_digest,
-    prototype_decision_digest,
-    requirement_review_digest,
-    validate_approval_receipt,
     validate_quality_review,
 )
 
@@ -522,15 +518,15 @@ def validate_requirement_review(review: Any, stages: dict[str, Any], errors: lis
         errors.append("requirement_review must be an object")
         return set()
     status = review.get("status")
-    if status not in {"pending", "completed"}:
-        errors.append("requirement_review.status must be pending or completed")
+    if status not in {"pending", "in_progress", "completed", "blocked"}:
+        errors.append("requirement_review.status must be pending, in_progress, completed, or blocked")
         return set()
     active_prd = stages.get("prd", {}).get("status") in {"in_progress", "blocked", "completed", "stale"}
     confirmed = review.get("confirmed_ids")
     confirmed_ids = set(confirmed) if isinstance(confirmed, list) and all(isinstance(x, str) for x in confirmed) else set()
-    if active_prd and status != "completed":
-        errors.append("PRD work requires completed requirement review")
-    if status == "completed":
+    if active_prd and status == "pending":
+        errors.append("PRD work requires an in-progress requirement baseline")
+    if status != "pending":
         if not isinstance(review.get("source_fingerprint"), str) or not SHA256.fullmatch(review["source_fingerprint"]):
             errors.append("completed requirement review requires a lowercase SHA-256 source_fingerprint")
         if not confirmed_ids or not all(ID_PATTERNS["SRC"].fullmatch(x) for x in confirmed_ids):
@@ -545,8 +541,8 @@ def validate_requirement_review(review: Any, stages: dict[str, Any], errors: lis
             for key in required - {"ui_impact"}:
                 if summary.get(key) is None or summary.get(key) == "" or summary.get(key) == [] or summary.get(key) == {}:
                     errors.append(f"requirement review summary.{key} must be non-empty; use an explicit none/no-open-items statement")
-        if not review.get("approved_at"):
-            errors.append("completed requirement review requires approved_at")
+        if status == "completed" and not review.get("reviewed_at"):
+            errors.append("completed requirement review requires reviewed_at")
     return confirmed_ids
 
 
@@ -575,17 +571,17 @@ def validate_architecture_review(
         errors.append("architecture_review must be an object")
         return {}
     status = review.get("status")
-    if status not in {"pending", "completed"}:
-        errors.append("architecture_review.status must be pending or completed")
+    if status not in {"pending", "in_progress", "completed", "blocked"}:
+        errors.append("architecture_review.status must be pending, in_progress, completed, or blocked")
         return review
     arch_status = stages.get("architecture", {}).get("status")
     # A blocked Architecture may mean the convergence review is waiting for
-    # evidence or user approval; detailed design has not started in that case.
+    # evidence or a completed automated review; detailed design has not started in that case.
     active = arch_status in {"in_progress", "completed", "stale"} or (
         arch_status == "blocked" and status == "completed"
     )
-    if active and status != "completed":
-        errors.append("architecture work requires completed architecture convergence review")
+    if active and status == "pending":
+        errors.append("architecture work requires an in-progress architecture convergence review")
     inputs = review.get("inputs")
     if not isinstance(inputs, dict):
         errors.append("architecture_review.inputs must be an object")
@@ -728,16 +724,16 @@ def validate_architecture_review(
     for index, decision in enumerate(material_decisions):
         valid = require_object_fields(
             decision,
-            {"id", "addition_ids", "decision", "reason", "reversible", "approval"},
+            {"id", "addition_ids", "decision", "reason", "reversible", "verdict"},
             f"architecture_review.material_decisions[{index}]",
             errors,
         )
         if valid and not re.fullmatch(r"MAT-[0-9]+", str(decision.get("id", ""))):
             errors.append(f"architecture_review.material_decisions[{index}].id must use MAT-nn")
-        if isinstance(decision, dict) and decision.get("approval") not in {"PENDING", "APPROVED"}:
-            errors.append(f"material architecture decision {decision.get('id')} approval must be PENDING or APPROVED")
-        if completed and isinstance(decision, dict) and decision.get("approval") != "APPROVED":
-            errors.append(f"material architecture decision {decision.get('id')} is not approved")
+        if isinstance(decision, dict) and decision.get("verdict") not in {"PENDING", "PASS", "BLOCKED"}:
+            errors.append(f"material architecture decision {decision.get('id')} verdict must be PENDING, PASS, or BLOCKED")
+        if completed and isinstance(decision, dict) and decision.get("verdict") != "PASS":
+            errors.append(f"material architecture decision {decision.get('id')} did not pass review")
     material_types = {"table", "link_table", "api", "event", "queue"}
     material_additions = [
         item for item in additions
@@ -758,11 +754,11 @@ def validate_architecture_review(
         covered_material_ids |= set(addition_ids) & material_ids
     uncovered = material_ids - covered_material_ids
     if uncovered:
-        errors.append(f"approved material additions lack MAT-* approval coverage: {', '.join(sorted(uncovered))}")
+        errors.append(f"accepted material additions lack MAT-* review coverage: {', '.join(sorted(uncovered))}")
     if not isinstance(review.get("boundary_proofs"), dict):
         errors.append("architecture_review.boundary_proofs must be an object")
-    if completed and not review.get("approved_at"):
-        errors.append("completed architecture_review requires approved_at")
+    if completed and not review.get("reviewed_at"):
+        errors.append("completed architecture_review requires reviewed_at")
     return review
 
 
@@ -849,7 +845,7 @@ def validate_prototype_contract(item: dict[str, Any], prd_text: str, errors: lis
         if not isinstance(value, list) or (not optional_empty and not value):
             errors.append(f"prototype contract.{key} must be {'an' if optional_empty else 'a non-empty'} array")
     if contract.get("visual_truth") is not True:
-        errors.append("approved prototype contract must declare visual_truth=true")
+        errors.append("reviewed prototype contract must declare visual_truth=true")
     for story in contract.get("story_ids", []) if isinstance(contract.get("story_ids"), list) else []:
         if not isinstance(story, str) or not ID_PATTERNS["US"].fullmatch(story) or story not in prd_text:
             errors.append(f"prototype contract has unknown story ID: {story}")
@@ -913,7 +909,7 @@ def validate_batches(text: str, arch_ids: set[str], errors: list[str]) -> tuple[
             errors.append(f"Code Spec batch {batch} requires at least one architecture anchor")
         unknown = batch_arch - arch_ids
         if unknown:
-            errors.append(f"Code Spec batch {batch} uses unapproved architecture IDs: {', '.join(sorted(unknown))}")
+            errors.append(f"Code Spec batch {batch} uses unreviewed architecture IDs: {', '.join(sorted(unknown))}")
         candidates = list_items(subsection(body, "候选路径"))
         source_reads = list_items(subsection(body, "源码必读"))
         support_reads = list_items(subsection(body, "测试/配置必读"))
@@ -972,7 +968,11 @@ def validate_semantics(
         stage_status = stages.get(stage, {}).get("status")
         if stage_status not in {"in_progress", "blocked", "completed", "stale"}:
             continue
+        if stage_status == "stale":
+            continue
         if stage == "architecture" and stage_status == "blocked" and architecture_review.get("status") != "completed":
+            continue
+        if stage == "code_spec" and architecture_review.get("status") != "completed":
             continue
         path = feature_dir / ARTIFACTS[stage]
         if not path.is_file() or path.stat().st_size == 0:
@@ -1178,7 +1178,7 @@ def validate_semantics(
             errors.append("multi-write architecture requires applicable concurrency review")
         if variant_signal and not (isinstance(review_variants, dict) and review_variants.get("applicable")):
             errors.append("product variants or policy dispatch require applicable rule-variant review")
-        # The approved review packet is canonical. Detailed design may distribute
+        # The reviewed packet is canonical. Detailed design may distribute
         # those decisions across quality, data, flow, and interface sections; do
         # not force duplicate fixed labels into the quality section.
 
@@ -1201,7 +1201,7 @@ def validate_semantics(
         if missing_arch:
             errors.append(f"code-spec.md does not consume architecture IDs: {', '.join(sorted(missing_arch))}")
         if extra_arch:
-            errors.append(f"code-spec.md introduces unapproved architecture IDs: {', '.join(sorted(extra_arch))}")
+            errors.append(f"code-spec.md introduces unreviewed architecture IDs: {', '.join(sorted(extra_arch))}")
         mapping = sections["code_spec"].get("2. 实现映射", "")
         if not ids(mapping, "DOMAIN"):
             errors.append("code-spec.md 实现映射 requires at least one Dxx")
@@ -1219,11 +1219,11 @@ def validate_semantics(
         missing_rule_products = (product.get("FR", set()) | product.get("BR", set()) | product.get("AC", set())) - ids(sections["code_spec"].get("6. 规则与异常", ""), "FR") - ids(sections["code_spec"].get("6. 规则与异常", ""), "BR") - ids(sections["code_spec"].get("6. 规则与异常", ""), "AC")
         if missing_rule_products:
             errors.append(f"Code Spec rules do not consume product IDs: {', '.join(sorted(missing_rule_products))}")
-        if ids(docs["architecture"], "API") and "5. 接口与数据实现" not in sections["code_spec"]:
+        if "architecture" in docs and ids(docs["architecture"], "API") and "5. 接口与数据实现" not in sections["code_spec"]:
             errors.append("architecture API decisions require Code Spec ## 5. 接口与数据实现")
-        if ids(docs["architecture"], "DATA") and "5. 接口与数据实现" not in sections["code_spec"]:
+        if "architecture" in docs and ids(docs["architecture"], "DATA") and "5. 接口与数据实现" not in sections["code_spec"]:
             errors.append("architecture DATA decisions require Code Spec ## 5. 接口与数据实现")
-        if (ids(docs["architecture"], "UI") or ids(docs["architecture"], "SHAPE")) and "4. 前端实现" not in sections["code_spec"]:
+        if "architecture" in docs and (ids(docs["architecture"], "UI") or ids(docs["architecture"], "SHAPE")) and "4. 前端实现" not in sections["code_spec"]:
             errors.append("architecture UI decisions require Code Spec ## 4. 前端实现")
         for heading in ("2. 实现映射", "7. 测试规格", "8. 实现批次"):
             require_ids(sections["code_spec"].get(heading, ""), assurance_ids, f"code-spec.md {heading}", errors)
@@ -1246,86 +1246,47 @@ def validate_semantics(
         # invoked by main(), owns evidence coverage and the verdict.
 
 
-def validate_v8_gates(
+def validate_v9_gates(
     root: Path,
     feature_id: str,
     feature_dir: Path,
     state: dict[str, Any],
     errors: list[str],
 ) -> None:
-    approvals = state.get("approvals")
-    if not isinstance(approvals, dict):
-        errors.append("approvals must be an object")
-        approvals = {}
     reviews = state.get("quality_reviews")
     if not isinstance(reviews, dict):
         errors.append("quality_reviews must be an object")
         reviews = {}
     else:
-        unknown = set(reviews) - {"architecture", "code_spec"}
+        unknown = set(reviews) - {"product", "architecture", "code_spec"}
         if unknown:
             errors.append(f"quality_reviews contains unknown keys: {', '.join(sorted(unknown))}")
+        missing = {"product", "architecture", "code_spec"} - set(reviews)
+        if missing:
+            errors.append(f"quality_reviews is missing keys: {', '.join(sorted(missing))}")
 
     requirement = state.get("requirement_review")
-    if isinstance(requirement, dict) and requirement.get("status") == "completed":
-        validate_approval_receipt(
-            approvals.get("requirement_review"),
-            "requirement_review",
-            requirement_review_digest(requirement),
-            errors,
-        )
-
     stages = state.get("stages", {})
-    for stage, artifact_name in (("prd", "prd.md"), ("prototype", "prototype.html")):
-        if stages.get(stage, {}).get("status") != "completed":
-            continue
-        path = feature_dir / artifact_name
-        if path.is_file():
-            validate_approval_receipt(approvals.get(stage), stage, digest(path), errors)
-    if stages.get("prototype", {}).get("status") == "not_applicable":
-        prd_fingerprint = stages.get("prd", {}).get("fingerprint")
-        if isinstance(prd_fingerprint, str) and SHA256.fullmatch(prd_fingerprint):
-            validate_approval_receipt(
-                approvals.get("prototype"),
-                "prototype",
-                prototype_decision_digest(prd_fingerprint),
-                errors,
-            )
-
-    for review_type in ("architecture", "code_spec"):
+    product_completed = (
+        isinstance(requirement, dict) and requirement.get("status") == "completed"
+    ) or stages.get("prd", {}).get("status") == "completed" or stages.get("prototype", {}).get("status") in {
+        "completed", "not_applicable"
+    }
+    for review_type in ("product", "architecture", "code_spec"):
         summary = reviews.get(review_type)
-        stage_completed = stages.get(review_type, {}).get("status") == "completed"
-        receipt = approvals.get(review_type)
-        if summary is None and not stage_completed and receipt is None:
+        stage_completed = product_completed if review_type == "product" else stages.get(review_type, {}).get("status") == "completed"
+        if summary is None and not stage_completed:
             continue
         review_errors: list[str] = []
-        review = validate_quality_review(
+        validate_quality_review(
             root,
             feature_id,
             review_type,
             state,
             review_errors,
-            require_pass=stage_completed or receipt is not None,
+            require_pass=stage_completed,
         )
         errors.extend(review_errors)
-        artifact_name = "architecture-design.md" if review_type == "architecture" else "code-spec.md"
-        artifact_path = feature_dir / artifact_name
-        if receipt is not None or stage_completed:
-            if artifact_path.is_file():
-                validate_approval_receipt(
-                    receipt,
-                    review_type,
-                    digest(artifact_path),
-                    errors,
-                    review=review,
-                    proof_contract_sha256=(
-                        proof_contract_draft_digest(state.get("proof_contract"))
-                        if review_type == "code_spec"
-                        else None
-                    ),
-                )
-            else:
-                errors.append(f"{review_type} approval requires {artifact_name}")
 
 
 def report(errors: list[str], warnings: list[str], *, final: bool = False) -> int:
@@ -1360,8 +1321,8 @@ def main() -> int:
     state = extract_state(state_path, errors)
     if state is None:
         return report(errors, warnings, final=args.final)
-    if state.get("schema_version") != 8:
-        errors.append("state.md schema_version must be 8; run upgrade_v7_to_v8.py for v7 deliveries")
+    if state.get("schema_version") != 9:
+        errors.append("state.md schema_version must be 9; run upgrade_v8_to_v9.py for v8 deliveries")
         return report(errors, warnings, final=args.final)
     if state.get("feature_id") != args.feature_id:
         errors.append("state.md feature_id does not match directory/argument")
@@ -1373,7 +1334,7 @@ def main() -> int:
     if not isinstance(stages, dict):
         errors.append("stages must be an object")
         return report(errors, warnings, final=args.final)
-    validate_v8_gates(root, args.feature_id, feature_dir, state, errors)
+    validate_v9_gates(root, args.feature_id, feature_dir, state, errors)
     confirmed_src = validate_requirement_review(state.get("requirement_review"), stages, errors)
     prd_fp = stages.get("prd", {}).get("fingerprint")
     prototype_item = stages.get("prototype", {})
@@ -1381,8 +1342,8 @@ def main() -> int:
     architecture_review = validate_architecture_review(
         state.get("architecture_review"), stages, prd_fp, prototype_fp, errors
     )
-    if architecture_review.get("status") != "completed" and (feature_dir / "architecture-design.md").exists():
-        errors.append("architecture-design.md must not exist before architecture convergence review approval")
+    if architecture_review.get("status") == "pending" and (feature_dir / "architecture-design.md").exists():
+        errors.append("architecture-design.md requires an in-progress architecture convergence review")
 
     for name in STAGES:
         item = stages.get(name)
@@ -1445,7 +1406,7 @@ def main() -> int:
 
     proof_obligations: dict[str, dict[str, Any]] = {}
     proof_active = stages.get("code_spec", {}).get("status") == "completed" or any(
-        stages.get(name, {}).get("status") in {"in_progress", "completed", "stale", "blocked"}
+        stages.get(name, {}).get("status") in {"in_progress", "completed", "blocked"}
         for name in ("code", "verification")
     )
     if proof_active:

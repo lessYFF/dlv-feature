@@ -1,23 +1,49 @@
 # DLV Feature
 
-Current plugin version: **0.4.0** (schema v8).
+Current plugin version: **0.5.0** (delivery schema v9).
 
 DLV Feature is a Codex skill for delivering a feature through one proof-carrying chain:
 
 ```text
-Requirement Approval → PRD ↔ Prototype Product Approval → Architecture Quality Review + Human Approval → Code Spec Quality Review + Human Approval → Sealed Proof Contract → Code → Verification → Deterministic Finalization
+Requirements + PRD + Prototype → Product Contract Review → Architecture Risk Review → Code Spec Coverage Review → Sealed Proof Contract → Code → Verification → Deterministic Finalization
 ```
 
-It keeps product behavior, approved visual intent, technical decisions, implementation scope, and verification evidence separate. Schema v8 adds fingerprint-bound approval receipts, independent Architecture and Code Spec quality reviews, schema-focused commented SQL, typed visual/runtime evidence, a report from Verification start, and an explicit final validation mode. A document, build, or agent can no longer self-award `completed`.
+It keeps product behavior, visual intent, technical decisions, implementation scope, and verification evidence separate. Schema v9 has zero routine human confirmation gates. Instead, three immutable automated reviews bind the exact input hashes and block progression on missing required checks, less than 100% required coverage, unmapped changes, or open critical/major findings:
 
-Existing schema-v7 deliveries require a conservative review before resuming:
+- Product Contract Review jointly checks source requirements, PRD, and Prototype or the explicit no-prototype decision.
+- Architecture Risk Review checks database change, API compatibility, existing-business impact, authorization/tenant boundaries, and fact ownership.
+- Code Spec Coverage Review checks complete PRD, Prototype, risk, and proof coverage with zero unmapped changes.
+
+```bash
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/quality_review.py product <feature-id> \
+  --root <project-root> --run-id <run-id>
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/quality_review.py architecture <feature-id> \
+  --root <project-root> --run-id <run-id>
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/quality_review.py code_spec <feature-id> \
+  --root <project-root> --run-id <run-id>
+```
+
+Each command launches its own ephemeral, read-only `codex exec` reviewer. The runner owns the verdict input, invocation identity, transcript, and transcript hash; callers cannot submit a prebuilt PASS result.
+
+An artifact or bound input change invalidates its review and every downstream claim. Genuine unresolved requirement ambiguity may still block for clarification. Authorization for external mutations remains governed by the host and repository policy; it is not a routine delivery confirmation.
+
+Existing schema-v8 deliveries require a conservative upgrade before resuming:
+
+```bash
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v8_to_v9.py <feature-id> --root <project-root>
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v8_to_v9.py <feature-id> --root <project-root> --apply
+```
+
+The first command is a dry run. The applied upgrade preserves documents, code, and raw evidence only as untrusted candidates; it removes legacy approval state and invalidates every old quality verdict, seal, PASS, and finalization. Three fresh automated reviews and a fresh Verification Run are required.
+
+Schema-v7 deliveries first use the existing v7-to-v8 migration, then v8-to-v9:
 
 ```bash
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v7_to_v8.py <feature-id> --root <project-root>
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v7_to_v8.py <feature-id> --root <project-root> --apply
 ```
 
-The first command is a dry run. The applied upgrade preserves documents, raw evidence, and the Proof Contract draft's ENV/PO/ASRT definitions, but invalidates all v7 approvals, quality verdicts, seals, PASS, and finalization. V8 requires fresh human confirmation and verification.
+After applying v7-to-v8, run the v8-to-v9 commands above. No prior review or completion claim crosses either migration boundary.
 
 ## Install from this repository marketplace
 

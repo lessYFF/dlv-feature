@@ -26,6 +26,7 @@ from delivery_proof import (
 from verification_run import (
     MAX_ANCHOR_BYTES,
     active_records,
+    computed_visual_metrics,
     contract_maps,
     is_supported_image,
     load_runtime_trace,
@@ -294,6 +295,19 @@ def validate_verification_run(
                     path = role_paths.get(role)
                     if path is not None and not is_supported_image(path):
                         errors.append(f"{evidence_id} {role} is not a supported image")
+                if all(role in role_paths for role in visual_roles):
+                    try:
+                        computed_pixel, computed_geometry = computed_visual_metrics([
+                            (role, role_paths[role]) for role in visual_roles
+                        ])
+                    except (OSError, ValueError) as exc:
+                        errors.append(f"{evidence_id} visual anchors are invalid: {exc}")
+                    else:
+                        observation = record.get("observation", {})
+                        if observation.get("pixel_diff_ratio") != computed_pixel:
+                            errors.append(f"{evidence_id} visual pixel metric disagrees with stored screenshots")
+                        if observation.get("geometry_diff_max") != computed_geometry:
+                            errors.append(f"{evidence_id} visual geometry metric disagrees with stored screenshots")
             if record.get("proof_type") == "runtime":
                 if role_counts.get("runtime_trace") != 1:
                     errors.append(f"{evidence_id} runtime evidence requires exactly one runtime_trace role")

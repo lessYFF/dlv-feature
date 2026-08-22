@@ -1,6 +1,6 @@
 ---
 name: dlv-feature
-description: Run a repository-agnostic, proof-carrying feature delivery workflow from requirement review through approved UI prototype, architecture, implementation-ready Code Spec, code changes, target-runtime Verification Runs, and deterministic finalization. Use when Codex is asked to develop, implement, deliver, verify, or resume a feature end to end while preventing requirement drift, stale evidence, boundary bypasses, environment misdiagnosis, and unsupported completion claims.
+description: Run a repository-agnostic, proof-carrying feature delivery workflow from requirement review through UI prototype, architecture, implementation-ready Code Spec, code changes, target-runtime Verification Runs, and deterministic finalization. Use when Codex is asked to develop, implement, deliver, verify, or resume a feature end to end while preventing requirement drift, stale evidence, boundary bypasses, environment misdiagnosis, and unsupported completion claims.
 ---
 
 # DLV Feature
@@ -8,16 +8,16 @@ description: Run a repository-agnostic, proof-carrying feature delivery workflow
 Deliver one feature through one truth chain:
 
 ```text
-Requirement Review approval → PRD ↔ Prototype product approval
-→ Architecture → Architecture Quality Review → human approval
-→ Code Spec + Proof Contract draft → Code Spec Quality Review → human approval
+Requirements + PRD ↔ Prototype → Product Contract Review
+→ Architecture → Architecture Risk Review
+→ Code Spec + Proof Contract draft → Code Spec Coverage Review
 → Immutable Proof Contract → Code → Verification Run → Evidence Bundle → Verdict
 ```
 
 Keep ownership singular:
 
 - PRD owns product behavior.
-- Approved Prototype owns visible content, states, interaction shape, and geometry.
+- Reviewed Prototype owns visible content, states, interaction shape, and geometry.
 - Architecture owns system decisions and fact ownership.
 - Code Spec owns files, symbols, rules, batches, and proof mapping.
 - The sealed Proof Contract owns target environments and executable assertions.
@@ -50,14 +50,17 @@ Immutable Truth → Structured Assertion → Machine Evidence → Deterministic 
    ```
 
 6. Read the JSON state block, then load only the current stage guide and direct inputs.
-7. Require `schema_version=8`. For an existing v7 delivery, preview and then apply the conservative upgrade:
+7. Require `schema_version=9`. Schema v9 replaces routine human confirmations with three automated, artifact-bound quality reviews. For an existing v8 delivery, preview the conservative upgrade:
 
    ```bash
-   python3 <skill-dir>/scripts/upgrade_v7_to_v8.py <feature-id> --root <project-root>
-   python3 <skill-dir>/scripts/upgrade_v7_to_v8.py <feature-id> --root <project-root> --apply
+   python3 <skill-dir>/scripts/upgrade_v8_to_v9.py <feature-id> --root <project-root>
    ```
 
-   The upgrade preserves documents and raw evidence, but never promotes v7 approvals, quality verdicts, Proof Contract seals, PASS, or finalization into v8.
+   ```bash
+   python3 <skill-dir>/scripts/upgrade_v8_to_v9.py <feature-id> --root <project-root> --apply
+   ```
+
+   The upgrade preserves documents, code, and raw evidence only as untrusted candidates. It removes legacy approval state and never promotes old quality verdicts, Proof Contract seals, PASS, or finalization into v9. For v7, upgrade to v8 first, then v9.
 
 ## Artifacts
 
@@ -69,7 +72,7 @@ delivery/{feature-id}/
 ├── prd.md
 ├── architecture-design.md
 ├── code-spec.md
-├── proof-contract.json  # one-way sealed approval snapshot
+├── proof-contract.json  # one-way sealed review snapshot
 ├── verification.md       # generated view only
 └── prototype.html        # visible UI only
 ```
@@ -94,7 +97,7 @@ Formal Markdown uses concise Chinese titles, a TOC before numbered sections, and
 
 | State | Guide | Output |
 |---|---|---|
-| `prd` | [prd-stage.md](references/prd-stage.md) | `prd.md`; optional approved Prototype |
+| `prd` | [prd-stage.md](references/prd-stage.md) | `prd.md`; optional reviewed Prototype |
 | `architecture` | [architecture-stage.md](references/architecture-stage.md) | `architecture-design.md` |
 | `code_spec` | [code-spec-stage.md](references/code-spec-stage.md) | `code-spec.md` + sealed Proof Contract |
 | `code` | [implementation-stage.md](references/implementation-stage.md) | repository changes |
@@ -102,31 +105,31 @@ Formal Markdown uses concise Chinese titles, a TOC before numbered sections, and
 
 Visible UI work also reads [prototype-stage.md](references/prototype-stage.md) during PRD. Follow [workflow.md](references/workflow.md) for transitions and [artifact-contracts.md](references/artifact-contracts.md) for schemas.
 
-## Human confirmations
+## Automated Quality Reviews
 
-Every confirmation writes an exact fingerprint-bound receipt. Hash the actual confirmation text, never a paraphrase supplied by the agent:
+Routine delivery has zero human confirmation gates. Run three independent reviews from fresh context; each immutable record binds the exact artifacts and upstream inputs it examined:
 
-```bash
-python3 <skill-dir>/scripts/approve_stage.py requirement_review <feature-id> --root <project-root> --approved-by <identity> --approval-reference <ref> --approval-text-sha256 <sha256>
-python3 <skill-dir>/scripts/approve_stage.py product <feature-id> --root <project-root> --approved-by <identity> --approval-reference <ref> --approval-text-sha256 <sha256>
-```
+1. Product Contract Review: source requirements, PRD acceptance coverage, Prototype states or explicit no-prototype decision, cross-artifact consistency, and no invented scope.
+2. Architecture Risk Review: database change, API compatibility, existing-business impact, authorization and tenant isolation, and fact ownership.
+3. Code Spec Coverage Review: 100% PRD, Prototype, risk, and Proof Contract coverage with zero unmapped changes.
 
-The Product command approves the final PRD and either the exact Prototype or an explicit not-applicable decision. Architecture and Code Spec confirmations occur only after their quality reviews, as described below.
+Every required check must be present. Each coverage check supplies an exact `covered_ids` set that the kernel compares with IDs derived from the bound artifacts; it may PASS only at 100%. `unmapped-changes` may PASS only at zero. Every record also identifies its fresh/isolated execution and binds a transcript hash. Any failed required check or open critical/major finding blocks PASS. Artifact changes invalidate the applicable review and downstream stages. This prevents accidental or procedural gate skipping; like the local evidence chain, it does not claim to resist a writer who can modify the skill, validator, state, review records, and transcripts together. Use remote attestation if that actor is in scope. Only genuine unresolved ambiguity requests human clarification; do not add routine approval pauses.
 
 ## Proof Contract
 
 Each `PO-*` has exactly one proof type (`visual`, `runtime`, `boundary`, `invariant`, or `artifact`), one `ENV-*`, explicit upstream `trace_ids`, and one or more `ASRT-*` assertions. Each assertion has a description and structured oracle (`kind`, JSON-pointer `source`, `operator`, and expected value where applicable). Free-text `expected` and caller-supplied assertion status are not a contract.
 
-Each `ENV-*` contains a structured target spec and executable preflight commands. Architecture and Code Spec each require an independent quality review before human approval. Review findings use `ARQ-*` or `CSQ-*`; open critical/major findings forbid `PASS`:
+Each `ENV-*` contains a structured target spec and executable preflight commands. Product, Architecture, and Code Spec each require an independent quality review. Findings use `PRQ-*`, `ARQ-*`, or `CSQ-*`; open critical/major findings forbid `PASS`:
 
 ```bash
-python3 <skill-dir>/scripts/quality_review.py architecture <feature-id> --root <project-root> --run-id <run-id> --result /abs/review.json
-python3 <skill-dir>/scripts/approve_stage.py architecture <feature-id> --root <project-root> --approved-by <identity> --approval-reference <ref> --approval-text-sha256 <sha256>
-python3 <skill-dir>/scripts/quality_review.py code_spec <feature-id> --root <project-root> --run-id <run-id> --result /abs/review.json
-python3 <skill-dir>/scripts/approve_stage.py code_spec <feature-id> --root <project-root> --approved-by <identity> --approval-reference <ref> --approval-text-sha256 <sha256>
+python3 <skill-dir>/scripts/quality_review.py product <feature-id> --root <project-root> --run-id <run-id>
+python3 <skill-dir>/scripts/quality_review.py architecture <feature-id> --root <project-root> --run-id <run-id>
+python3 <skill-dir>/scripts/quality_review.py code_spec <feature-id> --root <project-root> --run-id <run-id>
 ```
 
-The Code Spec approval binds the exact Code Spec, quality review, and Proof Contract draft, and authorizes implementation within that scope. Then seal once without accepting new approval arguments:
+The command launches an ephemeral read-only reviewer and owns the verdict input, invocation identity, transcript, and transcript hash. The caller cannot submit review JSON. If any bound input changes while the review runs, discard the result and rerun it against the new hashes.
+
+The Code Spec review binds the exact Code Spec, upstream product and architecture fingerprints, and Proof Contract draft. Then seal once without accepting review overrides:
 
 ```bash
 python3 <skill-dir>/scripts/seal_proof_contract.py <feature-id> --root <project-root>
@@ -174,15 +177,15 @@ Environment/tool/network/credential failures are `blocked`, never PASS and never
 - Simplicity: Delete → KISS → DRY → Responsibility → Dependency; KISS wins over ceremonial abstractions.
 - Boundary: every access/owner/lineage/projection/lifecycle change has one complete `BP-*` and direct negative probe.
 - Evidence: every active PO has exactly one fresh passed evidence record; skips are forbidden.
-- Integrity: state and sealed contract snapshot agree; contract/code/environment digests match; every preflight summary is re-derived from its contracted command and hashed anchor; evidence hash-chain head/count match state; every anchor exists inside the run and matches SHA-256. Start, recorder, render, and finalizer share ordered cross-platform feature/run locks; a write-ahead journal replays interrupted manifest/state commits. This detects accidental or ordinary file rewriting, but does not claim to resist an attacker who can modify code, state, validator, and all local artifacts together; use an external signed/remote attestation when that threat is in scope.
+- Integrity: state and sealed contract snapshot agree; contract/code/environment digests match; every preflight summary is re-derived from its contracted command and hashed anchor; visual pixel and geometry metrics are recomputed from valid PNG screenshots; evidence hash-chain head/count match state; every anchor exists inside the run and matches SHA-256. Start, recorder, render, and finalizer share ordered cross-platform feature/run locks; a write-ahead journal replays interrupted manifest/state commits. This detects accidental or ordinary file rewriting, but does not claim to resist an attacker who can modify code, state, validator, and all local artifacts together; use an external signed/remote attestation when that threat is in scope.
 - Risk: risks are structured `RISK-*`; an open blocker prevents PASS, and accepted residual risk names its approver.
 - Mission: every critical action runs in its target runtime at its declared proof strength.
 
 ## Authorization and Recovery
 
 - Documentation writes stay under `delivery/{feature-id}/`; machine run data stays under `.dlv/runs/`.
-- Use exactly four delivery confirmation points: requirement review; final PRD plus Prototype decision; Architecture after a fresh PASS Architecture Quality Review; Code Spec plus Proof Contract draft after a fresh PASS Code Spec Quality Review. The fourth confirmation authorizes implementation within the bound scope. External mutations still require their own authorization.
-- Keep approved PRD, Architecture, Code Spec, and Proof Contract immutable. Plan/actual differences are evidence, not retroactive plan edits.
+- Use zero routine human confirmation points and exactly three automated reviews: Product Contract, Architecture Risk, and Code Spec Coverage. External mutations still require authorization under host and repository policy.
+- Keep reviewed PRD, Prototype, Architecture, Code Spec, and Proof Contract immutable. Plan/actual differences are evidence, not retroactive plan edits.
 - Preserve unrelated user changes and avoid destructive Git operations.
 - Recover from `state.md → current artifact/contract → active run → manifest/anchors → repository evidence`.
 

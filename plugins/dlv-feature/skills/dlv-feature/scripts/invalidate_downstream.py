@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Mark changed schema-v8 truth/code and downstream runs stale."""
+"""Mark changed schema-v9 truth/code and downstream runs stale."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from delivery_proof import exclusive_file_lock, extract_state, file_digest, repository_fingerprint, validate_feature_id, write_state
+from quality_gates import review_artifacts, validate_quality_review
 
 
 ORDER = ("prd", "prototype", "architecture", "code_spec", "code", "verification")
@@ -32,8 +33,8 @@ def invalidate(root: Path, feature_id: str, from_stage: str | None) -> str:
         raise ValueError(f"missing {state_path}")
     with exclusive_file_lock(root / ".dlv" / "runs" / feature_id / ".feature.lock"):
         content, state = extract_state(state_path)
-        if state.get("schema_version") != 8:
-            raise ValueError("invalidate_downstream.py only accepts schema_version=8")
+        if state.get("schema_version") != 9:
+            raise ValueError("invalidate_downstream.py only accepts schema_version=9")
         original_state = copy.deepcopy(state)
         stages = state.get("stages", {})
         changed: list[str] = [from_stage] if from_stage else []
@@ -48,36 +49,68 @@ def invalidate(root: Path, feature_id: str, from_stage: str | None) -> str:
             recorded = result.get("repository_fingerprint") if isinstance(result, dict) else None
             if recorded != repository_fingerprint(root, feature_id):
                 changed.append("code")
+        reviews = state.get("quality_reviews")
+        if isinstance(reviews, dict):
+            review_stages = {"product": "prd", "architecture": "architecture", "code_spec": "code_spec"}
+            for review_type, stage in review_stages.items():
+                summary = reviews.get(review_type)
+                if not isinstance(summary, dict):
+                    continue
+                integrity_errors: list[str] = []
+                validate_quality_review(
+                    root, feature_id, review_type, state, integrity_errors, require_pass=False,
+                )
+                expected = review_artifacts(root, feature_id, review_type, state)
+                if (
+                    integrity_errors
+                    or
+                    summary.get("artifact_sha256") != expected.get("artifact_sha256")
+                    or summary.get("proof_contract_sha256") != expected.get("proof_contract_sha256")
+                    or summary.get("bound_artifacts") != expected.get("bound_artifacts")
+                ):
+                    changed.append(stage)
         if not changed:
             return "fresh: no downstream invalidation required"
         start = min(ORDER.index(stage) for stage in changed)
         for stage in ORDER[start:]:
             item = stages.get(stage)
-            if isinstance(item, dict) and item.get("status") not in {"pending", "not_applicable"}:
-                item["status"] = "stale"
+            if isinstance(item, dict):
+                if stage == "prototype" and start <= ORDER.index("prototype"):
+                    item["status"] = "stale"
+                elif item.get("status") not in {"pending", "not_applicable"}:
+                    item["status"] = "stale"
             if stage == "verification" and isinstance(item, dict):
                 item.update({"finalization": None, "verdict": None, "run_digest": None})
         remove_contract_snapshot = start <= ORDER.index("code_spec")
         if remove_contract_snapshot:
             contract = state.get("proof_contract")
             if isinstance(contract, dict):
-                contract.update({"status": "stale", "seal": None, "sealed_at": None, "approval": None})
-        approvals = state.setdefault("approvals", {})
-        quality_reviews = state.setdefault("quality_reviews", {"architecture": None, "code_spec": None})
+                contract.update({"status": "stale", "seal": None, "sealed_at": None, "quality_review": None})
+        quality_reviews = state.setdefault("quality_reviews", {"product": None, "architecture": None, "code_spec": None})
         if start <= ORDER.index("prd"):
-            for key in ("prd", "prototype", "architecture", "code_spec"):
-                approvals.pop(key, None)
-            quality_reviews.update({"architecture": None, "code_spec": None})
+            quality_reviews.update({"product": None, "architecture": None, "code_spec": None})
+            requirement = state.get("requirement_review")
+            if isinstance(requirement, dict):
+                requirement.update({"status": "in_progress", "reviewed_at": None})
+            architecture_review = state.get("architecture_review")
+            if isinstance(architecture_review, dict):
+                candidate_status = "in_progress" if (state_path.parent / "architecture-design.md").is_file() else "pending"
+                architecture_review.update({"status": candidate_status, "reviewed_at": None})
         elif start <= ORDER.index("prototype"):
-            for key in ("prd", "prototype", "architecture", "code_spec"):
-                approvals.pop(key, None)
-            quality_reviews.update({"architecture": None, "code_spec": None})
+            quality_reviews.update({"product": None, "architecture": None, "code_spec": None})
+            requirement = state.get("requirement_review")
+            if isinstance(requirement, dict):
+                requirement.update({"status": "in_progress", "reviewed_at": None})
+            architecture_review = state.get("architecture_review")
+            if isinstance(architecture_review, dict):
+                candidate_status = "in_progress" if (state_path.parent / "architecture-design.md").is_file() else "pending"
+                architecture_review.update({"status": candidate_status, "reviewed_at": None})
         elif start <= ORDER.index("architecture"):
-            for key in ("architecture", "code_spec"):
-                approvals.pop(key, None)
             quality_reviews.update({"architecture": None, "code_spec": None})
+            architecture_review = state.get("architecture_review")
+            if isinstance(architecture_review, dict):
+                architecture_review.update({"status": "in_progress", "reviewed_at": None})
         elif start <= ORDER.index("code_spec"):
-            approvals.pop("code_spec", None)
             quality_reviews["code_spec"] = None
         state["current_stage"] = ORDER[start]
         state["last_updated"] = timestamp()

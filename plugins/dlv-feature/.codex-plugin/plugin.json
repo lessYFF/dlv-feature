@@ -1,6 +1,6 @@
 {
   "name": "dlv-feature",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "A proof-carrying end-to-end feature delivery workflow for Codex.",
   "author": {
     "name": "lessYFF",
@@ -13,13 +13,13 @@
   "interface": {
     "displayName": "DLV Feature",
     "shortDescription": "Deliver features with evidence-backed gates.",
-    "longDescription": "Guides a feature from fingerprint-bound requirement and product confirmation through reviewed Architecture and Code Spec, typed target-runtime evidence, and deterministic schema-v8 delivery.",
+    "longDescription": "Guides a feature through three artifact-bound automated reviews, typed target-runtime evidence, pixel-level UI comparison, and deterministic schema-v9 delivery without routine confirmation gates.",
     "developerName": "lessYFF",
     "category": "Productivity",
-    "capabilities": ["Feature planning", "Fingerprint-bound approvals", "Architecture and Code Spec quality reviews", "Sealed proof contracts", "Typed Verification runs", "Append-only evidence", "Deterministic verification"],
+    "capabilities": ["Feature planning", "Product contract reviews", "Architecture risk reviews", "Code Spec coverage reviews", "Sealed proof contracts", "Typed Verification runs", "Pixel-level UI comparison", "Append-only evidence", "Deterministic verification"],
     "websiteURL": "https://github.com/lessYFF/dlv-feature",
     "defaultPrompt": [
-      "Use $dlv-feature to deliver this feature with schema-v8 fingerprint-bound approvals, Architecture and Code Spec quality reviews, typed target-runtime evidence, and deterministic finalization."
+      "Use $dlv-feature to deliver this feature with schema-v9 automated Product, Architecture, and Code Spec reviews, typed target-runtime evidence, pixel-level UI comparison, and deterministic finalization."
     ]
   }
 }

@@ -6,7 +6,7 @@
 
 ## 输入
 
-- fresh `prd.md`、已批准原型（如适用）、仓库规则与架构/API/数据资料；
+- fresh `prd.md`、已复核原型（如适用）、仓库规则与架构/API/数据资料；
 - 为证明现状所需的源码、schema、migration、测试和 Git 基线。
 
 记录仓库与 commit 基线。搜索只产生 candidate；读源码才产生 verified 事实。
@@ -17,10 +17,10 @@
 
 ```text
 现状证据核验 → 事实所有权 → 复用/扩展/替换/新增裁决
-→ Boundary Proof → 隔离/并发/规则扩展性 → 材料决定批准 → 详细方案
+→ Boundary Proof → 隔离/并发/规则扩展性 → 材料决定 → 详细方案
 ```
 
-收敛检查必须回答：当前可复用能力与正典所有者；最小改动与第二事实源/双写风险；每个新增对象为何不能安全扩展现有事实与合同；以及数据隔离、并发旁路、规则分派和不可逆决策是否有缺口。材料决定用 `MAT-*` 逐项绑定 `ADD-*`，统一纳入技术方案后的人工确认。
+收敛检查必须回答：当前可复用能力与正典所有者；最小改动与第二事实源/双写风险；每个新增对象为何不能安全扩展现有事实与合同；以及数据隔离、并发旁路、规则分派和不可逆决策是否有缺口。材料决定用 `MAT-*` 逐项绑定 `ADD-*`，统一纳入 Architecture Risk Review。
 
 ## Boundary Proof Gate
 
@@ -72,4 +72,4 @@ SQL 只表达目标 schema，不展示可执行迁移程序。禁止 `DO`、`EXE
 
 完成条件：输入 fresh；新增举证、隔离、并发、规则分派无 blocker；所有适用 `BP-*` 的入口、授权、lineage、projection 与 probe 完整且被技术方案消费；无第二事实源、fail-open 隔离、旧入口写旁路或散落规则。技术事实有仓库/基线/路径/符号锚点，新目标标为 proposed。
 
-写完后必须执行 Architecture Quality Review。review 记录写入 `.dlv/reviews/{feature}/{run-id}.json`，finding 使用 `ARQ-*`，verdict 为 `PASS|REVISE|BLOCKED`；open critical/major 时不得 PASS。fresh PASS 后再由用户确认，`approve_stage.py architecture` 将确认绑定技术方案指纹、review run、确认文本哈希和身份。文档、review 或批准后任一输入变化均使 review 与批准 stale；只有确认完成才进入 Code Spec。
+写完后必须执行 Architecture Risk Review。review 记录写入 `.dlv/reviews/{feature}/{run-id}.json`，finding 使用 `ARQ-*`，verdict 为 `PASS|REVISE|BLOCKED`。数据库改动、API 兼容、现有业务影响、授权/租户隔离与事实所有权五项 required check 必须逐项给证据；适用项不得 N/A，任一 FAIL 或 open critical/major finding 禁止 PASS。fresh PASS 自动进入 Code Spec；技术方案或任一绑定输入变化都使本 review 与下游 stale。

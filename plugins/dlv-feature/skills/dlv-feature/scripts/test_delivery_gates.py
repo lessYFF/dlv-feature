@@ -1,26 +1,29 @@
 #!/usr/bin/env python3
-"""Regression and forward tests for the schema-v8 delivery kernel."""
+"""Regression and forward tests for the schema-v9 delivery kernel."""
 
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
+import shutil
 import subprocess
+import struct
 import sys
 import tempfile
 import time
 import unittest
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
 import finalize_delivery
 import invalidate_downstream
-import approve_stage
 import quality_review
 import seal_proof_contract
 import upgrade_v7_to_v8
+import upgrade_v8_to_v9
 import verification_run
 from delivery_proof import (
     acquire_windows_lock,
@@ -35,12 +38,15 @@ from delivery_proof import (
     validate_proof_contract,
     write_state,
 )
-from validate_feature import validate_database_section, validate_document, validate_v8_gates
+from validate_feature import validate_database_section, validate_document, validate_v9_gates
 from quality_gates import (
+    REQUIRED_CHECKS,
+    expected_review_coverage,
     proof_contract_draft_digest,
     prototype_decision_digest,
     requirement_review_digest,
-    validate_approval_receipt,
+    review_artifacts,
+    validate_review_context,
     validate_review_payload,
 )
 from validate_verification_evidence import validate_verification_run
@@ -98,11 +104,14 @@ def contract() -> dict[str, object]:
                 },
             ],
         }],
-        "approval": {
-            "approved_by": "test-owner",
-            "reference": "test-approval-01",
-            "approval_text_sha256": "a" * 64,
-            "quality_review_run_id": "code-spec-review-01",
+        "quality_review": {
+            "status": "completed",
+            "review_run_id": "code-spec-review-01",
+            "artifact_sha256": "c" * 64,
+            "proof_contract_sha256": "f" * 64,
+            "bound_artifacts": {"code_spec": "c" * 64, "proof_contract": "f" * 64},
+            "verdict": "PASS",
+            "record_sha256": "d" * 64,
         },
         "sealed_at": "2026-08-21T00:00:00+08:00",
         "seal": None,
@@ -155,46 +164,17 @@ def result_file(root: Path, *, status: str = "passed") -> Path:
     return path
 
 
+def png_bytes(red: int, green: int, blue: int) -> bytes:
+    def chunk(name: bytes, payload: bytes) -> bytes:
+        return struct.pack(">I", len(payload)) + name + payload + struct.pack(">I", zlib.crc32(name + payload) & 0xFFFFFFFF)
+
+    header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+    pixels = zlib.compress(bytes((0, red, green, blue, 255)))
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", pixels) + chunk(b"IEND", b"")
+
+
 def prepare_sealable(root: Path, feature_id: str) -> Path:
-    subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), feature_id, "--root", str(root)], check=True)
-    state_path = root / "delivery" / feature_id / "state.md"
-    (state_path.parent / "prd.md").write_text("AC-01", encoding="utf-8")
-    code_spec = state_path.parent / "code-spec.md"
-    code_spec.write_text("approved code specification\n", encoding="utf-8")
-    content, state = extract_state(state_path)
-    pending = contract()
-    pending.update({
-        "status": "pending",
-        "code_spec_fingerprint": None,
-        "approval": None,
-        "sealed_at": None,
-        "seal": None,
-    })
-    state["proof_contract"] = pending
-    write_state(state_path, content, state)
-    review_input = root / f"{feature_id}-review.json"
-    review_input.write_text(json.dumps({
-        "review_type": "code_spec",
-        "reviewer": "test-reviewer",
-        "review_reference": "test-review-reference",
-        "verdict": "PASS",
-        "findings": [],
-    }), encoding="utf-8")
-    quality_review.record_review(feature_id, root, "code_spec", "code-spec-review-01", review_input)
-    content, state = extract_state(state_path)
-    artifact_sha = hashlib.sha256(code_spec.read_bytes()).hexdigest()
-    state["approvals"]["code_spec"] = {
-        "stage": "code_spec",
-        "artifact_sha256": artifact_sha,
-        "approved_by": "test-owner",
-        "approval_reference": "test-approval-01",
-        "approval_text_sha256": "a" * 64,
-        "approved_at": "2026-08-21T00:00:00+08:00",
-        "quality_review_run_id": "code-spec-review-01",
-        "proof_contract_sha256": proof_contract_draft_digest(state["proof_contract"]),
-    }
-    write_state(state_path, content, state)
-    return state_path
+    return prepare_approved_delivery(root, feature_id, seal=False)
 
 
 def prepare_profile_run(root: Path, proof_type: str) -> tuple[Path, Path]:
@@ -472,12 +452,107 @@ def run_delivery_cli(root: Path, script: str, *arguments: str) -> subprocess.Com
     return completed
 
 
-def prepare_approved_delivery(root: Path, feature_id: str) -> Path:
+def review_checks(
+    review_type: str, *, prototype: bool = False,
+    coverage: dict[str, set[str]] | None = None,
+) -> list[dict[str, object]]:
+    checks: list[dict[str, object]] = []
+    for check_id in sorted(REQUIRED_CHECKS[review_type]):
+        value: dict[str, object] = {
+            "id": check_id,
+            "status": "PASS",
+            "evidence": f"fixture evidence for {check_id}",
+        }
+        if check_id.endswith("coverage"):
+            if "prototype" in check_id and not prototype:
+                value["status"] = "N/A"
+                value["not_applicable_reason"] = "fixture has no visible UI prototype"
+            else:
+                value["coverage_pct"] = 100
+                value["covered_ids"] = sorted((coverage or {}).get(check_id, set()))
+        if check_id == "unmapped-changes":
+            value["unmapped_count"] = 0
+        checks.append(value)
+    return checks
+
+
+def review_result_payload(review_type: str, checks: list[dict[str, object]]) -> dict[str, object]:
+    return {
+        "review_type": review_type,
+        "reviewer": "independent-test-reviewer",
+        "review_reference": f"fresh-context:{review_type}",
+        "execution": {
+            "mode": "fresh_context", "provider": "test-runner",
+            "invocation_id": f"{review_type}-invocation",
+            "transcript_sha256": hashlib.sha256(review_type.encode()).hexdigest(),
+        },
+        "verdict": "PASS", "findings": [], "checks": checks,
+    }
+
+
+def test_review_execution(root: Path, feature_id: str, run_id: str) -> dict[str, str]:
+    invocation_id = f"invocation-{run_id}"
+    transcript = root / ".dlv" / "reviews" / feature_id / f"{run_id}.{invocation_id}.transcript.jsonl"
+    transcript.parent.mkdir(parents=True, exist_ok=True)
+    transcript.write_text(json.dumps({"event": "isolated-test-review", "run_id": run_id}) + "\n", encoding="utf-8")
+    return {
+        "mode": "isolated_process", "provider": "test-runner", "invocation_id": invocation_id,
+        "transcript_path": transcript.relative_to(root).as_posix(),
+        "transcript_sha256": hashlib.sha256(transcript.read_bytes()).hexdigest(),
+    }
+
+
+def record_test_review(root: Path, feature_id: str, review_type: str, run_id: str, *, prototype: bool = False) -> None:
+    review_dir = root / ".dlv" / "inputs"
+    review_dir.mkdir(parents=True, exist_ok=True)
+    result = review_dir / f"{run_id}.json"
+    _, state = extract_state(root / "delivery" / feature_id / "state.md")
+    payload = review_result_payload(
+        review_type,
+        review_checks(review_type, prototype=prototype, coverage=expected_review_coverage(root / "delivery" / feature_id, review_type, state)),
+    )
+    payload["review_reference"] = f"fresh-context:{run_id}"
+    payload["execution"]["invocation_id"] = run_id  # type: ignore[index]
+    result.write_text(json.dumps(payload), encoding="utf-8")
+    quality_review._record_review(
+        feature_id, root, review_type, run_id, result,
+        execution=test_review_execution(root, feature_id, run_id),
+        reviewed_artifacts=review_artifacts(root, feature_id, review_type, state),
+    )
+
+
+def prepare_product_review(root: Path, feature_id: str) -> Path:
     init_git(root)
     run_delivery_cli(root, "init_feature.py", feature_id)
     state_path = root / "delivery" / feature_id / "state.md"
     content, state = extract_state(state_path)
     state["requirement_review"].update({
+        "status": "in_progress",
+        "source_fingerprint": "b" * 64,
+        "confirmed_ids": ["SRC-01"],
+        "summary": {
+            "goal": "machine-owned review",
+            "users_scenarios": "delivery owner runs an isolated review",
+            "in_scope": "review binding",
+            "out_scope": "external attestation",
+            "key_rules": "callers cannot submit verdict JSON",
+            "ui_impact": "none",
+            "open_questions": "none",
+        },
+    })
+    state["stages"]["prd"]["status"] = "in_progress"
+    write_state(state_path, content, state)
+    (state_path.parent / "prd.md").write_text(PRD_DOCUMENT, encoding="utf-8")
+    return state_path
+
+
+def prepare_approved_delivery(root: Path, feature_id: str, *, seal: bool = True) -> Path:
+    init_git(root)
+    run_delivery_cli(root, "init_feature.py", feature_id)
+    state_path = root / "delivery" / feature_id / "state.md"
+    content, state = extract_state(state_path)
+    state["requirement_review"].update({
+        "status": "in_progress",
         "source_fingerprint": "b" * 64,
         "confirmed_ids": ["SRC-01"],
         "summary": {
@@ -490,18 +565,17 @@ def prepare_approved_delivery(root: Path, feature_id: str) -> Path:
             "open_questions": "no open questions",
         },
     })
+    state["stages"]["prd"]["status"] = "in_progress"
     write_state(state_path, content, state)
-    approval = ("--approved-by", "test-owner", "--approval-reference", "approval-01", "--approval-text-sha256", "a" * 64)
-    run_delivery_cli(root, "approve_stage.py", "requirement_review", feature_id, *approval)
     (state_path.parent / "prd.md").write_text(PRD_DOCUMENT, encoding="utf-8")
-    run_delivery_cli(root, "approve_stage.py", "product", feature_id, *approval)
+    record_test_review(root, feature_id, "product", "product-review-01")
 
     (state_path.parent / "architecture-design.md").write_text(ARCHITECTURE_DOCUMENT, encoding="utf-8")
     content, state = extract_state(state_path)
     prd_sha = state["stages"]["prd"]["fingerprint"]
     state["stages"]["architecture"]["inputs"] = {"prd": prd_sha, "prototype": None, "repositories": {}}
     state["architecture_review"].update({
-        "status": "completed",
+        "status": "in_progress",
         "inputs": {"prd": prd_sha, "prototype": None, "repositories": {}},
         "existing_capabilities": ["existing deterministic validator"],
         "fact_owners": [{
@@ -516,21 +590,11 @@ def prepare_approved_delivery(root: Path, feature_id: str) -> Path:
         "rule_variants": {"applicable": False, "verdict": "N/A"},
         "boundary_proofs": {"applicable": False, "reason": "No access boundary changes", "proofs": [], "verdict": "N/A"},
         "material_decisions": [],
-        "approved_at": "2026-08-21T00:00:00+08:00",
+        "reviewed_at": None,
     })
+    state["stages"]["architecture"]["status"] = "in_progress"
     write_state(state_path, content, state)
-    review_dir = root / ".dlv" / "inputs"
-    review_dir.mkdir(parents=True, exist_ok=True)
-    architecture_review_result = review_dir / "architecture-review.json"
-    architecture_review_result.write_text(json.dumps({
-        "review_type": "architecture", "reviewer": "test-reviewer",
-        "review_reference": "architecture-review-reference", "verdict": "PASS", "findings": [],
-    }), encoding="utf-8")
-    run_delivery_cli(
-        root, "quality_review.py", "architecture", feature_id,
-        "--run-id", "architecture-review-01", "--result", str(architecture_review_result),
-    )
-    run_delivery_cli(root, "approve_stage.py", "architecture", feature_id, *approval)
+    record_test_review(root, feature_id, "architecture", "architecture-review-01")
 
     (state_path.parent / "code-spec.md").write_text(CODE_SPEC_DOCUMENT, encoding="utf-8")
     content, state = extract_state(state_path)
@@ -541,25 +605,18 @@ def prepare_approved_delivery(root: Path, feature_id: str) -> Path:
     }
     draft = contract()
     draft["obligations"][0]["trace_ids"] = ["ARCH-01", "FLOW-01", "R-D01-1", "T-B01-1", "B01"]  # type: ignore[index]
-    draft.update({"status": "pending", "code_spec_fingerprint": None, "approval": None, "sealed_at": None, "seal": None})
+    draft.update({"status": "pending", "code_spec_fingerprint": None, "quality_review": None, "sealed_at": None, "seal": None})
     state["proof_contract"] = draft
+    state["stages"]["code_spec"]["status"] = "in_progress"
     write_state(state_path, content, state)
-    code_review_result = review_dir / "code-spec-review.json"
-    code_review_result.write_text(json.dumps({
-        "review_type": "code_spec", "reviewer": "test-reviewer",
-        "review_reference": "code-spec-review-reference", "verdict": "PASS", "findings": [],
-    }), encoding="utf-8")
-    run_delivery_cli(
-        root, "quality_review.py", "code_spec", feature_id,
-        "--run-id", "code-spec-review-01", "--result", str(code_review_result),
-    )
-    run_delivery_cli(root, "approve_stage.py", "code_spec", feature_id, *approval)
-    run_delivery_cli(root, "seal_proof_contract.py", feature_id)
+    record_test_review(root, feature_id, "code_spec", "code-spec-review-01")
+    if seal:
+        run_delivery_cli(root, "seal_proof_contract.py", feature_id)
     return state_path
 
 
 class ContractTests(unittest.TestCase):
-    def test_four_human_gates_and_two_quality_reviews_execute_end_to_end(self) -> None:
+    def test_three_automated_quality_reviews_execute_end_to_end_without_approvals(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             state_path = prepare_approved_delivery(root, "approval-workflow")
@@ -567,15 +624,14 @@ class ContractTests(unittest.TestCase):
             self.assertEqual("completed", state["requirement_review"]["status"])
             self.assertEqual("completed", state["stages"]["prd"]["status"])
             self.assertEqual("not_applicable", state["stages"]["prototype"]["status"])
+            self.assertEqual("PASS", state["quality_reviews"]["product"]["verdict"])
             self.assertEqual("PASS", state["quality_reviews"]["architecture"]["verdict"])
             self.assertEqual("completed", state["stages"]["architecture"]["status"])
             self.assertEqual("PASS", state["quality_reviews"]["code_spec"]["verdict"])
             self.assertEqual("completed", state["stages"]["code_spec"]["status"])
             self.assertEqual("code", state["current_stage"])
-            self.assertEqual(
-                state["quality_reviews"]["code_spec"]["review_run_id"],
-                state["approvals"]["code_spec"]["quality_review_run_id"],
-            )
+            self.assertNotIn("approvals", state)
+            self.assertEqual(state["quality_reviews"]["code_spec"], state["proof_contract"]["quality_review"])
             self.assertEqual("completed", state["proof_contract"]["status"])
 
     def test_quality_review_rejects_feature_id_path_traversal(self) -> None:
@@ -584,9 +640,12 @@ class ContractTests(unittest.TestCase):
             result = root / "review.json"
             result.write_text("{}", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "feature-id"):
-                quality_review.record_review("../escape", root, "architecture", "review-01", result)
+                quality_review._record_review(
+                    "../escape", root, "architecture", "review-01", result,
+                    execution={}, reviewed_artifacts={},
+                )
 
-    def test_requirement_completion_without_receipt_is_invalid(self) -> None:
+    def test_product_completion_without_quality_review_is_invalid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "approval-gate", "--root", str(root)], check=True)
@@ -597,29 +656,32 @@ class ContractTests(unittest.TestCase):
                 "source_fingerprint": "b" * 64,
                 "confirmed_ids": ["SRC-01"],
                 "summary": {"goal": "goal"},
-                "approved_at": "2026-08-21T00:00:00+08:00",
+                "reviewed_at": "2026-08-21T00:00:00+08:00",
             }
             write_state(state_path, content, state)
             errors: list[str] = []
-            validate_v8_gates(root, "approval-gate", state_path.parent, state, errors)
-            self.assertTrue(any("approvals.requirement_review" in error for error in errors))
+            validate_v9_gates(root, "approval-gate", state_path.parent, state, errors)
+            self.assertTrue(any("completed product requires a quality review" in error for error in errors))
 
-    def test_approval_receipt_is_bound_to_exact_artifact(self) -> None:
-        receipt = {
-            "stage": "prd", "artifact_sha256": "a" * 64, "approved_by": "owner",
-            "approval_reference": "decision-1", "approval_text_sha256": "b" * 64,
-            "approved_at": "2026-08-21T00:00:00+08:00",
-        }
-        errors: list[str] = []
-        validate_approval_receipt(receipt, "prd", "c" * 64, errors)
-        self.assertTrue(any("stale" in error for error in errors))
+    def test_product_review_is_bound_to_exact_prd(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_approved_delivery(root, "product-binding")
+            (state_path.parent / "prd.md").write_text(PRD_DOCUMENT + "\nchanged\n", encoding="utf-8")
+            _, state = extract_state(state_path)
+            errors: list[str] = []
+            validate_v9_gates(root, "product-binding", state_path.parent, state, errors)
+            self.assertTrue(any("product is stale" in error for error in errors), errors)
 
     def test_quality_review_cannot_pass_with_open_major_finding(self) -> None:
         errors: list[str] = []
         validate_review_payload({
             "review_type": "architecture", "review_run_id": "architecture-review-01",
             "reviewer": "reviewer", "review_reference": "review-1", "reviewed_at": "now",
+            "execution": {"mode": "fresh_context", "provider": "test-runner", "invocation_id": "review-1", "transcript_sha256": "e" * 64},
             "verdict": "PASS", "artifact_sha256": "a" * 64,
+            "bound_artifacts": {"architecture": "a" * 64},
+            "checks": review_checks("architecture"),
             "findings": [{"id": "ARQ-1", "severity": "major", "status": "open", "statement": "unsafe write path", "evidence": "architecture-design.md"}],
         }, "architecture", errors)
         self.assertTrue(any("cannot PASS" in error for error in errors))
@@ -654,7 +716,7 @@ class ContractTests(unittest.TestCase):
         mutations = {
             "status": "stale",
             "sealed_at": "2099-01-01T00:00:00Z",
-            "approval": {"approved_by": "test-owner", "reference": "forged"},
+            "quality_review": {"verdict": "PASS", "record_sha256": "0" * 64},
         }
         for field, replacement in mutations.items():
             with self.subTest(field=field):
@@ -735,6 +797,22 @@ class ContractTests(unittest.TestCase):
         validate_proof_contract(value, {"AC-01"}, "c" * 64, False, errors)
         self.assertEqual([], errors)
 
+    def test_visual_contract_requires_exact_zero_difference(self) -> None:
+        value = contract()
+        value["environments"][0]["spec"]["runtime"] = "browser"  # type: ignore[index]
+        obligation = value["obligations"][0]  # type: ignore[index]
+        obligation["proof_type"] = "visual"
+        obligation["runner"]["observation_adapter"] = "visual_bundle"
+        obligation["assertions"] = [
+            {"id": "ASRT-01", "description": "pixel", "oracle": {"kind": "json_path", "source": "/observation/pixel_diff_ratio", "operator": "lte", "expected": 0.01}},
+            {"id": "ASRT-02", "description": "geometry", "oracle": {"kind": "json_path", "source": "/observation/geometry_diff_max", "operator": "eq", "expected": 0}},
+            {"id": "ASRT-03", "description": "forbidden", "oracle": {"kind": "json_path", "source": "/observation/forbidden_elements_count", "operator": "eq", "expected": 0}},
+        ]
+        value["seal"] = proof_contract_digest(value)
+        errors: list[str] = []
+        validate_proof_contract(value, {"AC-01"}, "c" * 64, True, errors)
+        self.assertTrue(any("pixel_diff_ratio" in error and "exact zero" in error for error in errors), errors)
+
     def test_preflight_check_id_cannot_escape_run_directory(self) -> None:
         value = contract()
         value["environments"][0]["spec"]["preflight"][0]["id"] = "../../escape"  # type: ignore[index]
@@ -763,16 +841,11 @@ class ContractTests(unittest.TestCase):
             state_path = prepare_sealable(root, "seal-recovery")
             _, state = extract_state(state_path)
             orphan = json.loads(json.dumps(state["proof_contract"]))
-            receipt = state["approvals"]["code_spec"]
+            review = state["quality_reviews"]["code_spec"]
             orphan.update({
                 "status": "completed",
-                "code_spec_fingerprint": receipt["artifact_sha256"],
-                "approval": {
-                    "approved_by": receipt["approved_by"],
-                    "reference": receipt["approval_reference"],
-                    "approval_text_sha256": receipt["approval_text_sha256"],
-                    "quality_review_run_id": receipt["quality_review_run_id"],
-                },
+                "code_spec_fingerprint": review["artifact_sha256"],
+                "quality_review": dict(review),
                 "sealed_at": "2026-08-21T00:00:00+08:00",
             })
             orphan["seal"] = proof_contract_digest(orphan)
@@ -800,6 +873,486 @@ class ContractTests(unittest.TestCase):
             _, updated = extract_state(state_path)
             self.assertEqual(1, outcomes.count("rejected"))
             self.assertEqual(artifact, updated["proof_contract"])
+
+
+class AutomatedQualityReviewTests(unittest.TestCase):
+    def payload(self, review_type: str) -> dict[str, object]:
+        return {
+            "review_type": review_type, "review_run_id": f"{review_type.replace('_', '-')}-review-01",
+            "reviewer": "independent-reviewer", "review_reference": "fresh-context",
+            "execution": {"mode": "fresh_context", "provider": "test-runner", "invocation_id": "review-01", "transcript_sha256": "e" * 64},
+            "reviewed_at": "2026-08-21T00:00:00+08:00", "verdict": "PASS",
+            "artifact_sha256": "a" * 64, "proof_contract_sha256": "b" * 64,
+            "bound_artifacts": {"artifact": "a" * 64}, "findings": [],
+            "checks": review_checks(review_type),
+        }
+
+    def test_required_checks_cannot_be_omitted(self) -> None:
+        payload = self.payload("architecture")
+        payload["checks"] = payload["checks"][:-1]  # type: ignore[index]
+        errors: list[str] = []
+        validate_review_payload(payload, "architecture", errors)
+        self.assertTrue(any("missing required checks" in error for error in errors), errors)
+
+    def test_coverage_cannot_pass_below_one_hundred_percent(self) -> None:
+        payload = self.payload("product")
+        check = next(item for item in payload["checks"] if item["id"] == "source-coverage")  # type: ignore[index]
+        check["coverage_pct"] = 99
+        errors: list[str] = []
+        validate_review_payload(payload, "product", errors)
+        self.assertTrue(any("coverage_pct must be 100" in error for error in errors), errors)
+
+    def test_failed_required_check_blocks_pass(self) -> None:
+        payload = self.payload("architecture")
+        payload["checks"][0]["status"] = "FAIL"  # type: ignore[index]
+        errors: list[str] = []
+        validate_review_payload(payload, "architecture", errors)
+        self.assertTrue(any("cannot PASS with failed checks" in error for error in errors), errors)
+
+    def test_not_applicable_check_requires_reason(self) -> None:
+        payload = self.payload("product")
+        check = next(item for item in payload["checks"] if item["id"] == "prototype-state-coverage")  # type: ignore[index]
+        check.pop("not_applicable_reason")
+        errors: list[str] = []
+        validate_review_payload(payload, "product", errors)
+        self.assertTrue(any("not_applicable_reason" in error for error in errors), errors)
+
+    def test_existing_prototype_cannot_be_skipped_as_not_applicable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            feature_dir = Path(temporary)
+            (feature_dir / "prototype.html").write_text("<html></html>", encoding="utf-8")
+            payload = self.payload("product")
+            errors: list[str] = []
+            validate_review_context(payload, "product", feature_dir, errors)
+            self.assertTrue(any("cannot be N/A" in error for error in errors), errors)
+
+    def test_applicable_architecture_risks_cannot_be_skipped_as_not_applicable(self) -> None:
+        cases = {
+            "database-risk": {"additions": [{"type": "table"}]},
+            "api-compatibility": {"api_decisions": [{"id": "API-01"}]},
+            "authorization-and-isolation": {"isolation": {"applicable": True}},
+        }
+        for check_id, review_update in cases.items():
+            with self.subTest(check_id=check_id), tempfile.TemporaryDirectory() as temporary:
+                payload = self.payload("architecture")
+                check = next(item for item in payload["checks"] if item["id"] == check_id)  # type: ignore[index]
+                check.update({"status": "N/A", "not_applicable_reason": "incorrect skip"})
+                state = {"architecture_review": review_update}
+                errors: list[str] = []
+                validate_review_context(payload, "architecture", Path(temporary), errors, state)
+                self.assertTrue(any(check_id in error and "cannot be N/A" in error for error in errors), errors)
+
+    def test_pass_that_fails_intermediate_validation_rolls_back(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            init_git(root)
+            run_delivery_cli(root, "init_feature.py", "invalid-product-pass")
+            state_path = root / "delivery/invalid-product-pass/state.md"
+            content, state = extract_state(state_path)
+            state["requirement_review"].update({
+                "status": "in_progress", "source_fingerprint": "b" * 64,
+                "confirmed_ids": ["SRC-01"],
+                "summary": {"goal": "goal", "users_scenarios": "scenario", "in_scope": "scope", "out_scope": "none", "key_rules": "rules", "ui_impact": "none", "open_questions": "none"},
+            })
+            state["stages"]["prd"]["status"] = "in_progress"
+            write_state(state_path, content, state)
+            (state_path.parent / "prd.md").write_text("# malformed\n", encoding="utf-8")
+            result = root / "product-review.json"
+            coverage = expected_review_coverage(state_path.parent, "product", state)
+            result.write_text(json.dumps(review_result_payload("product", review_checks("product", coverage=coverage))), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "failed intermediate validation"):
+                quality_review._record_review(
+                    "invalid-product-pass", root, "product", "product-review-01", result,
+                    execution=test_review_execution(root, "invalid-product-pass", "product-review-01"),
+                    reviewed_artifacts=review_artifacts(root, "invalid-product-pass", "product", state),
+                )
+            _, rolled_back = extract_state(state_path)
+            self.assertEqual("in_progress", rolled_back["stages"]["prd"]["status"])
+            self.assertIsNone(rolled_back["quality_reviews"]["product"])
+            self.assertFalse((root / ".dlv/reviews/invalid-product-pass/product-review-01.json").exists())
+
+    def test_isolated_runner_owns_result_identity_and_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_product_review(root, "isolated-runner")
+            state = extract_state(state_path)[1]
+            response = review_result_payload(
+                "product",
+                review_checks("product", coverage=expected_review_coverage(state_path.parent, "product", state)),
+            )
+            real_run = subprocess.run
+
+            def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if command[0] != "codex":
+                    return real_run(command, **kwargs)
+                self.assertIn("--ephemeral", command)
+                self.assertEqual("read-only", command[command.index("--sandbox") + 1])
+                output = Path(command[command.index("--output-last-message") + 1])
+                output.write_text(json.dumps(response), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, '{"type":"review.completed"}\n', "")
+
+            with patch("quality_review.subprocess.run", side_effect=fake_run):
+                record_path = quality_review.run_isolated_review(
+                    "isolated-runner", root, "product", "product-isolated-01",
+                )
+            record_payload = json.loads(record_path.read_text(encoding="utf-8"))
+            execution = record_payload["execution"]
+            transcript = root / execution["transcript_path"]
+            self.assertEqual("codex-exec", record_payload["reviewer"])
+            self.assertEqual(execution["invocation_id"], record_payload["review_reference"])
+            self.assertTrue(transcript.is_file())
+            self.assertEqual(hashlib.sha256(transcript.read_bytes()).hexdigest(), execution["transcript_sha256"])
+
+    def test_public_isolated_runner_rejects_path_traversal_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch("quality_review.subprocess.run") as run:
+                with self.assertRaisesRegex(ValueError, "feature-id"):
+                    quality_review.run_isolated_review("../escape", root, "product", "product-review-01")
+                with self.assertRaisesRegex(ValueError, "review-run-id"):
+                    quality_review.run_isolated_review("feature-id", root, "product", "../../escape")
+                with self.assertRaisesRegex(ValueError, "review_type"):
+                    quality_review.run_isolated_review("feature-id", root, "unknown", "product-review-01")
+                run.assert_not_called()
+
+    def test_isolated_runner_rejects_relocated_review_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as external:
+            root = Path(temporary)
+            prepare_product_review(root, "review-symlink")
+            reviews = root / ".dlv/reviews"
+            reviews.parent.mkdir(parents=True, exist_ok=True)
+            reviews.symlink_to(Path(external), target_is_directory=True)
+            with patch("quality_review.subprocess.run") as run:
+                with self.assertRaisesRegex(ValueError, "escapes the project root|relocated through a symlink"):
+                    quality_review.run_isolated_review(
+                        "review-symlink", root, "product", "product-review-01",
+                    )
+                run.assert_not_called()
+
+    def test_snapshot_digest_rejects_aba_before_reviewer_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_product_review(root, "snapshot-aba")
+            prd = state_path.parent / "prd.md"
+            original = prd.read_text(encoding="utf-8")
+            real_copy = shutil.copy2
+
+            def racing_copy(source: Path, target: Path) -> Path:
+                if Path(source).resolve() == prd.resolve():
+                    prd.write_text(original + "\nintermediate B\n", encoding="utf-8")
+                    copied = real_copy(source, target)
+                    prd.write_text(original, encoding="utf-8")
+                    return Path(copied)
+                return Path(real_copy(source, target))
+
+            with (
+                patch("quality_review.shutil.copy2", side_effect=racing_copy),
+                patch("quality_review.subprocess.run") as run,
+            ):
+                with self.assertRaisesRegex(ValueError, "immutable snapshot"):
+                    quality_review.run_isolated_review(
+                        "snapshot-aba", root, "product", "product-review-01",
+                    )
+                run.assert_not_called()
+
+    def test_snapshot_presence_rejects_delete_restore_aba(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_product_review(root, "snapshot-presence")
+            prd = state_path.parent / "prd.md"
+            original = prd.read_text(encoding="utf-8")
+            real_copy = shutil.copy2
+
+            def delete_restore_copy(source: Path, target: Path) -> Path:
+                if Path(source).resolve() == prd.resolve():
+                    prd.unlink()
+                    prd.write_text(original, encoding="utf-8")
+                    return Path(target)
+                return Path(real_copy(source, target))
+
+            with (
+                patch("quality_review.shutil.copy2", side_effect=delete_restore_copy),
+                patch("quality_review.subprocess.run") as run,
+            ):
+                with self.assertRaisesRegex(ValueError, "input presence changed"):
+                    quality_review.run_isolated_review(
+                        "snapshot-presence", root, "product", "product-review-01",
+                    )
+                run.assert_not_called()
+
+    def test_final_rehash_rolls_back_late_review_input_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_product_review(root, "late-review-race")
+            state = extract_state(state_path)[1]
+            result = root / "product-review.json"
+            result.write_text(json.dumps(review_result_payload(
+                "product",
+                review_checks("product", coverage=expected_review_coverage(state_path.parent, "product", state)),
+            )), encoding="utf-8")
+            reviewed = review_artifacts(root, "late-review-race", "product", state)
+            prd = state_path.parent / "prd.md"
+
+            def validation_then_change(*_args: object, **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                prd.write_text(PRD_DOCUMENT + "\nlate change\n", encoding="utf-8")
+                return subprocess.CompletedProcess([], 0, "VALID INTERMEDIATE\n", "")
+
+            with patch("quality_review.subprocess.run", side_effect=validation_then_change):
+                with self.assertRaisesRegex(ValueError, "changed during final validation"):
+                    quality_review._record_review(
+                        "late-review-race", root, "product", "product-review-01", result,
+                        execution=test_review_execution(root, "late-review-race", "product-review-01"),
+                        reviewed_artifacts=reviewed,
+                    )
+            rolled_back = extract_state(state_path)[1]
+            self.assertIsNone(rolled_back["quality_reviews"]["product"])
+            self.assertEqual("in_progress", rolled_back["stages"]["prd"]["status"])
+
+    def test_isolated_runner_rejects_inputs_changed_during_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_product_review(root, "review-race")
+            state = extract_state(state_path)[1]
+            response = review_result_payload(
+                "product",
+                review_checks("product", coverage=expected_review_coverage(state_path.parent, "product", state)),
+            )
+
+            def fake_run(command: list[str], **_kwargs: object) -> subprocess.CompletedProcess[str]:
+                output = Path(command[command.index("--output-last-message") + 1])
+                output.write_text(json.dumps(response), encoding="utf-8")
+                (state_path.parent / "prd.md").write_text(PRD_DOCUMENT + "\nchanged\n", encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "review transcript\n", "")
+
+            with patch("quality_review.subprocess.run", side_effect=fake_run):
+                with self.assertRaisesRegex(ValueError, "inputs changed during"):
+                    quality_review.run_isolated_review("review-race", root, "product", "product-race-01")
+            self.assertFalse((root / ".dlv/reviews/review-race/product-race-01.json").exists())
+            self.assertEqual([], list((root / ".dlv/reviews/review-race").glob("product-race-01.*.transcript.jsonl")))
+
+    def test_duplicate_run_cleanup_preserves_winning_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_product_review(root, "duplicate-run")
+            state = extract_state(state_path)[1]
+            response = review_result_payload(
+                "product",
+                review_checks("product", coverage=expected_review_coverage(state_path.parent, "product", state)),
+            )
+            real_run = subprocess.run
+
+            def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                if command[0] != "codex":
+                    return real_run(command, **kwargs)
+                output = Path(command[command.index("--output-last-message") + 1])
+                output.write_text(json.dumps(response), encoding="utf-8")
+                return subprocess.CompletedProcess(command, 0, "review transcript\n", "")
+
+            with (
+                patch("quality_review.subprocess.run", side_effect=fake_run),
+                patch("quality_review.secrets.token_hex", side_effect=["a" * 32, "b" * 32]),
+            ):
+                record_path = quality_review.run_isolated_review(
+                    "duplicate-run", root, "product", "product-duplicate-01",
+                )
+                winning = root / json.loads(record_path.read_text(encoding="utf-8"))["execution"]["transcript_path"]
+                with self.assertRaisesRegex(ValueError, "review run already exists"):
+                    quality_review.run_isolated_review(
+                        "duplicate-run", root, "product", "product-duplicate-01",
+                    )
+            self.assertTrue(winning.is_file())
+            losing = root / ".dlv/reviews/duplicate-run" / f"product-duplicate-01.review-{'b' * 32}.transcript.jsonl"
+            self.assertFalse(losing.exists())
+
+    def test_quality_review_cli_rejects_caller_supplied_result(self) -> None:
+        result = subprocess.run(
+            [
+                sys.executable, str(SCRIPTS / "quality_review.py"), "product", "feature-id",
+                "--run-id", "product-review-01", "--result", "/tmp/forged-pass.json",
+            ],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertIn("unrecognized arguments: --result", result.stderr)
+
+    def test_transcript_tampering_invalidates_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_approved_delivery(root, "transcript-tamper")
+            transcript = next((root / ".dlv/reviews/transcript-tamper").glob("product-review-01.*.transcript.jsonl"))
+            transcript.write_text("tampered\n", encoding="utf-8")
+            validation = subprocess.run(
+                [sys.executable, str(SCRIPTS / "validate_feature.py"), "transcript-tamper", "--root", str(root)],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(0, validation.returncode)
+            self.assertIn("transcript hash is stale", validation.stdout + validation.stderr)
+            self.assertTrue(state_path.is_file())
+
+    def test_transcript_tampering_invalidates_review_and_downstream(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_approved_delivery(root, "transcript-invalidate")
+            transcript = next((root / ".dlv/reviews/transcript-invalidate").glob("product-review-01.*.transcript.jsonl"))
+            transcript.write_text("tampered\n", encoding="utf-8")
+            message = invalidate_downstream.invalidate(root, "transcript-invalidate", None)
+            self.assertIn("stale from prd", message)
+            invalidated = extract_state(state_path)[1]
+            self.assertEqual({"product": None, "architecture": None, "code_spec": None}, invalidated["quality_reviews"])
+
+    def test_review_run_ids_are_immutable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_approved_delivery(root, "immutable-review")
+            record = root / ".dlv/reviews/immutable-review/product-review-01.json"
+            payload = root / "duplicate.json"
+            duplicate = json.loads(record.read_text(encoding="utf-8"))
+            execution = duplicate["execution"]
+            for field in ("review_run_id", "reviewed_at", "artifact_sha256", "proof_contract_sha256", "bound_artifacts"):
+                duplicate.pop(field, None)
+            payload.write_text(json.dumps(duplicate), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "already exists"):
+                quality_review._record_review(
+                    "immutable-review", root, "product", "product-review-01", payload,
+                    execution=execution,
+                    reviewed_artifacts=review_artifacts(root, "immutable-review", "product", extract_state(state_path)[1]),
+                )
+            self.assertTrue(state_path.is_file())
+
+    def test_review_invocation_id_cannot_be_reused(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_product_review(root, "invocation-reuse")
+            state = extract_state(state_path)[1]
+            result = root / "product-review.json"
+            result.write_text(json.dumps(review_result_payload(
+                "product",
+                review_checks("product", coverage=expected_review_coverage(state_path.parent, "product", state)),
+            )), encoding="utf-8")
+            invocation_id = "shared-invocation"
+            transcript_dir = root / ".dlv/reviews/invocation-reuse"
+            transcript_dir.mkdir(parents=True, exist_ok=True)
+            first_transcript = transcript_dir / f"product-review-01.{invocation_id}.transcript.jsonl"
+            first_transcript.write_text("first\n", encoding="utf-8")
+            execution = {
+                "mode": "isolated_process", "provider": "test-runner", "invocation_id": invocation_id,
+                "transcript_path": first_transcript.relative_to(root).as_posix(),
+                "transcript_sha256": hashlib.sha256(first_transcript.read_bytes()).hexdigest(),
+            }
+            snapshot = review_artifacts(root, "invocation-reuse", "product", state)
+            quality_review._record_review(
+                "invocation-reuse", root, "product", "product-review-01", result,
+                execution=execution, reviewed_artifacts=snapshot,
+            )
+            current_state = extract_state(state_path)[1]
+            second_transcript = transcript_dir / f"product-review-02.{invocation_id}.transcript.jsonl"
+            second_transcript.write_text("second\n", encoding="utf-8")
+            reused_execution = dict(execution)
+            reused_execution.update({
+                "transcript_path": second_transcript.relative_to(root).as_posix(),
+                "transcript_sha256": hashlib.sha256(second_transcript.read_bytes()).hexdigest(),
+            })
+            with self.assertRaisesRegex(ValueError, "invocation_id cannot be reused"):
+                quality_review._record_review(
+                    "invocation-reuse", root, "product", "product-review-02", result,
+                    execution=reused_execution,
+                    reviewed_artifacts=review_artifacts(root, "invocation-reuse", "product", current_state),
+                )
+
+    def test_architecture_review_requires_product_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            init_git(root)
+            run_delivery_cli(root, "init_feature.py", "review-order")
+            state_path = root / "delivery/review-order/state.md"
+            (state_path.parent / "prd.md").write_text(PRD_DOCUMENT, encoding="utf-8")
+            (state_path.parent / "architecture-design.md").write_text(ARCHITECTURE_DOCUMENT, encoding="utf-8")
+            content, state = extract_state(state_path)
+            state["stages"]["prd"]["fingerprint"] = hashlib.sha256((state_path.parent / "prd.md").read_bytes()).hexdigest()
+            state["architecture_review"]["status"] = "in_progress"
+            write_state(state_path, content, state)
+            result = root / "architecture-review.json"
+            result.write_text(json.dumps(review_result_payload("architecture", review_checks("architecture"))), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "passed Product review"):
+                quality_review._record_review(
+                    "review-order", root, "architecture", "architecture-review-01", result,
+                    execution=test_review_execution(root, "review-order", "architecture-review-01"),
+                    reviewed_artifacts=review_artifacts(root, "review-order", "architecture", extract_state(state_path)[1]),
+                )
+
+    def test_code_spec_review_requires_architecture_pass(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_approved_delivery(root, "code-review-order")
+            content, state = extract_state(state_path)
+            state["stages"]["architecture"]["status"] = "in_progress"
+            state["quality_reviews"]["code_spec"] = None
+            state["proof_contract"]["quality_review"] = None
+            state["proof_contract"]["status"] = "pending"
+            state["proof_contract"]["seal"] = None
+            (state_path.parent / "proof-contract.json").unlink()
+            write_state(state_path, content, state)
+            result = root / "code-review.json"
+            coverage = expected_review_coverage(state_path.parent, "code_spec", state)
+            result.write_text(json.dumps(review_result_payload("code_spec", review_checks("code_spec", coverage=coverage))), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "passed Architecture review"):
+                quality_review._record_review(
+                    "code-review-order", root, "code_spec", "code-spec-review-02", result,
+                    execution=test_review_execution(root, "code-review-order", "code-spec-review-02"),
+                    reviewed_artifacts=review_artifacts(root, "code-review-order", "code_spec", state),
+                )
+
+    def test_forged_product_stage_cannot_bypass_product_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_approved_delivery(root, "forged-product-stage")
+            content, state = extract_state(state_path)
+            state["quality_reviews"]["product"] = None
+            state["stages"]["prd"]["status"] = "completed"
+            state["quality_reviews"]["architecture"] = None
+            state["stages"]["architecture"]["status"] = "in_progress"
+            state["current_stage"] = "architecture"
+            write_state(state_path, content, state)
+            result = root / "forged-architecture-review.json"
+            result.write_text(json.dumps(review_result_payload("architecture", review_checks("architecture"))), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "failed intermediate validation"):
+                quality_review._record_review(
+                    "forged-product-stage", root, "architecture", "architecture-review-02", result,
+                    execution=test_review_execution(root, "forged-product-stage", "architecture-review-02"),
+                    reviewed_artifacts=review_artifacts(root, "forged-product-stage", "architecture", state),
+                )
+            _, rolled_back = extract_state(state_path)
+            self.assertIsNone(rolled_back["quality_reviews"]["architecture"])
+
+    def test_legacy_approval_command_returns_migration_guidance(self) -> None:
+        result = subprocess.run([sys.executable, str(SCRIPTS / "approve_stage.py")], capture_output=True, text=True)
+        self.assertEqual(2, result.returncode)
+        self.assertIn("upgrade_v8_to_v9.py", result.stderr)
+        self.assertIn("quality_review.py", result.stderr)
+
+    def test_blocked_architecture_review_is_a_recoverable_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_approved_delivery(root, "blocked-architecture")
+            invalidate_downstream.invalidate(root, "blocked-architecture", "architecture")
+            result = root / "blocked-review.json"
+            checks = review_checks("architecture")
+            checks[0]["status"] = "FAIL"
+            payload = review_result_payload("architecture", checks)
+            payload["verdict"] = "BLOCKED"
+            payload["findings"] = [{"id": "ARQ-1", "severity": "major", "status": "open", "statement": "unsafe boundary", "evidence": "architecture-design.md"}]
+            result.write_text(json.dumps(payload), encoding="utf-8")
+            current_state = extract_state(state_path)[1]
+            quality_review._record_review(
+                "blocked-architecture", root, "architecture", "architecture-blocked-01", result,
+                execution=test_review_execution(root, "blocked-architecture", "architecture-blocked-01"),
+                reviewed_artifacts=review_artifacts(root, "blocked-architecture", "architecture", current_state),
+            )
+            validation = subprocess.run([sys.executable, str(SCRIPTS / "validate_feature.py"), "blocked-architecture", "--root", str(root)], capture_output=True, text=True)
+            self.assertNotIn("Traceback", validation.stdout + validation.stderr)
+            self.assertEqual(0, validation.returncode, validation.stdout + validation.stderr)
+            _, state = extract_state(state_path)
+            self.assertEqual("blocked", state["stages"]["architecture"]["status"])
 
 
 class ArchitectureDocumentTests(unittest.TestCase):
@@ -914,8 +1467,101 @@ class VerificationRunTests(unittest.TestCase):
             payload = json.loads(result.read_text(encoding="utf-8"))
             payload["anchors"] = anchors
             result.write_text(json.dumps(payload), encoding="utf-8")
-            with self.assertRaisesRegex(ValueError, "supported image"):
+            with self.assertRaisesRegex(ValueError, "truncated PNG|pixel comparison"):
                 record("visual-profile", root, "run-001", result, [])
+
+    def test_visual_evidence_rejects_png_decompression_bomb(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "bomb.png"
+
+            def chunk(name: bytes, payload: bytes) -> bytes:
+                return struct.pack(">I", len(payload)) + name + payload + struct.pack(">I", zlib.crc32(name + payload) & 0xFFFFFFFF)
+
+            header = struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0)
+            oversized_scanlines = zlib.compress(b"\x00" * 1_000_000)
+            path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", header) + chunk(b"IDAT", oversized_scanlines) + chunk(b"IEND", b""))
+            with self.assertRaisesRegex(ValueError, "PNG scanline size mismatch"):
+                verification_run.load_png_rgba(path)
+
+    def test_visual_evidence_rejects_short_ihdr_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "short-ihdr.png"
+
+            def chunk(name: bytes, payload: bytes) -> bytes:
+                return struct.pack(">I", len(payload)) + name + payload + struct.pack(">I", zlib.crc32(name + payload) & 0xFFFFFFFF)
+
+            path.write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", b"short") + chunk(b"IEND", b""))
+            with self.assertRaisesRegex(ValueError, "exactly one 13-byte IHDR"):
+                verification_run.load_png_rgba(path)
+
+    def test_visual_evidence_cannot_self_report_zero_for_different_pixels(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, result = prepare_profile_run(root, "visual")
+            anchor_dir = root / ".dlv" / "inputs"
+            prototype = anchor_dir / "prototype.png"
+            implementation = anchor_dir / "implementation.png"
+            visual_diff = anchor_dir / "diff.png"
+            prototype.write_bytes(png_bytes(255, 0, 0))
+            implementation.write_bytes(png_bytes(0, 0, 255))
+            visual_diff.write_bytes(png_bytes(255, 255, 255))
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            payload["anchors"] = [
+                {"role": "prototype_screenshot", "path": str(prototype)},
+                {"role": "implementation_screenshot", "path": str(implementation)},
+                {"role": "visual_diff", "path": str(visual_diff)},
+            ]
+            result.write_text(json.dumps(payload), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "visual_diff must contain zero RGB difference pixels"):
+                record("visual-profile", root, "run-001", result, [])
+
+    def test_visual_evidence_accepts_computed_zero_difference(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, result = prepare_profile_run(root, "visual")
+            anchor_dir = root / ".dlv" / "inputs"
+            anchors = []
+            for role, color in (("prototype_screenshot", (0, 128, 0)), ("implementation_screenshot", (0, 128, 0)), ("visual_diff", (0, 0, 0))):
+                path = anchor_dir / f"{role}.png"
+                path.write_bytes(png_bytes(*color))
+                anchors.append({"role": role, "path": str(path)})
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            payload["anchors"] = anchors
+            result.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertEqual("EVID-0001", record("visual-profile", root, "run-001", result, []))
+
+    def test_visual_source_swap_after_snapshot_cannot_change_stored_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _, result = prepare_profile_run(root, "visual")
+            anchor_dir = root / ".dlv" / "inputs"
+            anchors = []
+            implementation: Path | None = None
+            for role, color in (("prototype_screenshot", (0, 128, 0)), ("implementation_screenshot", (0, 128, 0)), ("visual_diff", (0, 0, 0))):
+                path = anchor_dir / f"{role}.png"
+                path.write_bytes(png_bytes(*color))
+                anchors.append({"role": role, "path": str(path)})
+                if role == "implementation_screenshot":
+                    implementation = path
+            payload = json.loads(result.read_text(encoding="utf-8"))
+            payload["anchors"] = anchors
+            result.write_text(json.dumps(payload), encoding="utf-8")
+            real_metrics = verification_run.computed_visual_metrics
+
+            def swap_source_after_snapshot(snapshot: list[tuple[str | None, Path]]) -> tuple[float, int]:
+                assert implementation is not None
+                implementation.write_bytes(png_bytes(255, 0, 0))
+                return real_metrics(snapshot)
+
+            with patch("verification_run.computed_visual_metrics", side_effect=swap_source_after_snapshot):
+                self.assertEqual("EVID-0001", record("visual-profile", root, "run-001", result, []))
+            records = json.loads((root / ".dlv/runs/visual-profile/run-001/evidence.jsonl").read_text(encoding="utf-8"))
+            stored = {item.get("role"): root / ".dlv/runs/visual-profile/run-001" / item["path"] for item in records["anchors"] if item.get("role")}
+            self.assertEqual(real_metrics(list(stored.items())), (0.0, 0))
+            errors: list[str] = []
+            state = extract_state(root / "delivery/visual-profile/state.md")[1]
+            validate_verification_run(root, "visual-profile", state, errors)
+            self.assertEqual([], errors)
 
     def test_runtime_evidence_requires_trace_role(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1223,7 +1869,7 @@ class VerificationRunTests(unittest.TestCase):
             state_path, _ = prepare(root)
             artifact = state_path.parent / "proof-contract.json"
             value = json.loads(artifact.read_text())
-            value["approval"]["reference"] = "forged"
+            value["quality_review"]["record_sha256"] = "0" * 64
             artifact.write_text(json.dumps(value))
             with self.assertRaisesRegex(ValueError, "disagrees"):
                 record("kernel-test", root, "run-001", result_file(root), [])
@@ -1335,7 +1981,7 @@ class MigrationTests(unittest.TestCase):
         )
         self.assertTrue(any("users.secret" in error for error in errors), errors)
 
-    def test_artifact_change_invalidates_quality_review_and_human_approval(self) -> None:
+    def test_artifact_change_invalidates_quality_review_and_downstream_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "review-stale", "--root", str(root)], check=True)
@@ -1345,14 +1991,77 @@ class MigrationTests(unittest.TestCase):
             content, state = extract_state(state_path)
             state["stages"]["architecture"].update({"status": "completed", "fingerprint": hashlib.sha256(architecture.read_bytes()).hexdigest()})
             state["quality_reviews"]["architecture"] = {"review_run_id": "architecture-review-01"}
-            state["approvals"]["architecture"] = {"stage": "architecture"}
             write_state(state_path, content, state)
             architecture.write_text("version two\n", encoding="utf-8")
             invalidate_downstream.invalidate(root, "review-stale", None)
             _, updated = extract_state(state_path)
             self.assertIsNone(updated["quality_reviews"]["architecture"])
-            self.assertNotIn("architecture", updated["approvals"])
             self.assertEqual("stale", updated["stages"]["architecture"]["status"])
+
+    def test_bound_non_file_inputs_invalidate_their_reviews(self) -> None:
+        mutations = {
+            "requirement": lambda state_path, state: state["requirement_review"]["summary"].update({"goal": "changed"}),
+            "prototype": lambda state_path, state: (state_path.parent / "prototype.html").write_text("<html>new</html>", encoding="utf-8"),
+            "architecture-review": lambda state_path, state: state["architecture_review"]["existing_capabilities"].append("changed capability"),
+            "proof-draft": lambda state_path, state: state["proof_contract"]["obligations"][0].update({"surface": "changed surface"}),
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                state_path = prepare_approved_delivery(root, f"invalidate-{name}", seal=False)
+                content, state = extract_state(state_path)
+                mutate(state_path, state)
+                write_state(state_path, content, state)
+                message = invalidate_downstream.invalidate(root, f"invalidate-{name}", None)
+                self.assertIn("stale from", message)
+                _, updated = extract_state(state_path)
+                if name in {"requirement", "prototype"}:
+                    self.assertIsNone(updated["quality_reviews"]["product"])
+                elif name == "architecture-review":
+                    self.assertIsNone(updated["quality_reviews"]["architecture"])
+                else:
+                    self.assertIsNone(updated["quality_reviews"]["code_spec"])
+
+    def test_requirement_change_requires_three_fresh_reviews_before_reseal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feature_id = "fresh-review-chain"
+            state_path = prepare_approved_delivery(root, feature_id)
+            content, state = extract_state(state_path)
+            state["requirement_review"]["summary"]["goal"] = "changed reviewed requirement"
+            write_state(state_path, content, state)
+            invalidate_downstream.invalidate(root, feature_id, None)
+            stale = extract_state(state_path)[1]
+            self.assertEqual({"product": None, "architecture": None, "code_spec": None}, stale["quality_reviews"])
+            self.assertFalse((state_path.parent / "proof-contract.json").exists())
+
+            record_test_review(root, feature_id, "product", "product-review-02")
+            record_test_review(root, feature_id, "architecture", "architecture-review-02")
+            record_test_review(root, feature_id, "code_spec", "code-spec-review-02")
+            run_delivery_cli(root, "seal_proof_contract.py", feature_id)
+            validation = subprocess.run(
+                [sys.executable, str(SCRIPTS / "validate_feature.py"), feature_id, "--root", str(root)],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(0, validation.returncode, validation.stdout + validation.stderr)
+            refreshed = extract_state(state_path)[1]
+            self.assertEqual("code", refreshed["current_stage"])
+            self.assertEqual("completed", refreshed["proof_contract"]["status"])
+
+    def test_review_record_identity_must_match_filename(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_approved_delivery(root, "review-identity")
+            record_path = root / ".dlv/reviews/review-identity/product-review-01.json"
+            payload = json.loads(record_path.read_text(encoding="utf-8"))
+            payload["review_run_id"] = "different-review"
+            record_path.write_text(json.dumps(payload), encoding="utf-8")
+            content, state = extract_state(state_path)
+            state["quality_reviews"]["product"]["record_sha256"] = hashlib.sha256(record_path.read_bytes()).hexdigest()
+            write_state(state_path, content, state)
+            errors: list[str] = []
+            validate_v9_gates(root, "review-identity", state_path.parent, state, errors)
+            self.assertTrue(any("record filename" in error for error in errors), errors)
 
     def test_v7_to_v8_dry_run_is_non_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1376,6 +2085,10 @@ class MigrationTests(unittest.TestCase):
             state["schema_version"] = 7
             state["approvals"] = {"architecture": {"stage": "architecture"}}
             state["quality_reviews"] = {"architecture": {"verdict": "PASS"}, "code_spec": {"verdict": "PASS"}}
+            state["architecture_review"]["material_decisions"] = [{
+                "id": "MAT-01", "addition_ids": ["ADD-01"], "decision": "add",
+                "reason": "legacy decision", "reversible": True, "approval": "APPROVED",
+            }]
             for name in state["stages"]:
                 state["stages"][name]["status"] = "completed"
             state["stages"]["verification"].update({"verdict": "PASS", "finalization": {"tool": "legacy"}})
@@ -1416,40 +2129,102 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual(before, state_path.read_bytes())
             self.assertTrue(snapshot.is_file())
 
-    def test_not_applicable_prototype_has_fingerprint_bound_receipt(self) -> None:
+    def test_v8_to_v9_dry_run_is_non_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            subprocess.run([sys.executable, str(SCRIPTS / "init_feature.py"), "product-receipt", "--root", str(root)], check=True)
-            state_path = root / "delivery/product-receipt/state.md"
+            run_delivery_cli(root, "init_feature.py", "v9-preview")
+            state_path = root / "delivery/v9-preview/state.md"
             content, state = extract_state(state_path)
-            state["requirement_review"].update({
-                "status": "completed",
-                "source_fingerprint": "b" * 64,
-                "confirmed_ids": ["SRC-01"],
-                "summary": {"goal": "goal", "users_scenarios": "users", "in_scope": "in", "out_scope": "out", "key_rules": "rules", "ui_impact": "none", "open_questions": "none"},
-                "approved_at": "2026-08-21T00:00:00+08:00",
-            })
-            state["approvals"]["requirement_review"] = {
-                "stage": "requirement_review", "artifact_sha256": requirement_review_digest(state["requirement_review"]),
-                "approved_by": "owner", "approval_reference": "ref", "approval_text_sha256": "a" * 64,
-                "approved_at": "2026-08-21T00:00:00+08:00",
-            }
+            state["schema_version"] = 8
+            state.pop("approval_trust", None)
+            state.pop("approval_challenges", None)
             write_state(state_path, content, state)
-            prd = state_path.parent / "prd.md"
-            prd.write_text("界面影响: none\n", encoding="utf-8")
-            args = argparse.Namespace(
-                feature_id="product-receipt", root=str(root), stage="product", approved_by="owner",
-                approval_reference="product-ref", approval_text_sha256="c" * 64,
+            before = state_path.read_bytes()
+            result = subprocess.run(
+                [sys.executable, str(SCRIPTS / "upgrade_v8_to_v9.py"), "v9-preview", "--root", str(root)],
+                capture_output=True, text=True,
             )
-            approve_stage.approve(args)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertEqual(before, state_path.read_bytes())
+
+    def test_v8_to_v9_removes_approval_state_and_requires_three_fresh_reviews(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            run_delivery_cli(root, "init_feature.py", "v9-upgrade")
+            state_path = root / "delivery/v9-upgrade/state.md"
+            content, state = extract_state(state_path)
+            state["schema_version"] = 8
+            state.pop("approval_trust", None)
+            state.pop("approval_challenges", None)
+            state["approvals"] = {"architecture": {"approved_by": "caller", "approval_reference": "generic-continue"}}
+            state["quality_reviews"] = {"architecture": {"verdict": "PASS"}, "code_spec": {"verdict": "PASS"}}
+            state["proof_contract"] = contract()
+            state["architecture_review"]["material_decisions"] = [{
+                "id": "MAT-01", "addition_ids": ["ADD-01"], "decision": "add",
+                "reason": "legacy decision", "reversible": True, "approval": "APPROVED",
+            }]
+            (state_path.parent / "proof-contract.json").write_text(json.dumps(state["proof_contract"]), encoding="utf-8")
+            for item in state["stages"].values():
+                item["status"] = "completed"
+            write_state(state_path, content, state)
+            result = subprocess.run(
+                [
+                    sys.executable, str(SCRIPTS / "upgrade_v8_to_v9.py"), "v9-upgrade", "--root", str(root),
+                    "--apply",
+                ],
+                capture_output=True, text=True,
+            )
+            _, upgraded = extract_state(state_path)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            self.assertEqual(9, upgraded["schema_version"])
+            self.assertNotIn("approvals", upgraded)
+            self.assertNotIn("approval_challenges", upgraded)
+            self.assertNotIn("approval_trust", upgraded)
+            self.assertEqual({"product": None, "architecture": None, "code_spec": None}, upgraded["quality_reviews"])
+            self.assertEqual("PENDING", upgraded["architecture_review"]["material_decisions"][0]["verdict"])
+            self.assertNotIn("approval", upgraded["architecture_review"]["material_decisions"][0])
+            self.assertEqual("in_progress", upgraded["requirement_review"]["status"])
+            self.assertEqual("stale", upgraded["proof_contract"]["status"])
+            self.assertFalse((state_path.parent / "proof-contract.json").exists())
+
+    def test_upgraded_completed_v8_delivery_can_run_three_reviews_and_reseal(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feature_id = "v9-forward-upgrade"
+            state_path = prepare_approved_delivery(root, feature_id)
+            content, state = extract_state(state_path)
+            state["schema_version"] = 8
+            state["approvals"] = {"architecture": {"stage": "architecture"}, "code_spec": {"stage": "code_spec"}}
+            state["quality_reviews"] = {"architecture": state["quality_reviews"]["architecture"], "code_spec": state["quality_reviews"]["code_spec"]}
+            state["requirement_review"]["approved_at"] = state["requirement_review"].pop("reviewed_at")
+            state["architecture_review"]["approved_at"] = state["architecture_review"].pop("reviewed_at")
+            state["proof_contract"]["approval"] = {"stage": "code_spec"}
+            state["proof_contract"].pop("quality_review", None)
+            write_state(state_path, content, state)
+            result = subprocess.run([sys.executable, str(SCRIPTS / "upgrade_v8_to_v9.py"), feature_id, "--root", str(root), "--apply"], capture_output=True, text=True)
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            record_test_review(root, feature_id, "product", "product-review-v9")
+            record_test_review(root, feature_id, "architecture", "architecture-review-v9")
+            record_test_review(root, feature_id, "code_spec", "code-spec-review-v9")
+            run_delivery_cli(root, "seal_proof_contract.py", feature_id)
+            validation = subprocess.run([sys.executable, str(SCRIPTS / "validate_feature.py"), feature_id, "--root", str(root)], capture_output=True, text=True)
+            self.assertEqual(0, validation.returncode, validation.stdout + validation.stderr)
+            _, upgraded = extract_state(state_path)
+            self.assertEqual("completed", upgraded["proof_contract"]["status"])
+            self.assertEqual("code", upgraded["current_stage"])
+
+    def test_not_applicable_prototype_is_bound_by_product_review(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = prepare_approved_delivery(root, "product-receipt")
             _, updated = extract_state(state_path)
-            prd_sha = hashlib.sha256(prd.read_bytes()).hexdigest()
+            prd_sha = hashlib.sha256((state_path.parent / "prd.md").read_bytes()).hexdigest()
             self.assertEqual("not_applicable", updated["stages"]["prototype"]["status"])
-            self.assertEqual(prototype_decision_digest(prd_sha), updated["approvals"]["prototype"]["artifact_sha256"])
-            updated["approvals"]["prototype"]["artifact_sha256"] = "0" * 64
+            self.assertEqual(prototype_decision_digest(prd_sha), updated["quality_reviews"]["product"]["bound_artifacts"]["prototype"])
+            updated["quality_reviews"]["product"]["bound_artifacts"]["prototype"] = "0" * 64
             errors: list[str] = []
-            validate_v8_gates(root, "product-receipt", state_path.parent, updated, errors)
-            self.assertTrue(any("approvals.prototype is stale" in error for error in errors), errors)
+            validate_v9_gates(root, "product-receipt", state_path.parent, updated, errors)
+            self.assertTrue(any("quality_reviews.product disagrees" in error for error in errors), errors)
 
     def test_current_stage_must_point_to_earliest_incomplete_stage(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1533,7 +2308,7 @@ class MigrationTests(unittest.TestCase):
 
 
 class FinalizationTests(unittest.TestCase):
-    def test_real_v8_delivery_finalizes_and_passes_independent_final_validation(self) -> None:
+    def test_real_v9_delivery_finalizes_and_passes_independent_final_validation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             feature_id = "real-finalization"
@@ -1548,7 +2323,6 @@ class FinalizationTests(unittest.TestCase):
                     name: {"status": "N/A", "reason": "fixture has no production code change"}
                     for name in ("delete", "kiss", "dry", "responsibility", "dependency")
                 },
-                "approved_at": "2026-08-21T00:00:00+08:00",
             })
             state["current_stage"] = "verification"
             write_state(state_path, content, state)
@@ -1616,11 +2390,11 @@ class FinalizationTests(unittest.TestCase):
             self.assertIn("EVID-0001", (state_path.parent / "verification.md").read_text())
 
             original_token = finalization_token(state)
-            state["approvals"] = {"prd": {"stage": "prd", "artifact_sha256": "a" * 64}}
+            state["quality_reviews"]["product"] = {"record_sha256": "a" * 64}
             self.assertNotEqual(original_token, finalization_token(state))
-            approval_tamper_errors: list[str] = []
-            validate_finalization(state, approval_tamper_errors)
-            self.assertTrue(any("token is stale" in error for error in approval_tamper_errors))
+            review_tamper_errors: list[str] = []
+            validate_finalization(state, review_tamper_errors)
+            self.assertTrue(any("token is stale" in error for error in review_tamper_errors))
 
             state["stages"]["verification"]["finalization"]["finalized_at"] = "2099-01-01T00:00:00Z"
             tamper_errors: list[str] = []
