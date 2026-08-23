@@ -6,7 +6,7 @@
 
 ## 就绪检查
 
-路径/符号必须 verified，或新路径为有父目录模式证据的 proposed；API、数据、UI、兼容和回滚合同完整；每个适用 `BP-*` 已批准并能落到具体文件、符号和断言；测试入口、命令与位置已知。否则返回上游。
+路径/符号必须 verified，或新路径为有父目录模式证据的 proposed；API、数据、UI、兼容和回滚合同完整；每个适用 `BP-*` 已复核并能落到具体文件、符号和断言；测试入口、命令与位置已知。否则返回上游。
 
 ## 实现映射
 
@@ -22,7 +22,7 @@
 
 | 类型 | 最低证明 |
 |---|---|
-| `visual` | 批准原型与实现使用相同终端、视口、状态、数据和字体截图；结构/禁止元素检查、关键几何和感知 diff |
+| `visual` | 原型与实现使用相同终端、视口、状态、数据和字体截图；原型截图、实现截图、diff 截图、结构/禁止元素检查、关键几何和零未解释像素差异 |
 | `runtime` | 在目标浏览器、开发者工具或真机执行用户动作并观察结果；原生副作用必须读取结果回证 |
 | `boundary` | direct API/入口的允许与拒绝角色、zero write/service-not-invoked、投影与 lineage probe |
 | `invariant` | 服务/数据库状态转换、跨事实一致性、租户和历史数据不变量 |
@@ -36,6 +36,6 @@
 
 每个 `Bxx` 是唯一最小执行边界：目标（至少一条 `R-*` 和 `AC/EX`）、架构锚点、仓库与基线、候选路径、源码/测试必读、允许与排除范围、依赖深度、test-first red/green/回归命令、消费的 `BP-*` 精确断言、完成/回滚条件、Simplicity 合同和超限理由。默认预算 3 仓库、20 路径、8 源码、4 测试/配置、1 hop。
 
-技术方案的每个影响项必须被消费；Code Spec 不得新增未批准的表、接口、组件、依赖、公共抽象或写入目标。每个 `BP-*` 必须进入至少一个 `Dxx`、`T-*` 和 `Bxx`；每个 `PO-*` 必须进入实现映射、测试规格和实现批次，`trace_ids` 必须精确枚举这些上游 ID。缺口返回上游并传播 stale。
+技术方案的每个影响项必须被消费；Code Spec 不得新增未复核的表、接口、组件、依赖、公共抽象或写入目标。每个 `BP-*` 必须进入至少一个 `Dxx`、`T-*` 和 `Bxx`；每个 `PO-*` 必须进入实现映射、测试规格和实现批次，`trace_ids` 必须精确枚举这些上游 ID。缺口返回上游并传播 stale。
 
-写完 Code Spec 与 Proof Contract 草案后必须执行 Code Spec Quality Review。finding 使用 `CSQ-*`，verdict 为 `PASS|REVISE|BLOCKED`；open critical/major 时不得 PASS。fresh PASS 后由用户一次确认 Code Spec、review 和 Proof Contract 草案；该确认同时授权严格按批准范围实现。随后运行无审批参数的 `seal_proof_contract.py`。Code Spec、草案或 review 变化会使确认 stale，必须重新审查和确认；seal 后合同不可原地修改。
+写完 Code Spec 与 Proof Contract 草案后必须执行 Code Spec Coverage Review。finding 使用 `CSQ-*`，verdict 为 `PASS|REVISE|BLOCKED`。PRD、Prototype、Architecture risk 与 Proof Contract coverage 必须为 100%，`unmapped-changes` 必须为 0；任一 required check FAIL 或 open critical/major finding 禁止 PASS。fresh PASS 后运行 `seal_proof_contract.py`；Code Spec、草案或任一绑定输入变化会使 review 与 seal stale，必须重新复核，seal 后合同不可原地修改。

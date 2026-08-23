@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seal a schema-v8 Proof Contract exactly once after reviewed Code Spec approval."""
+"""Seal a schema-v9 Proof Contract exactly once after Code Spec quality PASS."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from delivery_proof import atomic_write_text, exclusive_file_lock, extract_state, file_digest, load_json, proof_contract_digest, validate_feature_id, validate_proof_contract, write_state
-from quality_gates import proof_contract_draft_digest, validate_approval_receipt, validate_quality_review
+from quality_gates import proof_contract_draft_digest, validate_quality_review
 
 
 def timestamp() -> str:
@@ -22,8 +22,8 @@ def seal_contract(feature_id: str, root: Path) -> str:
     state_path = root / "delivery" / feature_id / "state.md"
     with exclusive_file_lock(root / ".dlv" / "runs" / feature_id / ".feature.lock"):
         content, state = extract_state(state_path)
-        if state.get("schema_version") != 8:
-            raise ValueError("seal_proof_contract.py requires schema_version=8")
+        if state.get("schema_version") != 9:
+            raise ValueError("seal_proof_contract.py requires schema_version=9")
         code_spec = state.get("stages", {}).get("code_spec", {})
         code_spec_path = state_path.parent / "code-spec.md"
         if not code_spec_path.is_file():
@@ -37,29 +37,23 @@ def seal_contract(feature_id: str, root: Path) -> str:
         acceptance_ids = set(re.findall(r"\b(?:AC|EX)-[0-9]+\b", prd_text))
         prototype_completed = state.get("stages", {}).get("prototype", {}).get("status") == "completed"
         artifact_path = state_path.parent / "proof-contract.json"
-        receipt = state.get("approvals", {}).get("code_spec")
         review_errors: list[str] = []
         review = validate_quality_review(root, feature_id, "code_spec", state, review_errors)
-        validate_approval_receipt(
-            receipt, "code_spec", code_spec_fingerprint, review_errors,
-            review=review, proof_contract_sha256=proof_contract_draft_digest(contract),
-        )
         if review_errors:
             raise ValueError("; ".join(review_errors))
-        approval = {
-            "approved_by": receipt["approved_by"],
-            "reference": receipt["approval_reference"],
-            "approval_text_sha256": receipt["approval_text_sha256"],
-            "quality_review_run_id": receipt["quality_review_run_id"],
-        }
+        quality_review = dict(state["quality_reviews"]["code_spec"])
+        if quality_review.get("artifact_sha256") != code_spec_fingerprint:
+            raise ValueError("Code Spec quality review is stale for the current artifact")
+        if quality_review.get("proof_contract_sha256") != proof_contract_draft_digest(contract):
+            raise ValueError("Code Spec quality review is stale for the Proof Contract draft")
         if artifact_path.is_file() and not contract.get("seal") and contract.get("status") != "completed":
             recovered = load_json(artifact_path)
             if (
                 recovered.get("code_spec_fingerprint") != code_spec_fingerprint
-                or recovered.get("approval") != approval
+                or recovered.get("quality_review") != quality_review
                 or recovered.get("seal") != proof_contract_digest(recovered)
             ):
-                raise ValueError("orphaned Proof Contract snapshot disagrees with the requested approval")
+                raise ValueError("orphaned Proof Contract snapshot disagrees with the current Code Spec review")
             recovery_errors: list[str] = []
             validate_proof_contract(recovered, acceptance_ids, code_spec_fingerprint, prototype_completed, recovery_errors)
             if recovery_errors:
@@ -68,7 +62,7 @@ def seal_contract(feature_id: str, root: Path) -> str:
             code_spec.update({
                 "status": "completed",
                 "fingerprint": code_spec_fingerprint,
-                "approved_at": receipt["approved_at"],
+                "reviewed_at": review["reviewed_at"],
             })
             state["current_stage"] = "code"
             state["last_updated"] = timestamp()
@@ -78,7 +72,7 @@ def seal_contract(feature_id: str, root: Path) -> str:
             raise ValueError("Proof Contract is already sealed; invalidate Code Spec to replace it")
         contract["code_spec_fingerprint"] = code_spec_fingerprint
         contract["status"] = "completed"
-        contract["approval"] = approval
+        contract["quality_review"] = quality_review
         contract["sealed_at"] = timestamp()
         contract["seal"] = proof_contract_digest(contract)
         errors: list[str] = []
@@ -94,7 +88,7 @@ def seal_contract(feature_id: str, root: Path) -> str:
         code_spec.update({
             "status": "completed",
             "fingerprint": code_spec_fingerprint,
-            "approved_at": receipt["approved_at"],
+            "reviewed_at": review["reviewed_at"],
         })
         state["current_stage"] = "code"
         state["last_updated"] = timestamp()

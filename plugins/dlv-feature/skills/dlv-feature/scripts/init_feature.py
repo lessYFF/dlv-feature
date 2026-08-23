@@ -25,15 +25,14 @@ def stage_state(name: str) -> dict:
     state = {"status": "pending"}
     if name in {"prd", "prototype", "architecture", "code_spec", "verification"}:
         state.update({"fingerprint": None})
-    if name in {"prd", "prototype", "code_spec"}:
-        state.update({"approved_at": None})
+    if name in {"prd", "prototype", "architecture", "code_spec"}:
+        state.update({"reviewed_at": None})
     if name == "code":
         state.update(
             {
                 "inputs": {"code_spec": None, "repositories": {}},
                 "result": None,
                 "simplicity_gate": None,
-                "approved_at": None,
             }
         )
     if name == "verification":
@@ -104,7 +103,7 @@ def main() -> int:
 
     feature_dir.mkdir(parents=True, exist_ok=True)
     state = {
-        "schema_version": 8,
+        "schema_version": 9,
         "feature_id": args.feature_id,
         "current_stage": "prd",
         "requirement_review": {
@@ -112,10 +111,9 @@ def main() -> int:
             "source_fingerprint": None,
             "confirmed_ids": [],
             "summary": None,
-            "approved_at": None,
+            "reviewed_at": None,
         },
-        "approvals": {},
-        "quality_reviews": {"architecture": None, "code_spec": None},
+        "quality_reviews": {"product": None, "architecture": None, "code_spec": None},
         "architecture_review": {
             "status": "pending",
             "inputs": {"prd": None, "prototype": None, "repositories": {}},
@@ -133,14 +131,14 @@ def main() -> int:
                 "verdict": "PENDING",
             },
             "material_decisions": [],
-            "approved_at": None,
+            "reviewed_at": None,
         },
         "proof_contract": {
             "status": "pending",
             "code_spec_fingerprint": None,
             "environments": [],
             "obligations": [],
-            "approval": None,
+            "quality_review": None,
             "sealed_at": None,
             "seal": None,
         },

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministic proof-kernel helpers for dlv-feature schema v8."""
+"""Deterministic proof-kernel helpers for delivery schema v9 and Verification schema v8."""
 
 from __future__ import annotations
 
@@ -306,12 +306,24 @@ def validate_proof_contract(
         errors.append(f"{location}.seal does not match the immutable contract payload")
     if not isinstance(contract.get("sealed_at"), str) or not contract["sealed_at"].strip():
         errors.append(f"{location}.sealed_at is required")
-    approval = contract.get("approval")
-    approval_fields = ("approved_by", "reference", "approval_text_sha256", "quality_review_run_id")
-    if not isinstance(approval, dict) or not all(isinstance(approval.get(key), str) and approval[key].strip() for key in approval_fields):
-        errors.append(f"{location}.approval requires a fingerprint-bound Code Spec approval receipt")
-    elif not SHA256.fullmatch(approval["approval_text_sha256"]):
-        errors.append(f"{location}.approval.approval_text_sha256 must be a lowercase SHA-256 fingerprint")
+    quality_review = contract.get("quality_review")
+    review_fields = (
+        "status", "review_run_id", "artifact_sha256", "proof_contract_sha256",
+        "verdict", "record_sha256",
+    )
+    if not isinstance(quality_review, dict) or not all(
+        isinstance(quality_review.get(key), str) and quality_review[key].strip() for key in review_fields
+    ):
+        errors.append(f"{location}.quality_review requires the passed Code Spec quality-review record")
+    elif quality_review.get("status") != "completed" or quality_review.get("verdict") != "PASS":
+        errors.append(f"{location}.quality_review must be a completed PASS")
+    elif any(not SHA256.fullmatch(quality_review[field]) for field in ("artifact_sha256", "proof_contract_sha256", "record_sha256")):
+        errors.append(f"{location}.quality_review contains an invalid SHA-256 fingerprint")
+    elif not isinstance(quality_review.get("bound_artifacts"), dict) or any(
+        not isinstance(value, str) or not SHA256.fullmatch(value)
+        for value in quality_review["bound_artifacts"].values()
+    ):
+        errors.append(f"{location}.quality_review.bound_artifacts is invalid")
 
     environments = contract.get("environments")
     environment_map: dict[str, dict[str, Any]] = {}
@@ -455,6 +467,14 @@ def validate_proof_contract(
             }
             if not required_sources <= assertion_sources:
                 errors.append(f"{prefix} visual assertions must cover pixel, geometry, and forbidden-element results")
+            visual_oracles = {
+                assertion.get("oracle", {}).get("source"): assertion.get("oracle", {})
+                for assertion in assertions if isinstance(assertion, dict)
+            }
+            for source in sorted(required_sources):
+                oracle = visual_oracles.get(source)
+                if not isinstance(oracle, dict) or oracle.get("operator") != "eq" or oracle.get("expected") != 0:
+                    errors.append(f"{prefix} visual assertion {source} must require exact zero difference")
         if proof_type == "runtime" and "/observation/result_readback" not in assertion_sources:
             errors.append(f"{prefix} runtime assertions must prove /observation/result_readback")
 
@@ -462,7 +482,7 @@ def validate_proof_contract(
     if missing:
         errors.append(f"proof obligations do not cover acceptance IDs: {', '.join(sorted(missing))}")
     if prototype_completed and not has_visual:
-        errors.append("visible UI with an approved prototype requires at least one visual proof obligation")
+        errors.append("visible UI with a reviewed prototype requires at least one visual proof obligation")
     return result
 
 
@@ -473,7 +493,6 @@ def finalization_payload(state: dict[str, Any]) -> dict[str, Any]:
         "schema_version": state.get("schema_version"),
         "feature_id": state.get("feature_id"),
         "truth": {name: stages.get(name, {}).get("fingerprint") for name in ("prd", "prototype", "architecture", "code_spec")},
-        "approvals": value_digest(state.get("approvals", {})),
         "quality_reviews": value_digest(state.get("quality_reviews", {})),
         "code_result": code_result_digest(state),
         "proof_contract": proof_contract_digest(state.get("proof_contract")),

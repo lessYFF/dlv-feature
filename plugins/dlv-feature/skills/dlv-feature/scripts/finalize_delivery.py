@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Render and finalize schema-v8 delivery from one fresh Verification Run."""
+"""Render and finalize schema-v9 delivery from one fresh Verification Run."""
 
 from __future__ import annotations
 
@@ -69,8 +69,8 @@ def main() -> int:
         print("error: state.md is required", file=sys.stderr)
         return 2
     content, state = extract_state(state_path)
-    if state.get("schema_version") != 8:
-        print("error: finalize_delivery.py only accepts schema_version=8", file=sys.stderr)
+    if state.get("schema_version") != 9:
+        print("error: finalize_delivery.py only accepts schema_version=9", file=sys.stderr)
         return 2
     run_id = state.get("stages", {}).get("verification", {}).get("active_run_id")
     if not isinstance(run_id, str) or not run_id:
