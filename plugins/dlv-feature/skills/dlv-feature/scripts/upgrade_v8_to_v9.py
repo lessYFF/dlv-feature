@@ -16,6 +16,26 @@ def timestamp() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
+def is_interrupted_v9_upgrade(state: dict[str, object]) -> bool:
+    reviews = state.get("quality_reviews")
+    contract = state.get("proof_contract")
+    requirement = state.get("requirement_review")
+    return (
+        state.get("schema_version") == 9
+        and state.get("current_stage") == "prd"
+        and not any(key in state for key in ("approvals", "approval_challenges", "approval_trust"))
+        and reviews == {"product": None, "architecture": None, "code_spec": None}
+        and isinstance(contract, dict)
+        and contract.get("status") == "stale"
+        and contract.get("quality_review") is None
+        and contract.get("sealed_at") is None
+        and contract.get("seal") is None
+        and isinstance(requirement, dict)
+        and requirement.get("status") == "in_progress"
+        and requirement.get("reviewed_at") is None
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("feature_id")
@@ -33,6 +53,21 @@ def main() -> int:
         print(f"error: missing {state_path}", file=sys.stderr)
         return 2
     content, state = extract_state(state_path)
+    snapshot_path = state_path.parent / "proof-contract.json"
+    lock_path = root / ".dlv" / "runs" / args.feature_id / ".feature.lock"
+    if is_interrupted_v9_upgrade(state):
+        print("recovery plan: finish interrupted schema 8 → 9 Proof Contract snapshot cleanup")
+        if not args.apply:
+            print("dry-run: pass --apply to finish the interrupted upgrade")
+            return 0
+        with exclusive_file_lock(lock_path):
+            _, locked_state = extract_state(state_path)
+            if not is_interrupted_v9_upgrade(locked_state):
+                print("error: state changed while waiting for the upgrade recovery lock", file=sys.stderr)
+                return 2
+            snapshot_path.unlink(missing_ok=True)
+        print(f"recovered: {state_path}")
+        return 0
     if state.get("schema_version") != 8:
         print("error: only schema_version=8 can be upgraded by this script", file=sys.stderr)
         return 2
@@ -45,8 +80,6 @@ def main() -> int:
         print("dry-run: pass --apply after reviewing the invalidation boundary")
         return 0
 
-    snapshot_path = state_path.parent / "proof-contract.json"
-    lock_path = root / ".dlv" / "runs" / args.feature_id / ".feature.lock"
     with exclusive_file_lock(lock_path):
         content, state = extract_state(state_path)
         if state.get("schema_version") != 8:

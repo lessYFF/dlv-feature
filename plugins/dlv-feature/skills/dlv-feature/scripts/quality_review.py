@@ -161,12 +161,23 @@ def _record_review(
                 })
                 architecture_review = state.get("architecture_review")
                 if isinstance(architecture_review, dict):
+                    decisions = architecture_review.get("material_decisions")
+                    if isinstance(decisions, list):
+                        for decision in decisions:
+                            if isinstance(decision, dict):
+                                decision["verdict"] = "PASS"
                     architecture_review.update({"status": "completed", "reviewed_at": payload["reviewed_at"]})
                 state["current_stage"] = "code_spec"
             else:
                 stages["architecture"]["status"] = blocked_status
                 architecture_review = state.get("architecture_review")
                 if isinstance(architecture_review, dict):
+                    decisions = architecture_review.get("material_decisions")
+                    if isinstance(decisions, list):
+                        decision_verdict = "BLOCKED" if payload["verdict"] == "BLOCKED" else "PENDING"
+                        for decision in decisions:
+                            if isinstance(decision, dict):
+                                decision["verdict"] = decision_verdict
                     architecture_review.update({"status": blocked_status, "reviewed_at": payload["reviewed_at"]})
                 state["current_stage"] = "architecture"
         else:

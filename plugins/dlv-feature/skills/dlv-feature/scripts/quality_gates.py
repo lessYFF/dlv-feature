@@ -25,7 +25,7 @@ REQUIRED_CHECKS = {
     },
     "architecture": {
         "database-risk", "api-compatibility", "existing-business-impact",
-        "authorization-and-isolation", "fact-ownership",
+        "authorization-and-isolation", "fact-ownership", "material-decision-coverage",
     },
     "code_spec": {
         "prd-coverage", "prototype-coverage", "risk-coverage", "proof-coverage",
@@ -34,7 +34,8 @@ REQUIRED_CHECKS = {
 }
 COVERAGE_CHECKS = {
     "source-coverage", "prd-acceptance-coverage", "prototype-state-coverage",
-    "prd-coverage", "prototype-coverage", "risk-coverage", "proof-coverage",
+    "material-decision-coverage", "prd-coverage", "prototype-coverage",
+    "risk-coverage", "proof-coverage",
 }
 N_A_CHECKS = {
     "product": {"prototype-state-coverage"},
@@ -61,6 +62,15 @@ def expected_review_coverage(
             "source-coverage": {item for item in confirmed if isinstance(item, str)},
             "prd-acceptance-coverage": document_ids(prd, ("AC", "EX")),
             "prototype-state-coverage": document_ids(prd, ("US",)) if (feature_dir / "prototype.html").is_file() else set(),
+        }
+    if review_type == "architecture":
+        review = state.get("architecture_review")
+        decisions = review.get("material_decisions", []) if isinstance(review, dict) else []
+        return {
+            "material-decision-coverage": {
+                str(item.get("id")) for item in decisions
+                if isinstance(item, dict) and item.get("id")
+            },
         }
     if review_type == "code_spec":
         risks = state.get("risks") if isinstance(state.get("risks"), list) else []
@@ -101,10 +111,20 @@ def proof_contract_draft_digest(contract: Any) -> str:
 def architecture_review_digest(review: Any) -> str:
     if not isinstance(review, dict):
         return value_digest(None)
-    return value_digest({
+    normalized = {
         key: value for key, value in review.items()
-        if key not in {"status", "reviewed_at"}
-    })
+        if key not in {"status", "reviewed_at", "material_decisions"}
+    }
+    decisions = review.get("material_decisions")
+    if isinstance(decisions, list):
+        normalized["material_decisions"] = [
+            {
+                key: value for key, value in decision.items()
+                if key not in {"verdict", "approval"}
+            } if isinstance(decision, dict) else decision
+            for decision in decisions
+        ]
+    return value_digest(normalized)
 
 
 def review_artifacts(root: Path, feature_id: str, review_type: str, state: dict[str, Any]) -> dict[str, Any]:

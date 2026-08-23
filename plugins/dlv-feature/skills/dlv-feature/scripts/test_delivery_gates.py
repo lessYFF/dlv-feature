@@ -2187,6 +2187,66 @@ class MigrationTests(unittest.TestCase):
             self.assertEqual("stale", upgraded["proof_contract"]["status"])
             self.assertFalse((state_path.parent / "proof-contract.json").exists())
 
+    def test_v8_to_v9_architecture_review_resolves_material_decisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feature_id = "v9-material-review"
+            state_path = prepare_approved_delivery(root, feature_id)
+            content, state = extract_state(state_path)
+            state["schema_version"] = 8
+            state["architecture_review"]["additions"] = [{
+                "id": "ADD-01", "type": "table", "object": "review_receipts",
+                "existing_alternative": "none", "why_not_reuse": "no existing owner",
+                "evidence": "architecture-design.md", "second_source_risk": "none",
+                "verdict": "APPROVED",
+            }]
+            state["architecture_review"]["material_decisions"] = [{
+                "id": "MAT-01", "addition_ids": ["ADD-01"], "decision": "add table",
+                "reason": "persist immutable review receipts", "reversible": True,
+                "verdict": "PASS", "approval": "APPROVED",
+            }]
+            architecture_path = state_path.parent / "architecture-design.md"
+            architecture_path.write_text(
+                architecture_path.read_text(encoding="utf-8").replace(
+                    "| ARCH-01 |", "| ARCH-01 ADD-01 |",
+                ),
+                encoding="utf-8",
+            )
+            write_state(state_path, content, state)
+
+            run_delivery_cli(root, "upgrade_v8_to_v9.py", feature_id, "--apply")
+            record_test_review(root, feature_id, "product", "product-review-v9-material")
+            record_test_review(root, feature_id, "architecture", "architecture-review-v9-material")
+
+            _, reviewed = extract_state(state_path)
+            self.assertEqual("completed", reviewed["stages"]["architecture"]["status"])
+            self.assertEqual("PASS", reviewed["architecture_review"]["material_decisions"][0]["verdict"])
+
+    def test_v8_to_v9_recovers_after_interruption_between_state_and_snapshot_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            feature_id = "v9-interrupted-upgrade"
+            run_delivery_cli(root, "init_feature.py", feature_id)
+            state_path = root / "delivery" / feature_id / "state.md"
+            content, state = extract_state(state_path)
+            state["schema_version"] = 8
+            state["proof_contract"] = contract()
+            snapshot = state_path.parent / "proof-contract.json"
+            snapshot.write_text(json.dumps(state["proof_contract"]), encoding="utf-8")
+            write_state(state_path, content, state)
+
+            with patch.object(Path, "unlink", side_effect=KeyboardInterrupt), patch(
+                "sys.argv", ["upgrade_v8_to_v9.py", feature_id, "--root", str(root), "--apply"]
+            ):
+                with self.assertRaises(KeyboardInterrupt):
+                    upgrade_v8_to_v9.main()
+
+            self.assertEqual(9, extract_state(state_path)[1]["schema_version"])
+            self.assertTrue(snapshot.is_file())
+            with patch("sys.argv", ["upgrade_v8_to_v9.py", feature_id, "--root", str(root), "--apply"]):
+                self.assertEqual(0, upgrade_v8_to_v9.main())
+            self.assertFalse(snapshot.exists())
+
     def test_upgraded_completed_v8_delivery_can_run_three_reviews_and_reseal(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
