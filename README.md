@@ -11,7 +11,7 @@ Requirements + PRD + Prototype → Product Contract Review → Architecture Risk
 It keeps product behavior, visual intent, technical decisions, implementation scope, and verification evidence separate. Schema v9 has zero routine human confirmation gates. Instead, three immutable automated reviews bind the exact input hashes and block progression on missing required checks, less than 100% required coverage, unmapped changes, or open critical/major findings:
 
 - Product Contract Review jointly checks source requirements, PRD, and Prototype or the explicit no-prototype decision.
-- Architecture Risk Review checks database change, API compatibility, existing-business impact, authorization/tenant boundaries, and fact ownership.
+- Architecture Risk Review checks database change, API compatibility, existing-business impact, authorization/tenant boundaries, fact ownership, and 100% coverage of every `MAT-*` material decision.
 - Code Spec Coverage Review checks complete PRD, Prototype, risk, and proof coverage with zero unmapped changes.
 
 ```bash
@@ -34,7 +34,7 @@ python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v8_to_v9.py <feat
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v8_to_v9.py <feature-id> --root <project-root> --apply
 ```
 
-The first command is a dry run. The applied upgrade preserves documents, code, and raw evidence only as untrusted candidates; it removes legacy approval state and invalidates every old quality verdict, seal, PASS, and finalization. Three fresh automated reviews and a fresh Verification Run are required.
+The first command is a dry run. The applied upgrade preserves documents, code, and raw evidence only as untrusted candidates; it removes legacy approval state and invalidates every old quality verdict, seal, PASS, and finalization. If cleanup is interrupted after the state advances to v9, rerun the same `--apply` command to finish removing the stale Proof Contract snapshot. Three fresh automated reviews and a fresh Verification Run are required.
 
 Schema-v7 deliveries first use the existing v7-to-v8 migration, then v8-to-v9:
 

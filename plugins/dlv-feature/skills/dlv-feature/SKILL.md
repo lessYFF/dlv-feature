@@ -60,7 +60,7 @@ Immutable Truth → Structured Assertion → Machine Evidence → Deterministic 
    python3 <skill-dir>/scripts/upgrade_v8_to_v9.py <feature-id> --root <project-root> --apply
    ```
 
-   The upgrade preserves documents, code, and raw evidence only as untrusted candidates. It removes legacy approval state and never promotes old quality verdicts, Proof Contract seals, PASS, or finalization into v9. For v7, upgrade to v8 first, then v9.
+   The upgrade preserves documents, code, and raw evidence only as untrusted candidates. It removes legacy approval state and never promotes old quality verdicts, Proof Contract seals, PASS, or finalization into v9. If cleanup is interrupted after the state advances to v9, rerun the same `--apply` command to finish removing the stale Proof Contract snapshot. For v7, upgrade to v8 first, then v9.
 
 ## Artifacts
 
@@ -110,7 +110,7 @@ Visible UI work also reads [prototype-stage.md](references/prototype-stage.md) d
 Routine delivery has zero human confirmation gates. Run three independent reviews from fresh context; each immutable record binds the exact artifacts and upstream inputs it examined:
 
 1. Product Contract Review: source requirements, PRD acceptance coverage, Prototype states or explicit no-prototype decision, cross-artifact consistency, and no invented scope.
-2. Architecture Risk Review: database change, API compatibility, existing-business impact, authorization and tenant isolation, and fact ownership.
+2. Architecture Risk Review: database change, API compatibility, existing-business impact, authorization and tenant isolation, fact ownership, and 100% coverage of every `MAT-*` material decision.
 3. Code Spec Coverage Review: 100% PRD, Prototype, risk, and Proof Contract coverage with zero unmapped changes.
 
 Every required check must be present. Each coverage check supplies an exact `covered_ids` set that the kernel compares with IDs derived from the bound artifacts; it may PASS only at 100%. `unmapped-changes` may PASS only at zero. Every record also identifies its fresh/isolated execution and binds a transcript hash. Any failed required check or open critical/major finding blocks PASS. Artifact changes invalidate the applicable review and downstream stages. This prevents accidental or procedural gate skipping; like the local evidence chain, it does not claim to resist a writer who can modify the skill, validator, state, review records, and transcripts together. Use remote attestation if that actor is in scope. Only genuine unresolved ambiguity requests human clarification; do not add routine approval pauses.

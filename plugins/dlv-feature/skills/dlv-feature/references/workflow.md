@@ -9,7 +9,7 @@
 | 阶段 | 进入条件 | 完成条件 |
 |---|---|---|
 | 需求复核与 PRD | 收到原始需求 | Product Review 对原始需求、PRD、原型/不做原型决定完成 100% 联合复核 |
-| 架构收敛与技术方案 | Product Review fresh PASS、现状已核验 | Architecture Review 对数据库、API、现有业务、授权/租户隔离、事实所有权全部复核并 PASS |
+| 架构收敛与技术方案 | Product Review fresh PASS、现状已核验 | Architecture Review 对数据库、API、现有业务、授权/租户隔离、事实所有权和全部 `MAT-*` 材料决定完成复核并 PASS |
 | Code Spec | Architecture Review fresh PASS | 文件、符号、规则、有界批次、`ENV/PO/ASRT` 完整；Code Spec Review 100% 覆盖且零 unmapped change |
 | Code | Code Spec Review fresh PASS 且 Proof Contract 已 seal | 完成实现与计划—实际核对；越界先失效并重审 |
 | 验证 | Code 结果已知 | fresh run 的 preflight 通过；每个 `PO-*` 恰有一条 active 证据并满足全部结构化断言 |
@@ -33,7 +33,7 @@
 
 保存 Requirement Review、Prototype、Architecture、Code Spec、Code 的直接输入 SHA-256 与仓库基线。Architecture Review 保存事实 owner、`BP-*`、新增举证、API 演进、隔离、并发、规则扩展性和材料裁决。Verification 以 run ID、run digest 和 finalization token 引用 `.dlv/runs/`，不把证据复制进状态。恢复时从最早 pending/in_progress/stale/blocked 项读取其产物、合同、run 与引用锚点；不得从“看起来完成”推断复核通过。
 
-每次恢复先运行 `invalidate_downstream.py`；产品行为变化时用 `--from-stage` 指明最早变化层。只接受 `schema_version=9`。v8 用 `upgrade_v8_to_v9.py` 保守迁移；v7 先升级到 v8，再升级到 v9。所有旧式批准、旧 quality PASS、Proof seal、手写 Verification 和完成裁决一律不沿用。
+每次恢复先运行 `invalidate_downstream.py`；产品行为变化时用 `--from-stage` 指明最早变化层。只接受 `schema_version=9`。v8 用 `upgrade_v8_to_v9.py` 保守迁移；若状态写入 v9 后的旧 Proof Contract 快照清理被中断，重复执行同一 `--apply` 命令完成清理。v7 先升级到 v8，再升级到 v9。所有旧式批准、旧 quality PASS、Proof seal、手写 Verification 和完成裁决一律不沿用。
 
 三个自动复核记录必须来自独立 fresh context，完整列出 required checks、证据、finding 和 verdict，并绑定精确输入哈希。缺项、覆盖率不足 100%、unmapped change 非零、required check FAIL 或 open critical/major finding 都阻断 PASS。输入变化使本复核及下游 stale。中间校验成功输出 `VALID INTERMEDIATE`；只有 `validate_feature.py --final` 可输出 `DELIVERY COMPLETE`。
 

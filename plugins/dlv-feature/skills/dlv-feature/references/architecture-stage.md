@@ -72,4 +72,4 @@ SQL 只表达目标 schema，不展示可执行迁移程序。禁止 `DO`、`EXE
 
 完成条件：输入 fresh；新增举证、隔离、并发、规则分派无 blocker；所有适用 `BP-*` 的入口、授权、lineage、projection 与 probe 完整且被技术方案消费；无第二事实源、fail-open 隔离、旧入口写旁路或散落规则。技术事实有仓库/基线/路径/符号锚点，新目标标为 proposed。
 
-写完后必须执行 Architecture Risk Review。review 记录写入 `.dlv/reviews/{feature}/{run-id}.json`，finding 使用 `ARQ-*`，verdict 为 `PASS|REVISE|BLOCKED`。数据库改动、API 兼容、现有业务影响、授权/租户隔离与事实所有权五项 required check 必须逐项给证据；适用项不得 N/A，任一 FAIL 或 open critical/major finding 禁止 PASS。fresh PASS 自动进入 Code Spec；技术方案或任一绑定输入变化都使本 review 与下游 stale。
+写完后必须执行 Architecture Risk Review。review 记录写入 `.dlv/reviews/{feature}/{run-id}.json`，finding 使用 `ARQ-*`，verdict 为 `PASS|REVISE|BLOCKED`。数据库改动、API 兼容、现有业务影响、授权/租户隔离、事实所有权与材料决定覆盖六项 required check 必须逐项给证据；`material-decision-coverage.covered_ids` 必须精确覆盖全部 `MAT-*`，适用项不得 N/A，任一 FAIL 或 open critical/major finding 禁止 PASS。fresh PASS 自动进入 Code Spec；技术方案或任一绑定输入变化都使本 review 与下游 stale。
