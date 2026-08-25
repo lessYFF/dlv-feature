@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate schema-v10 Delivery Graph state, attestations, contract, and evidence."""
+"""Validate schema-v11 Delivery Graph state, attestations, contract, and evidence."""
 
 from __future__ import annotations
 
@@ -30,6 +30,13 @@ from delivery_graph import (
     structural_errors,
 )
 from delivery_proof import file_digest, load_json, repository_fingerprint, value_digest
+from delivery_governance import (
+    BLOCKING_FINDING_STATUSES,
+    finding_summary,
+    ledger_path,
+    load_ledger,
+    source_revision_status,
+)
 from graph_contract import validate_contract
 
 
@@ -134,14 +141,18 @@ def validate_attestations(root: Path, feature_id: str, graph: dict[str, Any], st
             errors.append(f"attestation semantic checks are invalid: {lens}")
         if any(
             not isinstance(item, dict)
-            or set(item) != {"id", "severity", "status", "statement", "evidence"}
+            or set(item) != {
+                "id", "unit_id", "severity", "status", "statement", "evidence", "risk_path",
+                "root_cause", "first_seen_at", "last_seen_at", "first_seen_revision", "last_seen_revision",
+                "previously_invisible_reason", "waiver", "supersedes",
+            }
             or item.get("severity") not in {"critical", "major", "minor"}
-            or item.get("status") not in {"open", "resolved"}
+            or item.get("status") not in {"OPEN", "FIXED_PENDING_REVIEW", "VERIFIED", "OUT_OF_SCOPE", "ACCEPTED_RISK", "SUPERSEDED"}
             for item in semantic_findings
         ):
             errors.append(f"attestation semantic findings are invalid: {lens}")
         open_major = any(
-            item.get("severity") in {"critical", "major"} and item.get("status") == "open"
+            item.get("severity") in {"critical", "major"} and item.get("status") in BLOCKING_FINDING_STATUSES
             for item in semantic_findings if isinstance(item, dict)
         )
         failed_check = any(item.get("status") != "PASS" for item in semantic_checks if isinstance(item, dict))
@@ -187,7 +198,7 @@ def validate_attestations(root: Path, feature_id: str, graph: dict[str, Any], st
         elif (
             set(execution) != {"mode", "engine", "independent"}
             or execution.get("mode") != "isolated_deterministic_lens"
-            or execution.get("engine") != "dlv-feature/graph-review-v10"
+            or execution.get("engine") != "dlv-feature/graph-review-v11"
             or execution.get("independent") is not True
         ):
             errors.append(f"deterministic attestation execution metadata is invalid: {lens}")
@@ -197,8 +208,6 @@ def validate_attestations(root: Path, feature_id: str, graph: dict[str, Any], st
         ) else "PASS"
         if record.get("verdict") != expected_verdict:
             errors.append(f"composite attestation verdict hides a failed lens: {lens}")
-    if state.get("readiness") != readiness(graph, attestations):
-        errors.append("state readiness disagrees with current review units")
 
 
 def finalization_payload(state: dict[str, Any], report_sha256: str | None) -> dict[str, Any]:
@@ -246,7 +255,8 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
         return errors + [f"state.json is not a valid object: {exc}"]
     expected_state_keys = {
         "schema_version", "feature_id", "graph_sha256", "node_hashes", "stage_hashes",
-        "readiness", "attestations", "proof_contract", "code", "verification", "last_compiled_at",
+        "readiness", "attestations", "source_revision", "risk", "finding_ledger", "convergence",
+        "execution", "proof_contract", "code", "verification", "last_compiled_at",
     }
     if set(state) != expected_state_keys:
         errors.append("state.json must contain only canonical hash/status/reference fields")
@@ -267,7 +277,34 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
         path = directory / name
         if not path.is_file() or path.read_text(encoding="utf-8") != expected_content:
             errors.append(f"generated artifact is missing or stale: {name}")
+    try:
+        source_status = source_revision_status(directory, feature_id, graph["source_revision"])
+        ledger = load_ledger(root, feature_id)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        errors.append(f"governance records are invalid: {exc}")
+        source_status, ledger = {"status": "drift"}, {"entries": {}, "campaigns": []}
+    source_reference = state.get("source_revision")
+    if source_reference != source_status:
+        errors.append("state Source Revision reference is stale")
+    risk = state.get("risk")
+    if not isinstance(risk, dict) or set(risk) != {"source", "design", "observed", "effective", "profiles"}:
+        errors.append("state risk assessment is invalid")
+    ledger_reference = state.get("finding_ledger")
+    if not isinstance(ledger_reference, dict) or set(ledger_reference) != {"record_path", "sha256", "summary"}:
+        errors.append("state finding ledger reference is invalid")
+    elif ledger_reference.get("record_path") != f".dlv/findings/{feature_id}/ledger.json" or (
+        ledger_path(root, feature_id).is_file() and ledger_reference.get("sha256") != file_digest(ledger_path(root, feature_id))
+    ) or ledger_reference.get("summary") != finding_summary(ledger):
+        errors.append("state finding ledger reference is stale")
+    convergence = state.get("convergence")
+    if not isinstance(convergence, dict) or set(convergence) != {"status", "ready_distance", "reason"}:
+        errors.append("state convergence is invalid")
+    execution = state.get("execution")
+    if not isinstance(execution, dict) or set(execution) != {"status", "checkpoint", "reason"}:
+        errors.append("state execution checkpoint is invalid")
     validate_attestations(root, feature_id, graph, state, errors)
+    if state.get("readiness") != readiness(graph, state.get("attestations", {}), source_status=source_status, ledger=ledger):
+        errors.append("state readiness disagrees with current review units/governance")
     contract_path = directory / "proof-contract.json"
     if not contract_path.is_file():
         errors.append("missing generated proof-contract.json")
@@ -303,7 +340,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     code = state.get("code")
     if not isinstance(code, dict):
         errors.append("state.code must be an object")
-    elif set(code) != {"status", "repository_fingerprint"} or code.get("status") not in {"pending", "stale", "completed"}:
+    elif set(code) != {"status", "repository_fingerprint"} or code.get("status") not in {"pending", "stale", "needs_reconcile", "completed"}:
         errors.append("state.code shape/status is invalid")
     elif code.get("status") == "completed":
         try:
@@ -394,7 +431,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
             if not report_path.is_file() or report_path.read_text(encoding="utf-8") != expected_report:
                 errors.append("generated Verification report is missing or stale")
     elif (directory / "verification.md").exists() or (directory / "verification.md").is_symlink():
-        errors.append("verification.md exists without an active schema-v10 run")
+        errors.append("verification.md exists without an active schema-v11 run")
     if final:
         if state.get("readiness", {}).get("status") != "ready":
             errors.append("final validation requires Delivery Readiness")
@@ -413,8 +450,11 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
             errors.append("finalization token is stale")
     if directory.is_dir():
         for entry in directory.iterdir():
-            if entry.is_dir():
+            if entry.is_dir() and entry.name != "source-revisions":
                 errors.append(f"unexpected directory in feature artifact set: {entry.name}/")
+            elif entry.is_dir() and entry.name == "source-revisions":
+                if any(not item.is_file() or item.suffix != ".json" for item in entry.iterdir()):
+                    errors.append("source-revisions contains an invalid artifact")
             elif entry.name not in ALLOWED_FILES:
                 errors.append(f"unexpected feature artifact: {entry.name}")
     return errors

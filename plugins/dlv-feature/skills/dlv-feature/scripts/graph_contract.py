@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seal and validate a schema-v10 generated Proof Contract."""
+"""Seal and validate a schema-v11 generated Proof Contract."""
 
 from __future__ import annotations
 

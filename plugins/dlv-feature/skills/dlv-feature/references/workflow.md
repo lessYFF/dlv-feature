@@ -1,46 +1,47 @@
-# Schema v10 workflow
-
-## Continuous truth and readiness
-
-Only `delivery-graph.json` is edited. `prototype.html` is additionally editable when Prototype is completed. Compilation validates the graph, renders PRD/Architecture/Code Spec as disposable views, derives the Proof Contract, computes deterministic review components, preserves exact fresh attestations, and updates Delivery Readiness.
+# Schema v11 workflow
 
 ```text
-edit graph → compile → review stale units → readiness
-→ seal → Code → runtime proof → finalize
+capture source → confirm scope epoch → edit Graph → compile/lint
+→ Review stale components + global coherence → resolve Findings
+→ seal → implement → reconcile Code risk → target-runtime Proof → finalization
 ```
 
-There is no Architecture-to-Code-Spec approval handoff. Those views help humans inspect different slices of the same graph.
+## Review depth
 
-## Deterministic local components
+The universal kernel is Source Revision, minimal Graph, deterministic lint,
+semantic Review, Finding Ledger, Proof Contract, Diff/evidence reconciliation,
+and Ready decision. Risk activates additive lenses rather than another serial
+workflow.
 
-Each lens is partitioned from its typed roots and graph edges. The caller cannot provide a component boundary. A unit binds `(lens, component_id, component_hash)` and contains its exact roots plus required upstream dependencies. A changed node invalidates only units whose recomputed hash changes.
+`UI_LOCAL` needs requirement/UI-state/component/Test/Proof traceability and
+design/interaction review. It does not invent persistence, distributed state,
+idempotency, or concurrency obligations. A local UI change touching money,
+authorization, business-state semantics, API, persistence, tenant boundaries,
+or cross-client behavior automatically becomes a higher-risk route.
 
-For `derives_from/changes/depends_on/tests/proves/runs_in/mitigates`, source depends on target. For `owns/guards`, the protected target depends on the provider. Explicit semantic changes that graph bytes cannot reveal use `--changed-node`.
+## Invalidation and convergence
 
-## Global Skeleton
+The compiler assigns stable component identity from typed roots, then records
+dependency paths for invalidation. A changed local Symbol should retain
+unrelated components and the Global Skeleton. Owner, boundary, state,
+material-risk, source-revision, or cross-component topology changes refresh
+global coherence.
 
-Local correctness is insufficient for a composed system. A compact global unit covers all Owner, Boundary, StateTransition, and critical/major Risk structure plus Fact/Environment context shared by multiple local units. It changes only when that system skeleton changes. A local Symbol or isolated proof edit does not trigger it.
-
-The reviewer receives an immutable unit snapshot. Normal reviews run in independent read-only Codex processes outside the repository so repository instructions cannot steer them. A deterministic critical/major issue, failed semantic check, semantic `BLOCKED`, or open critical/major finding blocks that unit.
-
-Delivery Readiness is `ready` only when every required local unit and the Global Skeleton have fresh PASS records. Sealing and Code completion require readiness; a local PASS cannot hide a global failure.
+Every campaign first verifies old Findings. New blockers need new evidence;
+repeated root causes share an ID. If remaining obligations do not decline,
+state becomes `STABLE_BLOCKED`; a pending scope capture or unplanned Code risk
+becomes `NEEDS_DECISION`. These states stop automatic Graph mutation, never
+create automatic PASS.
 
 ## Recovery
 
-Recover in this order:
+One feature lock serializes Graph/state/ledger writes. Semantic Review uses
+independent temporary read-only processes. Failure preserves a checkpoint:
+`needs_resume` resumes recorded work; `needs_decision` waits for an Owner
+scope/design/risk decision. New source input creates drift instead of blindly
+cancelling work.
 
-```text
-delivery-graph.json
-→ compile views/state
-→ validate component and global records/transcripts
-→ validate generated Proof Contract + seal
-→ validate Code fingerprint
-→ run metadata → evidence JSONL → anchors
-→ regenerate Verification → deterministic finalization
-```
-
-Missing or stale references return only the affected unit, contract, Code, or run claim to pending. `--all-reviews` is an explicit destructive reset of review claims, not the normal resume path.
-
-## Schema-v9 import
-
-The only legacy boundary is `upgrade_v9_to_v10.py`. Preview is read-only. Apply archives old artifacts byte-for-byte, verifies every SHA-256 before cleanup, derives untrusted candidate nodes, and invalidates every old review, seal, Code, run, PASS, and finalization claim. Schema-v9 creation and execution are not part of v0.6.
+Before finalization DLV reconciles formal feature commits, Code fingerprint,
+effective risk, sealed Proof Contract, environments, runners, fixtures,
+assertion observability, evidence anchors, and final state. Any mismatch is
+pending or blocked, never Ready.

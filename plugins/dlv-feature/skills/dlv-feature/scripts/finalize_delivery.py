@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finalize a schema-v10 Delivery Graph feature."""
+"""Finalize a schema-v11 Delivery Graph feature."""
 
 from graph_finalize import main
 

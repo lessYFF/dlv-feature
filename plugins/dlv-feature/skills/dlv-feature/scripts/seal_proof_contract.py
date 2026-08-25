@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seal the schema-v10 generated Proof Contract."""
+"""Seal the schema-v11 generated Proof Contract."""
 
 from graph_contract import main
 

@@ -18,7 +18,7 @@ Make every planned change, symbol, test, runtime, proof, and assertion executabl
 3. Connect Proof `proves` to exact Acceptance/Exception and supporting Test/Boundary/Transition/Risk targets; connect `runs_in` exactly one Environment.
 4. Create structured `Assertion` nodes with `attributes.oracle`. Each Assertion `proves` exactly one Proof.
 5. Every Acceptance/Exception requires both Test and Proof coverage. Choose the strongest applicable type: `visual`, `runtime`, `boundary`, `invariant`, or `artifact`. Do not downgrade for convenience.
-6. A completed Prototype requires every Acceptance/Exception to declare boolean `prototype_applicable`, with at least one true value and direct visual Proof coverage for every true node.
+6. A contractual Prototype requires every Acceptance/Exception to declare boolean `prototype_applicable`, with at least one true value and direct visual Proof coverage for every true node. A reference Prototype remains an intent reference rather than a pixel contract.
 7. Each visual Proof runs in a visual target runtime, sets exact `capture_profile={viewport,state,data,dpr,fonts}`, and has exactly one `eq 0.0` pixel-diff assertion, one `eq 0` geometry-diff assertion, and one `eq 0` forbidden-element assertion. Its `visual_bundle` runner returns the sealed Prototype SHA/profile and exact Prototype/Implementation/Diff PNG paths.
 
 The compiler generates Code Spec and the Proof Contract draft from this graph. Never hand-edit either.
