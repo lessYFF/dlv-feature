@@ -1,4 +1,4 @@
 interface:
   display_name: "DLV Feature"
-  short_description: "以证明义务、视觉一致性和真实运行时证据驱动端到端功能交付"
-  default_prompt: "Use $dlv-feature to deliver this feature with schema-v9 automated Product, Architecture, and Code Spec reviews, typed target-runtime evidence, pixel-level UI comparison, and deterministic finalization."
+  short_description: "以组件级复核、全局骨架和真实运行时证据驱动功能交付"
+  default_prompt: "Use $dlv-feature to deliver this feature with a schema-v10 Delivery Graph, component-scoped semantic attestations, a compact global-coherence review, generated proof contracts, target-runtime evidence, and deterministic finalization."

@@ -1,36 +1,18 @@
-# 原型实验
+# Prototype branch
 
-## 定位
+Use this branch only when visible UI shape is product truth.
 
-仅在可见 UI 需求中作为 PRD 复核支线运行。与 PRD 收口并通过 Product Contract Review 后，原型成为可见内容、状态、交互形态和视觉几何的实现真值；它不决定组件、状态管理、接口或代码形态。
+1. Read the target repository design rules and the actual page, shell, route, components, responsive constraints, and fonts.
+2. Build one self-contained `prototype.html` that expresses the graph’s applicable Behavior/Acceptance/Exception states. It does not define code architecture.
+3. Exercise it with the repository-configured browser capability; do not download a browser runtime solely for testing.
+4. Resolve mismatches by changing the product graph when requirement truth changed, or the Prototype when only presentation was wrong.
+5. Set boolean `attributes.prototype_applicable` on every Acceptance and Exception. At least one must be `true`; each true node needs direct visual Proof coverage.
+6. Set:
 
-## 输入
+   ```json
+   {"status":"completed","path":"prototype.html","sha256":"<sha256>"}
+   ```
 
-- 已确认的需求复核摘要；
-- 当前 `prd.md` 的 UI 需求、`US/FR/AC/EX`；
-- 目标应用的真实页面、路由/容器、组件、布局、样式和响应式约束；
-- 当前原型（如修订）。
+7. Recompile and run Product review.
 
-无法唯一定位真实页面/容器或缺少必要源码证据时阻断，不使用通用品牌模板替代事实。
-
-## 执行
-
-1. 确认目标应用和页面/路由/容器。
-2. 形成精简原型合同：来源锚点、Story、关键状态、目标视口、禁止元素、真实 UI 证据和 PRD 指纹。
-3. 生成一个自包含 `prototype.html`；逐项覆盖 PRD 已定义的输入、选择和动作，适用时覆盖正常、空、加载、错误、禁用、权限和响应式状态。
-4. 重要表面标记 `data-story-id`，状态标记 `data-state`。
-5. 使用浏览器能力检查可打开性、关键交互和合同视口；不得为了测试单独下载浏览器运行时。
-6. 比较 HTML、原型合同与 PRD UI：
-   - 原型揭示需求来源未覆盖的产品意图：登记 gap；只有真实歧义才请求用户澄清，解决后同步 PRD；
-   - PRD 不变：修订原型；
-   - 有可解释偏差：记录来源与理由，但偏差不进入默认实现真值。
-
-## 完成条件
-
-- 每个适用 Story 有对应 UI 表面和状态；
-- 每个 UI `AC-* / EX-*` 都能定位到一个具体控件、动作或可见状态，不能只由 Story 容器笼统覆盖；
-- PRD 指纹、HTML 指纹、真实来源、Story、状态、视口、禁止元素和偏差写入 `state.md -> stages.prototype.contract`，并声明 `visual_truth=true`；
-- PRD 与原型差异已收口；
-- Product Contract Review 联合复核 PRD 与原型，覆盖率 100%，并绑定两个产物指纹。
-
-完成后回到 Product Contract Review，不直接进入 Architecture。无需对文本 PRD 做像素比较；最终实现必须在同视口、状态、数据、字体和终端条件下与 reviewed 原型生成 Prototype、Implementation 与 Diff 三张 PNG，由 recorder 解码后重算 pixel/geometry 差异并要求为 0。原型变化导致 PRD 同步时，刷新 PRD 指纹并按上游变化传播 stale。
+The final visual Proof must declare exact `capture_profile={viewport,state,data,dpr,fonts}`. Its sealed runner uses that profile and returns the Prototype SHA plus exact `anchor_paths` for distinct Prototype, Implementation, and Diff PNGs. The caller cannot label screenshots. The recorder snapshots runner-produced files, recomputes pixel and geometry metrics, and requires the sealed zero-difference assertions. Source/DOM presence is not visual proof.
