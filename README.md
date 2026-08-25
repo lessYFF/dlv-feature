@@ -1,99 +1,45 @@
 # DLV Feature
 
-Current plugin version: **0.5.0** (delivery schema v9).
+Current plugin version: **0.6.0**, Delivery Graph schema v10.
 
-DLV Feature is a Codex skill for delivering a feature through one proof-carrying chain:
+DLV Feature is a proof-carrying Codex workflow with one editable Delivery Graph, deterministic component-scoped review reuse, a compact global system-coherence review, generated delivery views and contracts, target-runtime evidence, and deterministic finalization.
 
-```text
-Requirements + PRD + Prototype → Product Contract Review → Architecture Risk Review → Code Spec Coverage Review → Sealed Proof Contract → Code → Verification → Deterministic Finalization
-```
+Architecture and Code Spec are generated views, not serial approval stages. A local edit invalidates only its dependency component. Owner, Boundary, StateTransition, critical/major Risk, shared Fact, or shared Environment changes also invalidate the Global Skeleton attestation.
 
-It keeps product behavior, visual intent, technical decisions, implementation scope, and verification evidence separate. Schema v9 has zero routine human confirmation gates. Instead, three immutable automated reviews bind the exact input hashes and block progression on missing required checks, less than 100% required coverage, unmapped changes, or open critical/major findings:
-
-- Product Contract Review jointly checks source requirements, PRD, and Prototype or the explicit no-prototype decision.
-- Architecture Risk Review checks database change, API compatibility, existing-business impact, authorization/tenant boundaries, fact ownership, and 100% coverage of every `MAT-*` material decision.
-- Code Spec Coverage Review checks complete PRD, Prototype, risk, and proof coverage with zero unmapped changes.
+## Install
 
 ```bash
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/quality_review.py product <feature-id> \
-  --root <project-root> --run-id <run-id>
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/quality_review.py architecture <feature-id> \
-  --root <project-root> --run-id <run-id>
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/quality_review.py code_spec <feature-id> \
-  --root <project-root> --run-id <run-id>
-```
-
-Each command launches its own ephemeral, read-only `codex exec` reviewer. The runner owns the verdict input, invocation identity, transcript, and transcript hash; callers cannot submit a prebuilt PASS result.
-
-An artifact or bound input change invalidates its review and every downstream claim. Genuine unresolved requirement ambiguity may still block for clarification. Authorization for external mutations remains governed by the host and repository policy; it is not a routine delivery confirmation.
-
-Existing schema-v8 deliveries require a conservative upgrade before resuming:
-
-```bash
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v8_to_v9.py <feature-id> --root <project-root>
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v8_to_v9.py <feature-id> --root <project-root> --apply
-```
-
-The first command is a dry run. The applied upgrade preserves documents, code, and raw evidence only as untrusted candidates; it removes legacy approval state and invalidates every old quality verdict, seal, PASS, and finalization. If cleanup is interrupted after the state advances to v9, rerun the same `--apply` command to finish removing the stale Proof Contract snapshot. Three fresh automated reviews and a fresh Verification Run are required.
-
-Schema-v7 deliveries first use the existing v7-to-v8 migration, then v8-to-v9:
-
-```bash
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v7_to_v8.py <feature-id> --root <project-root>
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v7_to_v8.py <feature-id> --root <project-root> --apply
-```
-
-After applying v7-to-v8, run the v8-to-v9 commands above. No prior review or completion claim crosses either migration boundary.
-
-## Install from this repository marketplace
-
-This repository contains a **repo marketplace**, not a public-directory
-listing. It is discoverable after you add this marketplace and then select
-`DLV Feature Marketplace` as the source; it is not indexed by the universal
-Plugins Directory search until it is submitted and approved for public
-publication.
-
-Add the marketplace, then install the plugin:
-
-```bash
-codex plugin marketplace add lessYFF/dlv-feature --ref main
+codex plugin marketplace add lessYFF/dlv-feature
 codex plugin add dlv-feature@dlv-feature-marketplace
 ```
 
-Verify that Codex can resolve the marketplace and plugin:
+## Core flow
 
 ```bash
-codex plugin marketplace list
-codex plugin list
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/init_feature.py feature-id --root /path/to/project --title "Feature title"
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/delivery_graph.py compile feature-id --root /path/to/project
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/quality_review.py feature-id --root /path/to/project --run-id review-01
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/seal_proof_contract.py feature-id --root /path/to/project
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/delivery_graph.py mark-code-complete feature-id --root /path/to/project
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/verification_run.py start feature-id --root /path/to/project --run-id run-01 --environment ENV-001=/path/to/env.json
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/verification_run.py record feature-id --root /path/to/project --run-id run-01 --result /path/to/result.json
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/finalize_delivery.py feature-id --root /path/to/project
 ```
 
-For the ChatGPT desktop app, open the repository as a workspace, restart the
-app, then open the Plugins Directory and choose `DLV Feature Marketplace` as
-the marketplace source. Search or browse there for `DLV Feature`.
+## Import a schema-v9 delivery
 
-Start a new Codex thread after installation, then ask Codex to deliver a
-feature end to end. The skill is selected when the request matches feature
-development, implementation, delivery, or resumption work.
+Schema v10 does not create or execute legacy deliveries. It keeps one conservative import boundary:
 
-## Publish to the universal Plugins Directory
+```bash
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v9_to_v10.py feature-id --root /path/to/project
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v9_to_v10.py feature-id --root /path/to/project --apply
+```
 
-Adding `marketplace.json` only supports local, repository, and team
-distribution. To make this plugin searchable in the universal directory shared
-by ChatGPT and Codex, submit the skills-only plugin through the [OpenAI plugin
-submission portal](https://platform.openai.com/plugins). The submitting
-organization needs Apps Management write access and a verified developer or
-business identity; after review approval, publish the plugin from the portal.
+The importer archives source bytes exactly, verifies every digest before legacy cleanup, and invalidates all prior completion claims.
 
-Before submitting, prepare the public listing details (website, support,
-privacy policy, terms, logo), starter prompts, and at least five positive plus
-three negative test cases. These are publication requirements rather than
-fields that a repository marketplace can supply.
+## Test
 
-## Contents
-
-- `plugins/dlv-feature/skills/dlv-feature/` — the skill, workflow guides, validation scripts, and Codex metadata.
-- `.agents/plugins/marketplace.json` — marketplace entry for the plugin.
-
-## License
-
-No license has been selected yet. All rights are reserved unless the repository owner adds one.
+```bash
+python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_delivery_graph.py
+python3 /path/to/skill-creator/scripts/quick_validate.py plugins/dlv-feature/skills/dlv-feature
+```

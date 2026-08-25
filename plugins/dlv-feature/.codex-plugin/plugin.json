@@ -1,7 +1,7 @@
 {
   "name": "dlv-feature",
-  "version": "0.5.0",
-  "description": "A proof-carrying end-to-end feature delivery workflow for Codex.",
+  "version": "0.6.0",
+  "description": "A dependency-aware, proof-carrying feature delivery workflow for Codex.",
   "author": {
     "name": "lessYFF",
     "url": "https://github.com/lessYFF"
@@ -13,13 +13,13 @@
   "interface": {
     "displayName": "DLV Feature",
     "shortDescription": "Deliver features with evidence-backed gates.",
-    "longDescription": "Guides a feature through three artifact-bound automated reviews, typed target-runtime evidence, pixel-level UI comparison, and deterministic schema-v9 delivery without routine confirmation gates.",
+    "longDescription": "Guides a feature through a schema-v10 Delivery Graph, deterministic component reviews, compact global system-coherence checks, generated proof contracts, target-runtime evidence, and deterministic finalization.",
     "developerName": "lessYFF",
     "category": "Productivity",
-    "capabilities": ["Feature planning", "Product contract reviews", "Architecture risk reviews", "Code Spec coverage reviews", "Sealed proof contracts", "Typed Verification runs", "Pixel-level UI comparison", "Append-only evidence", "Deterministic verification"],
+    "capabilities": ["Delivery Graph planning", "Component-scoped review reuse", "Global system-coherence review", "Continuous Delivery Readiness", "Generated proof contracts", "Typed Verification runs", "Pixel-level UI comparison", "Deterministic verification"],
     "websiteURL": "https://github.com/lessYFF/dlv-feature",
     "defaultPrompt": [
-      "Use $dlv-feature to deliver this feature with schema-v9 automated Product, Architecture, and Code Spec reviews, typed target-runtime evidence, pixel-level UI comparison, and deterministic finalization."
+      "Use $dlv-feature to deliver this feature with a schema-v10 Delivery Graph, component-scoped semantic attestations, a compact global-coherence review, generated proof contracts, target-runtime evidence, and deterministic finalization."
     ]
   }
 }
