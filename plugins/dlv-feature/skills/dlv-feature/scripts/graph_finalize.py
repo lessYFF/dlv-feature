@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministically finalize a schema-v10 Delivery Graph Verification Run."""
+"""Deterministically finalize a schema-v11 Delivery Graph Verification Run."""
 
 from __future__ import annotations
 

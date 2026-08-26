@@ -30,6 +30,10 @@ import graph_validation
 import graph_verification
 import runtime_evidence
 import upgrade_v9_to_v10
+import upgrade_v10_to_v11
+import scope_revision
+import finding_ledger
+from delivery_governance import apply_review_findings, empty_ledger, finding_summary, load_ledger, write_ledger
 
 
 def node(node_id: str, node_type: str, title: str, statement: str, **attributes: object) -> dict:
@@ -64,7 +68,7 @@ def valid_graph(feature_id: str = "cross-domain-feature", *, runtime: str = "pyt
         node("BND-001", "Boundary", "Authorization boundary", "Authorization guards state mutation"),
         node("ST-001", "StateTransition", "Pending to complete", "The entity moves to completed"),
         node("DEC-001", "Decision", "Single writer", "One service owns the write transaction"),
-        node("RISK-001", "Risk", "Duplicate execution", "Concurrent execution could duplicate side effects", severity="major"),
+        node("RISK-001", "Risk", "Duplicate execution", "Concurrent execution could duplicate side effects", severity="major", risk_axes=["CONCURRENCY"]),
         node("CHG-001", "Change", "Implement transaction", "Implement the guarded atomic transition"),
         node("SYM-001", "Symbol", "DomainService.execute", "Change the domain service execution symbol", path="src/domain_service.py"),
         node("ENV-001", "Environment", "Python runtime", "Execute in the target Python runtime", target="python runtime", spec={"runtime": runtime, "preflight": []}),
@@ -103,14 +107,10 @@ def valid_graph(feature_id: str = "cross-domain-feature", *, runtime: str = "pyt
         edge("PO-001", "mitigates", "RISK-001"),
         edge("ASRT-001", "proves", "PO-001"),
     ]
-    return {
-        "schema_version": 10,
-        "feature_id": feature_id,
-        "title": "Cross-domain feature",
-        "nodes": nodes,
-        "edges": edges,
-        "prototype": {"status": "not_applicable"},
-    }
+    graph = delivery_graph.default_graph(feature_id, "Cross-domain feature")
+    graph["nodes"] = nodes
+    graph["edges"] = edges
+    return graph
 
 
 def write_json(path: Path, value: object) -> None:
@@ -150,8 +150,8 @@ class GraphTestCase(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         root = Path(temporary.name)
         subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+        delivery_graph.initialize(root, feature_id, "Cross-domain feature")
         directory = root / "delivery" / feature_id
-        directory.mkdir(parents=True)
         write_json(directory / "delivery-graph.json", valid_graph(feature_id))
         return temporary, root
 
@@ -184,7 +184,7 @@ class GraphTestCase(unittest.TestCase):
         }
         graph = valid_graph(feature_id, runtime="browser")
         graph["prototype"] = {
-            "status": "completed", "path": "prototype.html",
+            "status": "contractual", "path": "prototype.html",
             "sha256": hashlib.sha256(prototype.read_bytes()).hexdigest(),
         }
         for item in graph["nodes"]:
@@ -271,7 +271,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
         fact["attributes"]["persistence"] = {"kind": "external"}
         self.assertTrue(any(item["code"] == "FACT_PERSISTENCE_RATIONALE_MISSING" for item in delivery_graph.semantic_issues(graph)))
 
-    def test_initialization_creates_only_v10_canonical_artifacts(self) -> None:
+    def test_initialization_creates_v11_canonical_artifacts_and_initial_source_revision(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             subprocess.run(["git", "init", "-q"], cwd=root, check=True)
@@ -279,9 +279,10 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertTrue(path.is_file())
             self.assertFalse((path.parent / "state.md").exists())
             self.assertEqual(
-                {"delivery-graph.json", "state.json", "prd.md", "architecture-design.md", "code-spec.md", "proof-contract.json"},
+                {"delivery-graph.json", "state.json", "prd.md", "architecture-design.md", "code-spec.md", "proof-contract.json", "source-revisions"},
                 {item.name for item in path.parent.iterdir()},
             )
+            self.assertTrue((path.parent / "source-revisions/SRC-001.json").is_file())
 
     def test_stable_entrypoints_dispatch_schema_v10_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -377,6 +378,150 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             delivery_graph.generate_proof_contract(graph)["draft_sha256"],
             delivery_graph.generate_proof_contract(reordered)["draft_sha256"],
         )
+
+    def test_scope_revision_creates_drift_then_owner_confirmation_starts_a_new_epoch(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.review_all(root)
+            source = root / "new-source.json"
+            write_json(source, {
+                "title": "Changed scope", "description": "Use the existing panel locally.",
+                "comments": ["No server-side recalculation."], "attachments": [],
+                "risk_vector": {"VISUAL_CONTRACT": "present"},
+            })
+            scope_revision.capture(root, "cross-domain-feature", source, "product-owner")
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            drifted = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+            self.assertEqual(("needs_decision", True), (drifted["readiness"]["status"], drifted["readiness"]["source_drift"]))
+            scope_revision.confirm(root, "cross-domain-feature", "SRC-002", "product-owner", ["BHV-001"])
+            state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+            self.assertEqual("SRC-002", delivery_graph.load_graph(root, "cross-domain-feature")["source_revision"])
+            self.assertFalse(state["readiness"]["source_drift"])
+            self.assertEqual("present", state["risk"]["source"]["VISUAL_CONTRACT"])
+
+    def test_confirming_latest_scope_revision_supersedes_older_pending_capture_for_drift(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.review_all(root)
+            for title in ("Earlier scope", "Latest scope"):
+                source = root / f"{title.replace(' ', '-').lower()}.json"
+                write_json(source, {
+                    "title": title, "description": "Local display behavior.", "comments": [], "attachments": [],
+                    "risk_vector": {},
+                })
+                scope_revision.capture(root, "cross-domain-feature", source, "product-owner")
+            scope_revision.confirm(root, "cross-domain-feature", "SRC-003", "product-owner", ["BHV-001"])
+            state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+            self.assertEqual("SRC-003", delivery_graph.load_graph(root, "cross-domain-feature")["source_revision"])
+            self.assertFalse(state["readiness"]["source_drift"])
+
+    def test_scope_confirmation_rejects_unknown_impact_without_mutating_epoch(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            source = root / "new-source.json"
+            write_json(source, {
+                "title": "Changed scope", "description": "Local display behavior.", "comments": [], "attachments": [],
+                "risk_vector": {},
+            })
+            scope_revision.capture(root, "cross-domain-feature", source, "product-owner")
+            with self.assertRaisesRegex(ValueError, "affected-node references unknown IDs"):
+                scope_revision.confirm(root, "cross-domain-feature", "SRC-002", "product-owner", ["REQ-999"])
+            revision = json.loads((root / "delivery/cross-domain-feature/source-revisions/SRC-002.json").read_text())
+            self.assertEqual("pending_confirmation", revision["status"])
+            self.assertEqual("SRC-001", delivery_graph.load_graph(root, "cross-domain-feature")["source_revision"])
+
+    def test_ui_local_profile_does_not_activate_unrelated_architecture_lenses(self) -> None:
+        graph = delivery_graph.default_graph("ui-local")
+        graph["nodes"] = [
+            node("REQ-001", "Requirement", "Need", "User needs a local guide"),
+            node("BHV-001", "Behavior", "Show", "The page shows the guide"),
+            node("AC-001", "Acceptance", "Visible", "The guide is visible"),
+            node("CHG-001", "Change", "UI", "Change the local guide component"),
+            node("SYM-001", "Symbol", "Guide", "Guide component", path="web/guide.tsx"),
+            node("ENV-001", "Environment", "Browser", "Browser runtime", target="browser", spec={"runtime": "browser", "preflight": []}),
+            node("TST-001", "Test", "Guide test", "Test guide visibility"),
+            node("PO-001", "Proof", "Guide proof", "Prove the guide is visible", proof_type="artifact", surface="guide", critical=False, runner={"argv": [sys.executable, "-c", "print('{}')"], "cwd": ".", "observation_adapter": "json_stdout", "timeout_seconds": 30}),
+            node("ASRT-001", "Assertion", "Exists", "Output exists", oracle={"kind": "json_path", "source": "/observation", "operator": "exists"}),
+        ]
+        graph["edges"] = [
+            edge("BHV-001", "derives_from", "REQ-001"), edge("AC-001", "derives_from", "BHV-001"),
+            edge("CHG-001", "changes", "BHV-001"), edge("SYM-001", "depends_on", "CHG-001"),
+            edge("TST-001", "tests", "AC-001"), edge("TST-001", "runs_in", "ENV-001"),
+            edge("PO-001", "proves", "AC-001"), edge("PO-001", "runs_in", "ENV-001"), edge("ASRT-001", "proves", "PO-001"),
+        ]
+        self.assertEqual(
+            ["change-traceability", "product-contract", "proof-coverage"],
+            delivery_graph.active_review_lenses(graph),
+        )
+        self.assertNotIn("ARCH_NO_CLAIM", {issue["code"] for issue in delivery_graph.semantic_issues(graph)})
+
+    def test_finding_ledger_deduplicates_root_cause_and_omission_keeps_blocker_open(self) -> None:
+        ledger = empty_ledger("feature")
+        findings = [{
+            "id": "NEW", "severity": "major", "status": "OPEN", "statement": "Money state is ambiguous",
+            "evidence": "ST-001", "risk_path": "MONEY → SETTLED", "root_cause": "zero-net transition ambiguity",
+            "previously_invisible_reason": "first semantic review",
+        }]
+        ledger, first = apply_review_findings(ledger, unit_id="global-system-coherence", source_revision="SRC-001", findings=findings)
+        ledger, second = apply_review_findings(ledger, unit_id="global-system-coherence", source_revision="SRC-001", findings=[{**findings[0], "id": "NEW"}])
+        self.assertEqual(first[0]["id"], second[0]["id"])
+        ledger, omitted = apply_review_findings(ledger, unit_id="global-system-coherence", source_revision="SRC-002", findings=[])
+        self.assertEqual("OPEN", omitted[0]["status"])
+        self.assertEqual(1, finding_summary(ledger)["open_blockers"])
+
+    def test_finding_repair_requires_fresh_review_and_updates_convergence(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.review_all(root)
+            ledger = empty_ledger("cross-domain-feature")
+            ledger, entries = apply_review_findings(
+                ledger, unit_id="global-system-coherence", source_revision="SRC-001", findings=[{
+                    "id": "NEW", "severity": "major", "status": "OPEN", "statement": "Boundary proof is incomplete",
+                    "evidence": "RISK-001", "risk_path": "CONCURRENCY → duplicate execution",
+                    "root_cause": "missing duplicate execution observation",
+                    "previously_invisible_reason": "review found the missing observation",
+                }],
+            )
+            finding_id = entries[0]["id"]
+            write_ledger(root, "cross-domain-feature", ledger)
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("blocked", delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")["readiness"]["status"])
+            finding_ledger.transition(root, "cross-domain-feature", finding_id, "FIXED_PENDING_REVIEW", "implementer", "Added result readback")
+            state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+            self.assertEqual("FIXED_PENDING_REVIEW", load_ledger(root, "cross-domain-feature")["entries"][finding_id]["status"])
+            self.assertEqual("CONVERGING", state["convergence"]["status"])
+
+    def test_observed_symbol_risk_requires_graph_reconciliation_before_code_completion(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            (root / "src").mkdir()
+            (root / "src/domain_service.py").write_text("def reimburse(amount): return amount\n", encoding="utf-8")
+            self.review_all(root)
+            graph_contract.seal_contract(root, "cross-domain-feature")
+            with self.assertRaisesRegex(ValueError, "undeclared risk axes"):
+                delivery_graph.mark_code_complete(root, "cross-domain-feature")
+            state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+            self.assertEqual("needs_reconcile", state["code"]["status"])
+            self.assertEqual("present", state["risk"]["observed"]["MONEY"])
+
+    def test_v10_to_v11_migration_archives_mutable_records_and_resets_claims(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            directory = root / "delivery/legacy-v10"
+            directory.mkdir(parents=True)
+            graph = valid_graph("legacy-v10")
+            graph["schema_version"] = 10
+            graph.pop("source_revision")
+            graph["metadata"] = {}
+            graph["prototype"] = {"status": "not_applicable"}
+            write_json(directory / "delivery-graph.json", graph)
+            write_json(directory / "state.json", {"schema_version": 10})
+            upgrade_v10_to_v11.upgrade(root, "legacy-v10", apply=True)
+            migrated = json.loads((directory / "delivery-graph.json").read_text())
+            self.assertEqual((11, "SRC-001"), (migrated["schema_version"], migrated["source_revision"]))
+            self.assertTrue((root / ".dlv/upgrades/legacy-v10/schema-v10-archive/delivery-graph.json").is_file())
+            self.assertEqual({}, delivery_graph.load_state(directory / "state.json")["attestations"])
 
     def test_dependency_and_impact_closures_are_exact(self) -> None:
         graph = valid_graph()
@@ -490,7 +635,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
                 graph["edges"] = mutation(graph["edges"])
                 self.assertTrue(delivery_graph.semantic_issues(graph), name)
 
-    def test_empty_architecture_and_implementation_subgraphs_cannot_pass_vacuously(self) -> None:
+    def test_ui_local_graph_skips_unrelated_architecture_but_not_implementation_proof(self) -> None:
         graph = delivery_graph.default_graph("empty-stages")
         graph["nodes"] = [
             node("REQ-001", "Requirement", "Need", "A user needs a result"),
@@ -502,11 +647,12 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             edge("AC-001", "derives_from", "BHV-001"),
         ]
         codes = {item["code"] for item in delivery_graph.semantic_issues(graph)}
-        self.assertTrue({"ARCH_NO_CLAIM", "IMPLEMENTATION_NO_CHANGE", "IMPLEMENTATION_NO_SYMBOL"} <= codes)
+        self.assertNotIn("ARCH_NO_CLAIM", codes)
+        self.assertTrue({"IMPLEMENTATION_NO_CHANGE", "IMPLEMENTATION_NO_SYMBOL"} <= codes)
 
     def test_completed_prototype_requires_canonical_zero_difference_visual_proof(self) -> None:
         graph = valid_graph()
-        graph["prototype"] = {"status": "completed", "path": "prototype.html", "sha256": "0" * 64}
+        graph["prototype"] = {"status": "contractual", "path": "prototype.html", "sha256": "0" * 64}
         codes = {item["code"] for item in delivery_graph.semantic_issues(graph, "proof-coverage")}
         self.assertIn("PROTOTYPE_VISUAL_PROOF_MISSING", codes)
 
@@ -731,7 +877,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             graph_path = directory / "delivery-graph.json"
             graph = json.loads(graph_path.read_text())
             graph["prototype"] = {
-                "status": "completed", "path": "prototype.html",
+                "status": "contractual", "path": "prototype.html",
                 "sha256": delivery_graph.file_digest(prototype),
             }
             write_json(graph_path, graph)
@@ -964,6 +1110,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
         with temporary:
             outside = root / "outside-machine-data"
             outside.mkdir()
+            (root / ".dlv").rename(root / "prior-machine-data")
             (root / ".dlv").symlink_to(outside, target_is_directory=True)
             with self.assertRaisesRegex(ValueError, "symlink"):
                 delivery_graph.compile_graph(root, "cross-domain-feature")
@@ -1798,7 +1945,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             before = {item.name: item.read_bytes() for item in directory.iterdir()}
             graph = upgrade_v9_to_v10.convert(root, "legacy-feature")
             self.assertEqual(before, {item.name: item.read_bytes() for item in directory.iterdir()})
-            self.assertEqual(10, graph["schema_version"])
+            self.assertEqual(11, graph["schema_version"])
             upgrade_v9_to_v10.apply_upgrade(root, "legacy-feature")
             self.assertFalse((directory / "state.md").exists())
             state = delivery_graph.load_state(directory / "state.json")
@@ -1887,7 +2034,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             (directory / "state.md").write_text(original_state, encoding="utf-8")
             upgrade_v9_to_v10.apply_upgrade(root, "legacy-feature")
             self.assertFalse((directory / "state.md").exists())
-            self.assertEqual(10, json.loads((directory / "delivery-graph.json").read_text())["schema_version"])
+            self.assertEqual(11, json.loads((directory / "delivery-graph.json").read_text())["schema_version"])
 
     def test_v9_to_v10_recovery_rejects_changed_source_or_archive(self) -> None:
         temporary, root, directory = self.make_v9_root()

@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Dependency-scoped invalidation for schema-v10 Delivery Graph features."""
+"""Dependency-scoped invalidation for schema-v11 Delivery Graph features."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 from delivery_graph import (
@@ -24,28 +25,29 @@ from delivery_proof import exclusive_file_lock, repository_fingerprint
 
 def invalidate(
     root: Path, feature_id: str, changed_nodes: list[str] | None = None,
-    reset_reviews: bool = False,
+    reset_reviews: bool = False, *, _lock_held: bool = False,
 ) -> str:
     root = root.expanduser().resolve()
     directory = feature_dir(root, feature_id)
     state_path = directory / "state.json"
-    graph = load_graph(root, feature_id)
-    before = load_state(state_path)
-    current_hashes = node_hashes(graph)
-    detected = {
-        node_id for node_id in set(before.get("node_hashes", {})) | set(current_hashes)
-        if before.get("node_hashes", {}).get(node_id) != current_hashes.get(node_id)
-    }
-    requested = set(changed_nodes or [])
-    unknown = requested - (set(current_hashes) | set(before.get("node_hashes", {})))
-    if unknown:
-        raise ValueError("changed-node references unknown IDs: " + ", ".join(sorted(unknown)))
-    changed = detected | requested
-    impacted = impact_closure(graph, changed & set(current_hashes)) | (changed - set(current_hashes))
-    old_attestations = set(before.get("attestations", {}))
-    if requested and impacted:
-        lock = confined_project_path(root, Path(".dlv") / "runs" / feature_id / ".feature.lock", "feature lock")
-        with exclusive_file_lock(lock):
+    lock = confined_project_path(root, Path(".dlv") / "runs" / feature_id / ".feature.lock", "feature lock")
+    lock_context = nullcontext() if _lock_held else exclusive_file_lock(lock)
+    with lock_context:
+        graph = load_graph(root, feature_id)
+        before = load_state(state_path)
+        current_hashes = node_hashes(graph)
+        detected = {
+            node_id for node_id in set(before.get("node_hashes", {})) | set(current_hashes)
+            if before.get("node_hashes", {}).get(node_id) != current_hashes.get(node_id)
+        }
+        requested = set(changed_nodes or [])
+        unknown = requested - (set(current_hashes) | set(before.get("node_hashes", {})))
+        if unknown:
+            raise ValueError("changed-node references unknown IDs: " + ", ".join(sorted(unknown)))
+        changed = detected | requested
+        impacted = impact_closure(graph, changed & set(current_hashes)) | (changed - set(current_hashes))
+        old_attestations = set(before.get("attestations", {}))
+        if requested and impacted:
             before = load_state(state_path)
             units = review_units(graph)
             before["attestations"] = {
@@ -53,21 +55,17 @@ def invalidate(
                 if unit_id in units and not (set(units[unit_id]["node_ids"]) & impacted)
             }
             atomic_write_json(state_path, before)
-    if reset_reviews:
-        lock = confined_project_path(root, Path(".dlv") / "runs" / feature_id / ".feature.lock", "feature lock")
-        with exclusive_file_lock(lock):
+        if reset_reviews:
             before = load_state(state_path)
             before["attestations"] = {}
             atomic_write_json(state_path, before)
-    state = compile_graph(root, feature_id)
-    invalidated = old_attestations - set(state.get("attestations", {}))
-    # Source changes after Code completion invalidate only Code and runtime
-    # claims. Graph reviews and the sealed plan remain reusable.
-    if state.get("code", {}).get("status") == "completed":
-        current_code = repository_fingerprint(root, feature_id)
-        if state["code"].get("repository_fingerprint") != current_code:
-            lock = confined_project_path(root, Path(".dlv") / "runs" / feature_id / ".feature.lock", "feature lock")
-            with exclusive_file_lock(lock):
+        state = compile_graph(root, feature_id, _lock_held=True)
+        invalidated = old_attestations - set(state.get("attestations", {}))
+        # Source changes after Code completion invalidate only Code and runtime
+        # claims. Graph reviews and the sealed plan remain reusable.
+        if state.get("code", {}).get("status") == "completed":
+            current_code = repository_fingerprint(root, feature_id)
+            if state["code"].get("repository_fingerprint") != current_code:
                 state = load_state(state_path)
                 state["code"] = {"status": "stale", "repository_fingerprint": None}
                 state["verification"] = {

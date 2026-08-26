@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from delivery_graph import atomic_write_json, compile_graph, confined_project_path, feature_dir
+from delivery_governance import create_source_revision
 from delivery_proof import exclusive_file_lock, extract_state, file_digest, load_json, validate_feature_id
 
 
@@ -193,21 +194,23 @@ def convert(root: Path, feature_id: str) -> dict[str, Any]:
         connect(proof_id, "runs_in", legacy_to_new.get(str(obligation.get("environment_id"))))
     prototype_path = directory / "prototype.html"
     prototype = (
-        {"status": "completed", "path": "prototype.html", "sha256": file_digest(prototype_path)}
-        if prototype_path.is_file() else {"status": "not_applicable"}
+        {"status": "contractual", "path": "prototype.html", "sha256": file_digest(prototype_path)}
+        if prototype_path.is_file() else {"status": "not_applicable", "reason": "No legacy prototype artifact was captured."}
     )
     source_artifacts_sha256 = {
         name: file_digest(directory / name)
         for name in LEGACY_ARTIFACTS if (directory / name).is_file()
     }
     return {
-        "schema_version": 10,
+        "schema_version": 11,
         "feature_id": feature_id,
         "title": _title(texts["prd.md"], feature_id),
+        "source_revision": "SRC-001",
         "nodes": nodes,
         "edges": edges,
         "prototype": prototype,
         "metadata": {
+            "risk_vector": {},
             "upgrade": "schema-v9-to-v10",
             "candidate_only": True,
             "source_state_sha256": file_digest(state_path),
@@ -225,8 +228,8 @@ def apply_upgrade(root: Path, feature_id: str) -> Path:
     with exclusive_file_lock(lock):
         if graph_path.is_file():
             graph = load_json(graph_path)
-            if graph.get("schema_version") != 10 or graph.get("feature_id") != feature_id:
-                raise ValueError("existing delivery-graph.json is not this feature's schema-v10 graph")
+            if graph.get("schema_version") != 11 or graph.get("feature_id") != feature_id:
+                raise ValueError("existing delivery-graph.json is not this feature's schema-v11 graph")
             upgrade = graph.get("metadata")
             if (
                 not isinstance(upgrade, dict)
@@ -239,6 +242,17 @@ def apply_upgrade(root: Path, feature_id: str) -> Path:
         else:
             graph = convert(root, feature_id)
             atomic_write_json(graph_path, graph)
+        source_path = directory / "source-revisions" / "SRC-001.json"
+        if not source_path.exists():
+            create_source_revision(
+                directory, feature_id, "SRC-001",
+                {
+                    "title": graph["title"],
+                    "description": "Legacy schema-v9 source archived as an untrusted migration candidate.",
+                    "comments": [], "attachments": [], "risk_vector": {},
+                },
+                owner="schema-v9-import", status="confirmed",
+            )
         archive = confined_project_path(root, Path(".dlv") / "upgrades" / feature_id / "schema-v9-candidates", "upgrade archive")
         expected_digests = graph["metadata"]["source_artifacts_sha256"]
         if state_path.is_file() and file_digest(state_path) != graph["metadata"]["source_state_sha256"]:

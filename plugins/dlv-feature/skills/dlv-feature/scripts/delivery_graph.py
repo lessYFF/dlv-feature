@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Schema-v10 Delivery Graph kernel and deterministic artifact compiler.
+"""Schema-v11 Delivery Graph kernel and deterministic artifact compiler.
 
-`delivery-graph.json` is the only editable delivery truth in schema v10.  This
+`delivery-graph.json` is the only editable delivery truth in schema v11.  This
 module validates it, computes dependency-scoped hashes, renders disposable
 human views, derives the Proof Contract, and keeps only references in
 `state.json`.
@@ -13,6 +13,7 @@ import argparse
 import copy
 import json
 import re
+from subprocess import run as run_process
 import sys
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -28,9 +29,22 @@ from delivery_proof import (
     value_digest,
     validate_feature_id,
 )
+from delivery_governance import (
+    RISK_AXES,
+    RISK_LEVELS,
+    create_source_revision,
+    finding_summary,
+    load_ledger,
+    load_source_revision,
+    normalize_risk_vector,
+    profiles_for,
+    source_revision_status,
+    union_risk_vectors,
+    write_ledger,
+)
 
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 STAGES = ("product", "architecture", "implementation_proof")
 GLOBAL_LENS = "global-system-coherence"
 GLOBAL_SKELETON_TYPES = {"Fact", "Owner", "Boundary", "StateTransition", "Risk", "Environment"}
@@ -67,6 +81,17 @@ ORACLE_OPERATORS = {"eq", "ne", "contains", "not_contains", "matches", "exists",
 ORACLE_KINDS = {"exit_code", "http_status", "json_path", "text", "file_hash", "screenshot_diff", "side_effect", "state"}
 VISUAL_RUNTIMES = {"browser", "chromium", "firefox", "webkit", "wechat-devtools", "wechat-device", "ios", "android"}
 MAX_COMMAND_TIMEOUT_SECONDS = 3600
+OBSERVED_RISK_PATTERNS = {
+    "API_CONTRACT": re.compile(r"\b(?:route|endpoint|controller|api/v[0-9]|requestmapping)\b", re.I),
+    "PERSISTENCE": re.compile(r"\b(?:select |insert |update |delete |migration|repository|database|sql)\b", re.I),
+    "AUTHORIZATION": re.compile(r"\b(?:authori[sz]|permission|role|access[_ -]?control)\b", re.I),
+    "TENANCY": re.compile(r"\b(?:tenant|organization_id|org_id)\b", re.I),
+    "MONEY": re.compile(r"\b(?:amount|price|payment|settlement|reimburse|refund|currency)\b", re.I),
+    "CONCURRENCY": re.compile(r"\b(?:idempot|retry|lock|concurr|transaction|atomic)\b", re.I),
+    "IRREVERSIBLE_SIDE_EFFECT": re.compile(r"\b(?:delete|publish|send|cancel|charge|execute)\b", re.I),
+    "CROSS_CLIENT": re.compile(r"\b(?:websocket|event|sync|broadcast|push)\b", re.I),
+    "VISUAL_CONTRACT": re.compile(r"\b(?:css|style|layout|component|render|view)\b", re.I),
+}
 
 # Every edge is directional: source depends on target.  The type constraints
 # reject semantically meaningless graphs before a review can attest them.
@@ -164,9 +189,11 @@ def default_graph(feature_id: str, title: str | None = None) -> dict[str, Any]:
         "schema_version": SCHEMA_VERSION,
         "feature_id": feature_id,
         "title": title or feature_id.replace("-", " ").title(),
+        "source_revision": "SRC-001",
         "nodes": [],
         "edges": [],
-        "prototype": {"status": "not_applicable"},
+        "prototype": {"status": "not_applicable", "reason": "No visible UI contract is in scope."},
+        "metadata": {"risk_vector": {axis: "absent" for axis in RISK_AXES}},
     }
 
 
@@ -213,7 +240,7 @@ def graph_digest(graph: dict[str, Any]) -> str:
 
 def structural_errors(graph: dict[str, Any], feature_id: str | None = None) -> list[str]:
     errors: list[str] = []
-    allowed_top = {"schema_version", "feature_id", "title", "nodes", "edges", "prototype", "metadata"}
+    allowed_top = {"schema_version", "feature_id", "title", "source_revision", "nodes", "edges", "prototype", "metadata"}
     unknown = set(graph) - allowed_top
     if unknown:
         errors.append("Delivery Graph contains unknown top-level keys: " + ", ".join(sorted(unknown)))
@@ -228,6 +255,17 @@ def structural_errors(graph: dict[str, Any], feature_id: str | None = None) -> l
         errors.append("Delivery Graph feature_id disagrees with directory/argument")
     if not isinstance(graph.get("title"), str) or not graph["title"].strip():
         errors.append("Delivery Graph title must be a non-empty string")
+    if not isinstance(graph.get("source_revision"), str) or not re.fullmatch(r"SRC-[0-9]{3,}", graph["source_revision"]):
+        errors.append("Delivery Graph source_revision must reference a confirmed SRC- revision")
+    metadata = graph.get("metadata")
+    allowed_metadata = {"risk_vector", "upgrade", "candidate_only", "source_state_sha256", "source_artifacts_sha256"}
+    if not isinstance(metadata, dict) or "risk_vector" not in metadata or set(metadata) - allowed_metadata:
+        errors.append("Delivery Graph metadata must contain risk_vector and only recognized machine metadata")
+    else:
+        try:
+            normalize_risk_vector(metadata.get("risk_vector"), label="Delivery Graph metadata.risk_vector")
+        except ValueError as exc:
+            errors.append(str(exc))
     nodes = graph.get("nodes")
     edges = graph.get("edges")
     if not isinstance(nodes, list):
@@ -319,17 +357,21 @@ def structural_errors(graph: dict[str, Any], feature_id: str | None = None) -> l
     if any(visit(node_id) for node_id in sorted(dependency_graph) if node_id not in visited):
         errors.append("Delivery Graph dependency relationships must be acyclic")
     prototype = graph.get("prototype", {"status": "not_applicable"})
-    if not isinstance(prototype, dict) or prototype.get("status") not in {"not_applicable", "completed"}:
-        errors.append("prototype must be an object with status not_applicable or completed")
-    elif prototype.get("status") == "not_applicable" and set(prototype) != {"status"}:
-        errors.append("not-applicable prototype must contain exactly status")
-    elif prototype.get("status") == "completed" and (
+    if not isinstance(prototype, dict) or prototype.get("status") not in {"not_applicable", "reference", "contractual"}:
+        errors.append("prototype must be an object with status not_applicable, reference, or contractual")
+    elif prototype.get("status") == "not_applicable" and (
+        set(prototype) != {"status", "reason"}
+        or not isinstance(prototype.get("reason"), str)
+        or not prototype["reason"].strip()
+    ):
+        errors.append("not-applicable prototype requires exactly status and a non-empty reason")
+    elif prototype.get("status") in {"reference", "contractual"} and (
         set(prototype) != {"status", "path", "sha256"}
         or prototype.get("path") != "prototype.html"
         or not isinstance(prototype.get("sha256"), str)
         or not SHA256.fullmatch(prototype["sha256"])
     ):
-        errors.append("completed prototype requires exactly path=prototype.html and a SHA-256")
+        errors.append("reference/contractual prototype requires exactly path=prototype.html and a SHA-256")
     return errors
 
 
@@ -341,10 +383,10 @@ def prototype_errors(root: Path, feature_id: str, graph: dict[str, Any]) -> list
         return ["prototype declaration is invalid"]
     if prototype.get("status") == "not_applicable":
         return ["prototype.html exists while prototype is not_applicable"] if path.exists() or path.is_symlink() else []
-    if prototype.get("status") != "completed":
+    if prototype.get("status") not in {"reference", "contractual"}:
         return ["prototype declaration is invalid"]
     if not path.is_file() or path.resolve() != path.absolute():
-        return ["completed Prototype requires a regular, non-symlink prototype.html"]
+        return ["reference/contractual Prototype requires a regular, non-symlink prototype.html"]
     return [] if prototype.get("sha256") == file_digest(path) else ["Prototype fingerprint is missing or stale"]
 
 
@@ -505,6 +547,7 @@ def lens_components(graph: dict[str, Any], lens: str) -> list[dict[str, Any]]:
         }
         if lens == "product-contract":
             component_payload["prototype"] = graph.get("prototype", {"status": "not_applicable"})
+            component_payload["source_revision"] = graph.get("source_revision")
         result.append({
             "unit_id": f"{lens}--{component_id}",
             "lens": lens,
@@ -541,7 +584,7 @@ def global_skeleton_node_ids(graph: dict[str, Any]) -> set[str]:
 
 def review_units(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
     units: dict[str, dict[str, Any]] = {}
-    for lens in sorted(LENSES):
+    for lens in active_review_lenses(graph):
         for component in lens_components(graph, lens):
             units[component["unit_id"]] = component
     selected = global_skeleton_node_ids(graph)
@@ -567,6 +610,8 @@ def review_units(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
     ]
     skeleton_hash = value_digest({
         "lens": GLOBAL_LENS,
+        "source_revision": graph.get("source_revision"),
+        "risk_vector": graph_risk_vector(graph),
         "component_topology": topology,
         "claim_synopsis": claim_synopsis,
         **subgraph(graph, selected),
@@ -584,7 +629,12 @@ def review_units(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return dict(sorted(units.items()))
 
 
-def readiness(graph: dict[str, Any], attestations: dict[str, Any]) -> dict[str, Any]:
+def readiness(
+    graph: dict[str, Any], attestations: dict[str, Any], *,
+    source_status: dict[str, Any] | None = None, ledger: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(attestations, dict):
+        attestations = {}
     units = review_units(graph)
     missing = sorted(unit_id for unit_id in units if unit_id not in attestations)
     blocked = sorted(
@@ -592,27 +642,29 @@ def readiness(graph: dict[str, Any], attestations: dict[str, Any]) -> dict[str, 
         if isinstance(attestations.get(unit_id), dict)
         and attestations[unit_id].get("verdict") != "PASS"
     )
+    finding_counts = finding_summary(ledger) if ledger is not None else {"open_blockers": 0}
+    drift = source_status is not None and source_status.get("status") != "confirmed"
+    if drift:
+        status = "needs_decision"
+    elif blocked or finding_counts["open_blockers"]:
+        status = "blocked"
+    elif missing:
+        status = "pending"
+    else:
+        status = "ready"
     return {
-        "status": "ready" if not missing and not blocked else "blocked" if blocked else "pending",
+        "status": status,
         "required_units": sorted(units),
         "missing_units": missing,
         "blocked_units": blocked,
         "global_skeleton_sha256": units[GLOBAL_LENS]["subgraph_sha256"],
+        "source_drift": bool(drift),
+        "open_blocking_findings": finding_counts["open_blockers"],
     }
 
 
 def applicable_lenses(graph: dict[str, Any], stage: str) -> list[str]:
-    nodes = node_map(graph)
-    result: list[str] = []
-    for name, spec in LENSES.items():
-        if spec["stage"] != stage:
-            continue
-        # The primary lens for every stage is always applicable; optional
-        # architecture lenses activate only when their domain appears.
-        lens_types = {nodes[node_id]["type"] for node_id in lens_node_ids(graph, name) if node_id in nodes}
-        if stage in {"product", "implementation_proof"} or name == "fact-ownership" or lens_types & spec["types"]:
-            result.append(name)
-    return sorted(result)
+    return [name for name in active_review_lenses(graph) if LENSES[name]["stage"] == stage]
 
 
 def _has_edge(graph: dict[str, Any], *, source: str | None = None, target: str | None = None, relation: str | None = None) -> bool:
@@ -761,6 +813,93 @@ def database_schema_errors(sql: Any) -> list[str]:
     return errors
 
 
+def graph_risk_vector(graph: dict[str, Any]) -> dict[str, str]:
+    """Derive design risk from explicit declarations and typed facts.
+
+    The compiler may add mechanically evident risk, but never lowers a
+    declared source/design risk.
+    """
+    metadata = graph.get("metadata", {})
+    declared = normalize_risk_vector(metadata.get("risk_vector", {}), label="Delivery Graph metadata.risk_vector")
+    inferred = {axis: "absent" for axis in RISK_AXES}
+    for node in graph.get("nodes", []):
+        if not isinstance(node, dict):
+            continue
+        attrs = node.get("attributes", {}) if isinstance(node.get("attributes"), dict) else {}
+        if node.get("type") == "Fact" and isinstance(attrs.get("persistence"), dict):
+            if attrs["persistence"].get("kind") in {"database", "external"}:
+                inferred["PERSISTENCE"] = "present"
+        axes = attrs.get("risk_axes", [])
+        if isinstance(axes, list):
+            for axis in axes:
+                if axis in RISK_AXES:
+                    inferred[axis] = "critical" if attrs.get("severity") == "critical" else "present"
+    return union_risk_vectors(declared, inferred)
+
+
+def observed_code_risk_vector(root: Path, graph: dict[str, Any]) -> dict[str, str]:
+    """R2: conservatively detect risk in the concrete Symbols declared by Graph.
+
+    This is an escalation signal, not a proof of safety.  It intentionally
+    never lowers R0/R1 and ignores undeclared paths rather than scanning an
+    unrelated repository.
+    """
+    result = {axis: "absent" for axis in RISK_AXES}
+    for node in graph.get("nodes", []):
+        if not isinstance(node, dict) or node.get("type") != "Symbol":
+            continue
+        attributes = node.get("attributes", {}) if isinstance(node.get("attributes"), dict) else {}
+        relative = attributes.get("path")
+        if not isinstance(relative, str) or not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
+            continue
+        path = root / relative
+        if not path.is_file() or path.is_symlink():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for axis, pattern in OBSERVED_RISK_PATTERNS.items():
+            if pattern.search(content):
+                result[axis] = "present"
+    return result
+
+
+def formal_feature_commits(root: Path, feature_id: str) -> list[str]:
+    """Return commits that explicitly declare ``DLV-Feature: <feature-id>``."""
+    completed = run_process(
+        ["git", "log", "--all", "--format=%H%x00%B%x00"], cwd=root,
+        capture_output=True, check=False,
+    )
+    if completed.returncode != 0:
+        return []
+    values = completed.stdout.decode("utf-8", errors="replace").split("\0")
+    commits: list[str] = []
+    for index in range(0, len(values) - 1, 2):
+        commit, body = values[index], values[index + 1]
+        if re.search(rf"(?mi)^DLV-Feature:\s*{re.escape(feature_id)}\s*$", body):
+            commits.append(commit)
+    return commits
+
+
+def active_review_lenses(graph: dict[str, Any]) -> list[str]:
+    """Choose additive lenses from evidence, never from a UI/backend label."""
+    nodes = node_map(graph)
+    vector = graph_risk_vector(graph)
+    result = {"product-contract", "change-traceability", "proof-coverage"}
+    if (
+        any(node["type"] in {"Fact", "Owner", "Decision"} for node in nodes.values())
+        or "CONTRACT_DATA" in profiles_for(vector)
+    ):
+        result.add("fact-ownership")
+    if (
+        any(node["type"] in {"Boundary", "StateTransition", "Risk"} for node in nodes.values())
+        or "CRITICAL_DOMAIN" in profiles_for(vector)
+    ):
+        result.add("boundary-state-safety")
+    return sorted(result)
+
+
 def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict[str, str]]:
     """Return deterministic, typed issues; every major issue blocks PASS."""
     nodes = node_map(graph)
@@ -778,7 +917,7 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
             and (source_type is None or nodes.get(edge.get("source"), {}).get("type") == source_type)
         ]
 
-    enabled = set(LENSES) if lens is None else {lens}
+    enabled = set(active_review_lenses(graph)) if lens is None else {lens}
     if "product-contract" in enabled:
         requirements = [n for n in nodes.values() if n["type"] == "Requirement"]
         acceptances = [n for n in nodes.values() if n["type"] == "Acceptance"]
@@ -871,7 +1010,8 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
             if node["type"] in {"Decision", "StateTransition"} and not typed_edges(target=node["id"], relation="changes", source_type="Change"):
                 add("ARCH_CHANGE_UNMAPPED", node["id"], f"{node['type']} requires an implementation Change")
     if "proof-coverage" in enabled:
-        if graph.get("prototype", {}).get("status") == "completed":
+        prototype_status = graph.get("prototype", {}).get("status")
+        if prototype_status == "contractual":
             product_nodes = [node for node in nodes.values() if node["type"] in {"Acceptance", "Exception"}]
             applicable = {
                 node["id"] for node in product_nodes
@@ -883,7 +1023,7 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
             ):
                 add(
                     "PROTOTYPE_APPLICABILITY_INVALID", "GRAPH",
-                    "Completed Prototype requires every Acceptance/Exception to declare prototype_applicable and at least one true value",
+                    "Contractual Prototype requires every Acceptance/Exception to declare prototype_applicable and at least one true value",
                     "critical",
                 )
             visual_targets = {
@@ -895,9 +1035,15 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
             if not applicable or not applicable <= visual_targets:
                 add(
                     "PROTOTYPE_VISUAL_PROOF_MISSING", "GRAPH",
-                    "Completed Prototype requires zero-difference visual Proof coverage for every prototype-applicable Acceptance/Exception",
+                    "Contractual Prototype requires zero-difference visual Proof coverage for every prototype-applicable Acceptance/Exception",
                     "critical",
                 )
+        if graph_risk_vector(graph)["VISUAL_CONTRACT"] != "absent" and prototype_status == "not_applicable":
+            add(
+                "PROTOTYPE_MODE_MISMATCH", "GRAPH",
+                "VISUAL_CONTRACT risk requires a reference or contractual Prototype, not not_applicable",
+                "major",
+            )
         for required_type in ("Test", "Environment", "Proof", "Assertion"):
             if not any(node["type"] == required_type for node in nodes.values()):
                 add(
@@ -1011,8 +1157,26 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
                         for check in preflight
                     ) or len(preflight_ids) != len(set(preflight_ids)):
                         add("ENVIRONMENT_PREFLIGHT_INVALID", node["id"], "Environment preflight commands are invalid")
-            elif node["type"] == "Risk" and node.get("attributes", {}).get("severity") not in {"critical", "major", "minor"}:
-                add("RISK_SEVERITY_INVALID", node["id"], "Risk requires critical, major, or minor severity")
+            elif node["type"] == "Risk":
+                attrs = node.get("attributes", {})
+                if attrs.get("severity") not in {"critical", "major", "minor"}:
+                    add("RISK_SEVERITY_INVALID", node["id"], "Risk requires critical, major, or minor severity")
+                axes = attrs.get("risk_axes", [])
+                if not isinstance(axes, list) or not axes or any(axis not in RISK_AXES for axis in axes):
+                    add("RISK_AXIS_INVALID", node["id"], "Risk requires one or more known attributes.risk_axes")
+                if any(axis in {"MONEY", "CONCURRENCY", "IRREVERSIBLE_SIDE_EFFECT"} for axis in axes if isinstance(axis, str)):
+                    proofs = [
+                        nodes[edge["source"]] for edge in typed_edges(target=node["id"], relation="proves", source_type="Proof")
+                        if edge.get("source") in nodes
+                    ]
+                    if any(proof.get("attributes", {}).get("proof_type") == "artifact" for proof in proofs):
+                        add("PROOF_STRENGTH_MISMATCH", node["id"], "Critical-domain Risk cannot rely on artifact-only Proof", "critical")
+                    tests = [
+                        nodes[edge["source"]] for edge in typed_edges(target=node["id"], relation="tests", source_type="Test")
+                        if edge.get("source") in nodes
+                    ]
+                    if "CONCURRENCY" in axes and any("sequential" in test["statement"].lower() for test in tests):
+                        add("SEQUENTIAL_CONCURRENCY_MISMATCH", node["id"], "Sequential Test cannot claim concurrency safety", "critical")
             elif node["type"] == "Assertion":
                 oracle = node.get("attributes", {}).get("oracle")
                 if not isinstance(oracle, dict) or not all(k in oracle for k in ("kind", "source", "operator")):
@@ -1151,6 +1315,10 @@ def load_state(path: Path) -> dict[str, Any]:
     return load_json(path)
 
 
+def ledger_path_exists(root: Path, feature_id: str) -> bool:
+    return (root / ".dlv" / "findings" / feature_id / "ledger.json").is_file()
+
+
 def _valid_attestation_reference(root: Path, feature_id: str, unit_id: str, summary: Any, graph: dict[str, Any]) -> bool:
     if not isinstance(summary, dict) or summary.get("verdict") not in {"PASS", "BLOCKED"}:
         return False
@@ -1179,6 +1347,12 @@ def compile_graph(
     source_sha256 = file_digest(source_path)
     errors = structural_errors(graph, feature_id)
     errors.extend(prototype_errors(root, feature_id, graph))
+    try:
+        source_status = source_revision_status(directory, feature_id, graph["source_revision"])
+        source_revision = load_source_revision(directory, feature_id, graph["source_revision"])
+    except (OSError, ValueError) as exc:
+        errors.append(str(exc))
+        source_status, source_revision = {"status": "drift", "pending_ids": []}, {"risk_vector": {}}
     if errors:
         raise ValueError("; ".join(errors))
     state_path = directory / "state.json"
@@ -1189,13 +1363,30 @@ def compile_graph(
         if file_digest(source_path) != source_sha256:
             raise ValueError("Delivery Graph changed before compilation acquired the feature lock; rerun")
         previous = load_state(state_path)
+        ledger = load_ledger(root, feature_id)
+        if not check and not ledger_path_exists(root, feature_id):
+            write_ledger(root, feature_id, ledger)
         units = review_units(graph)
         attestations = {
             unit_id: summary for unit_id, summary in previous.get("attestations", {}).items()
             if unit_id in units and _valid_attestation_reference(root, feature_id, unit_id, summary, graph)
         }
         stage_hashes = {stage: stage_hash(graph, stage) for stage in STAGES}
-        delivery_readiness = readiness(graph, attestations)
+        observed_risk = previous.get("risk", {}).get("observed", {}) if isinstance(previous.get("risk"), dict) else {}
+        try:
+            observed_risk = normalize_risk_vector(observed_risk, label="observed risk vector")
+        except ValueError:
+            observed_risk = {axis: "absent" for axis in RISK_AXES}
+        observed_risk = union_risk_vectors(observed_risk, observed_code_risk_vector(root, graph))
+        design_risk = graph_risk_vector(graph)
+        risk = {
+            "source": source_revision["risk_vector"],
+            "design": design_risk,
+            "observed": observed_risk,
+            "effective": union_risk_vectors(source_revision["risk_vector"], design_risk, observed_risk),
+        }
+        risk["profiles"] = profiles_for(risk["effective"])
+        delivery_readiness = readiness(graph, attestations, source_status=source_status, ledger=ledger)
         contract = generate_proof_contract(graph)
         previous_contract = load_json(contract_path) if contract_path.is_file() else None
         sealed_contract_preserved = False
@@ -1223,6 +1414,32 @@ def compile_graph(
         if implementation_changed or sealed_contract_invalidated:
             code = {"status": "stale" if code.get("status") == "completed" else "pending", "repository_fingerprint": None}
             verification = {"status": "pending", "active_run_id": None, "run_digest": None, "verdict": None, "finalization": None}
+        if formal_feature_commits(root, feature_id) and code.get("status") == "pending":
+            code = {"status": "needs_reconcile", "repository_fingerprint": None}
+        previous_convergence = previous.get("convergence", {}) if isinstance(previous.get("convergence"), dict) else {}
+        if (
+            previous.get("graph_sha256") == graph_digest(graph)
+            and previous.get("readiness") == delivery_readiness
+            and set(previous_convergence) == {"status", "ready_distance", "reason"}
+        ):
+            convergence = previous_convergence
+        else:
+            if delivery_readiness["status"] == "ready":
+                convergence_status, convergence_reason = "READY", "all required review and finding obligations are closed"
+            elif delivery_readiness["source_drift"]:
+                convergence_status, convergence_reason = "NEEDS_DECISION", "a captured source revision awaits Owner confirmation"
+            elif previous_convergence.get("ready_distance") == (len(delivery_readiness["missing_units"]) + len(delivery_readiness["blocked_units"]) + delivery_readiness["open_blocking_findings"]):
+                convergence_status, convergence_reason = "STABLE_BLOCKED", "remaining obligations did not decrease"
+            else:
+                convergence_status, convergence_reason = "CONVERGING", "remaining obligations changed"
+            convergence = {
+                "status": convergence_status,
+                "ready_distance": len(delivery_readiness["missing_units"]) + len(delivery_readiness["blocked_units"]) + delivery_readiness["open_blocking_findings"],
+                "reason": convergence_reason,
+            }
+        execution = previous.get("execution") if isinstance(previous.get("execution"), dict) else None
+        if not isinstance(execution, dict) or set(execution) != {"status", "checkpoint", "reason"}:
+            execution = {"status": "idle", "checkpoint": "compile", "reason": None}
         state = {
             "schema_version": SCHEMA_VERSION,
             "feature_id": feature_id,
@@ -1231,6 +1448,15 @@ def compile_graph(
             "stage_hashes": stage_hashes,
             "readiness": delivery_readiness,
             "attestations": attestations,
+            "source_revision": source_status,
+            "risk": risk,
+            "finding_ledger": {
+                "record_path": f".dlv/findings/{feature_id}/ledger.json",
+                "sha256": file_digest(root / f".dlv/findings/{feature_id}/ledger.json") if ledger_path_exists(root, feature_id) else None,
+                "summary": finding_summary(ledger),
+            },
+            "convergence": convergence,
+            "execution": execution,
             "proof_contract": {
                 "status": contract["status"],
                 "draft_sha256": contract["draft_sha256"],
@@ -1303,6 +1529,25 @@ def mark_code_complete(root: Path, feature_id: str) -> str:
     lock = confined_project_path(root, Path(".dlv") / "runs" / feature_id / ".feature.lock", "feature lock")
     with exclusive_file_lock(lock):
         state = load_state(state_path)
+        if state.get("readiness", {}).get("status") != "ready" or state.get("convergence", {}).get("status") == "NEEDS_DECISION":
+            raise ValueError("Code requires current Source Revision, zero blocking Findings, and Delivery Readiness")
+        observed = observed_code_risk_vector(root, graph)
+        planned = union_risk_vectors(
+            state.get("risk", {}).get("source", {}),
+            state.get("risk", {}).get("design", {}),
+        )
+        unplanned = [axis for axis in RISK_AXES if RISK_LEVELS[observed[axis]] > RISK_LEVELS[planned[axis]]]
+        if unplanned:
+            state["risk"]["observed"] = observed
+            state["risk"]["effective"] = union_risk_vectors(planned, observed)
+            state["risk"]["profiles"] = profiles_for(state["risk"]["effective"])
+            state["code"] = {"status": "needs_reconcile", "repository_fingerprint": None}
+            state["execution"] = {
+                "status": "needs_decision", "checkpoint": "code-risk-reconciliation",
+                "reason": "observed code risk exceeds Graph risk: " + ", ".join(unplanned),
+            }
+            atomic_write_json(state_path, state)
+            raise ValueError("Code introduced undeclared risk axes; update Delivery Graph and rerun review: " + ", ".join(unplanned))
         required = review_units(graph)
         if not required or not all(
             _valid_attestation_reference(root, feature_id, unit_id, state.get("attestations", {}).get(unit_id), graph)
@@ -1337,6 +1582,20 @@ def initialize(root: Path, feature_id: str, title: str | None = None) -> Path:
     if directory.exists() and any(directory.iterdir()):
         raise ValueError(f"non-empty feature directory has no delivery-graph.json: {directory}")
     directory.mkdir(parents=True, exist_ok=True)
+    create_source_revision(
+        directory,
+        feature_id,
+        "SRC-001",
+        {
+            "title": title or feature_id.replace("-", " ").title(),
+            "description": "Initial feature source captured during delivery initialization.",
+            "comments": [],
+            "attachments": [],
+            "risk_vector": {},
+        },
+        owner="initialization",
+        status="confirmed",
+    )
     atomic_write_json(path, default_graph(feature_id, title))
     compile_graph(root, feature_id)
     return path

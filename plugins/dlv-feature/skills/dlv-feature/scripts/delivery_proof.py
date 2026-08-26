@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared integrity, locking, hashing, and evidence helpers for schema v10."""
+"""Shared integrity, locking, hashing, and evidence helpers for schema v11."""
 
 from __future__ import annotations
 

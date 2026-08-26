@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate a schema-v10 Delivery Graph feature."""
+"""Validate a schema-v11 Delivery Graph feature."""
 
 from graph_validation import main
 
