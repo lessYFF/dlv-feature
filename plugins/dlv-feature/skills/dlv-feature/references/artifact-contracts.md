@@ -1,74 +1,173 @@
-# Schema v11 artifact contracts
+# Schema v12 artifact contracts
 
-## Delivery Graph and Scope Revision
+## Editable truth
 
-`delivery-graph.json` is the sole editable delivery-design truth. It has
-`schema_version: 11`, `feature_id`, `title`, `source_revision`, `nodes`,
-`edges`, `prototype`, and `metadata.risk_vector`. Node and edge schemas remain
-typed and acyclic. `source_revision` names a confirmed immutable `SRC-*`
-record; any pending source record is `SOURCE_DRIFT` and blocks Ready.
+`delivery/{feature}/delivery-graph.json` is the sole editable delivery truth.
+It contains `schema_version: 12`, feature/source identity, `claims`, typed nodes
+and edges, Prototype declaration, risk vector, Review budget, and delivery
+mode. Generated Markdown, state, reviews, ledgers, contracts, and evidence are
+derived records and must not be repaired by hand.
 
-The source capture has title, description, comments, attachment descriptors,
-R0 risk vector, owner, timestamp, and a SHA-256 over captured content. Its
-status is `confirmed` or `pending_confirmation`; only
-`scope_revision.py confirm` may start a new epoch.
+Each Claim contains exactly `id`, `lens`, `invariant`, sorted `subjects`,
+`failure_boundary`, `critical`, and sorted `proof_ids`. Its `CLM-*` identity is
+the digest of lens + invariant + subjects + failure boundary + criticality. The only initial
+risk lenses are `PROVENANCE_INTEGRITY`, `STATE_AND_ATOMICITY`,
+`BOUNDARY_AND_CONCURRENCY`, and `RUNTIME_AUTHENTICITY`.
+`claim_successions` is reserved and must remain empty. Natural-language
+"strengthening" cannot deterministically prove that a new invariant or subject
+set preserves an old Claim. A semantic change creates a new Claim ID and a new
+obligation; the predecessor Finding remains separate and blocking until explicit
+independent Review resolves it. Graph/unit repartitioning needs no succession:
+unchanged Claim IDs and semantic Finding IDs already survive it.
 
-Risk axes are `API_CONTRACT`, `PERSISTENCE`, `AUTHORIZATION`, `TENANCY`,
-`MONEY`, `CONCURRENCY`, `IRREVERSIBLE_SIDE_EFFECT`, `CROSS_CLIENT`, and
-`VISUAL_CONTRACT`, each `absent`, `present`, or `critical`. R0/R1/R2 combine
-monotonically; observed code may escalate but not lower prior risk.
+## Source and Prototype provenance
 
-Prototype modes are:
+The Graph references one confirmed immutable `SRC-*` capture. A later pending
+capture creates source drift and blocks Ready.
 
-- `reference` with `path=prototype.html` and SHA-256;
-- `contractual` with the same fields and visual Proof for every applicable
-  Acceptance/Exception;
-- `not_applicable` with a concrete `reason`.
+AI-created Prototype bytes are `generated_candidate` and cannot enter Review.
+`reference` and `contractual` require `path=prototype.html`, Prototype SHA,
+current `source_revision`, `source_kind`, `source_ref`, and `source_sha256`.
+`source_revision` provenance binds the Source digest; `attachment` provenance
+must exactly match one captured attachment descriptor. Missing, invented, or
+stale provenance blocks Review and Ready.
 
-## Generated state
+## Findings and convergence
 
-`state.json` contains references only: Graph and stage hashes, component
-attestations, Source Revision status, R0/R1/R2/effective risk, Finding Ledger
-reference, convergence state, durable execution checkpoint, Proof Contract,
-Code fingerprint, and Verification state. It never embeds Graph nodes,
-evidence, or generated Markdown.
+`.dlv/findings/{feature}/ledger.json` owns `FND-*`. Finding identity excludes
+review-unit IDs and includes Claim, failure mode, violated invariant, sorted
+subjects, and sorted risk axes. Exact matches merge deterministically and add
+to `observed_in_units`. Partial semantic overlap creates a blocking
+`MERGE_CANDIDATE`; text similarity alone never merges.
+Resolving partial overlap is an explicit Owner decision: the superseded entry
+must name one related canonical Finding. Finding IDs cannot be rebound to new
+semantics, and stored semantic keys are recomputed on load.
+A superseded alias may route an OPEN rediscovery to its canonical blocker, but
+verification must return the canonical ID and exact canonical semantic payload.
 
-Architecture, Code Spec, PRD, diagrams, and Proof Contract draft are generated
-from the same Graph compilation. They are not separately editable or approved.
+Convergence compares:
 
-## Reviews and Findings
+```text
+[critical_obligation_weight, nonwaivable_major_obligation_weight,
+ unproven_critical_claims, major_obligation_weight, missing_proofs,
+ stale_reviews, review_units]
+```
 
-Each attestation binds `(lens, stable component roots, component hash, source
-revision, reviewer contract)`. The Global Skeleton always reviews cross-unit
-ownership, boundaries, state transitions, material risks, source revision, and
-claim synopsis. Shared providers are dependency context, not a reason to merge
-unrelated components.
+OPEN and MERGE_CANDIDATE Findings weigh 2; FIXED_PENDING_REVIEW weighs 1.
+Repair is therefore monotonic progress while remaining blocking until an
+independent Review verifies it.
 
-`.dlv/findings/{feature}/ledger.json` owns stable `FND-*` Finding identity.
-Each entry contains unit, severity, evidence, risk path, root cause, first/last
-scope epoch, lifecycle status, and any Owner decision. Reviewers must address
-all active Findings in their unit; omission keeps it active. New Major/Critical
-entries need evidence, root cause, risk path, and why prior Review could not
-see them. Duplicate root causes merge.
+Finding severity is the delivery priority contract: `critical=P0`, `major=P1`,
+`moderate=P2`, and `minor=P3`. P0/P1 cannot be accepted as delivery risk. An
+OPEN P2 produces `NEEDS_DECISION` until an Owner fixes it, moves it out of
+scope, or records `ACCEPTED_RISK` with a reason. P3 is advisory and may remain
+OPEN without preventing Ready. Ready therefore means zero important unresolved
+Findings, not zero Findings of every priority.
 
-Only `OPEN` and `FIXED_PENDING_REVIEW` block. `ACCEPTED_RISK` is rejected for
-tenancy, authorization, money, and irreversible side effects.
-An implementer marks a repaired Finding `FIXED_PENDING_REVIEW` with concrete
-repair evidence; only the next independent Review may mark that same `FND-*`
-`VERIFIED`.
+States are `CONVERGING`, `STABLE_BLOCKED`, `DIVERGING`, `NEEDS_DECISION`, and
+`READY`. State retains the latest three distinct vectors. Two consecutive
+increases in ready distance, blocking Finding count, or Review-unit count
+produce divergence; one ordinary invalidation is tolerated. Exhausting
+campaign, unit-review, or new-Finding budget produces `NEEDS_DECISION`, never
+PASS. A prospective campaign that reaches a stop-loss is durably counted as
+consumed Review work before convergence is re-derived, so the Owner-decision
+gate survives validation and recompilation.
+`max_campaigns` is a hard upper bound of three; configuration may lower it but
+cannot raise it. A fourth automatic campaign is forbidden. After the third
+non-Ready campaign, only an explicit Owner decision may choose repair,
+risk acceptance for P2, scope change, or termination.
+The Finding Ledger stores an independent append-only convergence event stream.
+Each event carries `key_id`, an RS256 signature, an authority digest, the
+previous record hash, and the exact confirmed Source Revision ID/digest. Every
+load rechecks that Source Revision's authority attachment. The repository carries the public key, while the matching
+private key remains external (`$CODEX_HOME/dlv-feature/convergence-rs256.pem` or
+`DLV_CONVERGENCE_PRIVATE_KEY`). The confirmed Source Revision binds that public
+identity. Any machine or CI can verify existing history; appending without the
+matching private key fails explicitly. Rebinding the source or changing the key
+invalidates the chain. Schema v12 intentionally has no in-place rotation command;
+any future versioned rotation protocol must require Owner approval and preserve
+prior events. The compiler and validator derive state history, previous vector,
+status, budget use, and reason from that stream and current records. Ledger size
+is capped at 8 MiB and convergence history at 256 events; reaching the event cap
+is a hard schema-v12 terminal that requires a future versioned migration. Schema
+v12 provides no manual checkpoint, truncation, rebaseline, or rotation escape hatch.
 
-## Proof and finalization
+## Repository adapter and fast path
 
-Proof Contract remains generated and one-way sealed. Every active Proof has a
-declared environment, runner, target, assertion oracle, and fresh runtime
-evidence. Proof strength must match its claim: artifact/typecheck evidence
-cannot prove money, concurrency, or irreversible-side-effect safety; sequential
-tests cannot prove concurrency safety.
+`.dlv/repository-adapter.json` exposes bounded parameter-array capabilities for
+instruction/change discovery, lint, targeted tests, typecheck, build,
+integration, runtime, database, and browser operations. It cannot decide
+verdicts, lower risk, mutate Claims, or grant waiver.
+On macOS every executable capability declares `sandbox_image`; the image must
+already exist locally and is resolved to its immutable OCI image ID before a
+network-disabled, PID/memory/CPU-limited container runs against a disposable
+repository snapshot. Every capability result records that resolved image ID,
+so the fast-path evidence digest exposes tag drift. Linux uses the same
+snapshot under `bwrap` with a private network namespace and private `/run` and
+`/tmp`, preventing host TCP/UDP, abstract-socket, and common runtime Unix-socket
+access. The isolated semantic Codex process is the sole outbound-network mode:
+it keeps `/run` and `/tmp` private but uses host networking for Codex HTTPS.
+The `changes` capability returns exactly
+`{schema_version:12, paths:[...], surfaces:[...], risk_axes:[...]}` with sorted,
+unique values. `frontend_roots` and the adapter SHA are confirmed Source
+Revision provenance, not adapter self-report. Only `frontend`, `frontend_test`, and `documentation` surfaces
+are fast-path eligible; malformed or boundary-bearing output fails closed to
+the standard route. Eligibility unions Source R0, Graph R1, and observed-code
+R2 risk. The kernel freezes base/merge-base OIDs, changed paths, adapter SHA,
+and Code fingerprint before capability execution. Mutation, symlinks, special
+files, oversized sources, or paths outside `frontend_roots` fail closed.
+Concurrent fast-path starts are serialized only long enough to reserve the
+feature. The capability pipeline runs outside that lock; a crash leaves the
+reservation in place and routes later starts to the standard/reconciliation
+path instead of silently replaying work. A caught routine execution failure
+writes a sanitized BLOCKED journal and releases only its matching reservation;
+the exception message is never persisted.
+Owner decision: a hard process/host crash may leave the reservation fail-closed.
+This accepted P2 availability risk never weakens delivery because later starts
+route to the standard path. An operator may remove the reservation only after
+confirming no matching run is active; automatic stale-owner guessing is forbidden.
 
-Ready requires the latest confirmed Source Revision, fresh PASS attestations,
-zero critical and non-waivable major blockers, no active blocking Finding, a
-matching Code fingerprint, and fresh runtime Proof. Formal commits use
-`DLV-Feature: <feature-id>` and cannot coexist with `Code=pending`.
+`frontend_fast_path` changes scheduling only. It is ineligible for API,
+persistence, authorization, tenancy, money, concurrency, cross-client, or
+irreversible-side-effect risk. It retains identical Source, Claim, Finding,
+Proof, and Ready contracts and ends at fresh Proof required.
 
-Schema v10 import archives mutable artifacts byte-for-byte, retains historical
-evidence unmodified, and starts v11 with no promoted completion claim.
+## Proof authenticity
+
+The generated one-way-sealed Proof Contract binds Claims, obligations,
+environments, runners, assertions, and Review attestations. High-strength
+runtime/invariant/visual evidence binds the Code fingerprint and real Git HEAD
+OID; HEAD carries the feature trailer and non-kernel source is fully committed.
+It also binds build, deployment, target runtime, adapter SHA, fixture SHA, and a fresh
+kernel-issued nonce unique to that evidence record. Drift or nonce reuse makes evidence stale.
+
+Repository-controlled commands execute through an OS file sandbox that denies
+the convergence credential directory and strips its locator variables. macOS
+uses `sandbox-exec`: high-strength Proof commands deny child creation, while
+repository-adapter process trees execute in a disposable repository copy with
+the real workspace write-denied; semantic review sees only its disposable
+immutable snapshot. Linux requires `bwrap` with PID isolation and a writable
+working-directory bind. Without the required sandbox, execution fails closed.
+
+Each high-strength Environment pins an RS256 target-attestation issuer,
+audience, and RSA public JWK. The actual target signs nonce, target/build/
+deployment identities, and the canonical measurement digest. Kernel-owned
+verification rejects local echo/self-report; the runner receives the nonce but
+not the expected target identity. Visual attestations also sign the three
+capture hashes before the core copies and re-hashes them.
+
+Runtime action, readback, and trace share target identity and nonce.
+Boolean-only observations cannot satisfy high-strength Proof. RSA key and
+compact-token sizes are bounded before verification. Critical state/concurrency
+Claims require invariant/runtime Proof plus Assertions that explicitly bind
+business `subject_ids`, exactly one unique authoritative measurement per subject,
+and state or side-effect readback. Visual captures
+come only from the sealed runner; core copies distinct Prototype,
+Implementation, and Diff PNGs and recomputes pixel/geometry metrics.
+
+Ready requires confirmed Source, authentic Prototype, fresh PASS attestations,
+zero P0/P1 Findings and zero undecided P2 Findings, complete critical Claim Proof coverage, sealed
+contract, matching Code fingerprint, and one active fresh passed record per
+Proof. Schema v11 migration archives old mutable records and promotes no prior
+seal, PASS, or Ready claim. Migration prevalidates symlinks, stages a complete
+archive, and rolls back every mutated record if compilation fails.

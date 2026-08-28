@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Capture and confirm immutable schema-v11 Scope Revisions.
+"""Capture and confirm immutable schema-v12 Scope Revisions.
 
 Capture records new issue text/comments/attachments without editing the Delivery
 Graph.  Confirmation is the explicit Owner decision that begins a new scope

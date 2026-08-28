@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate schema-v11 Delivery Graph state, attestations, contract, and evidence."""
+"""Validate schema-v12 Delivery Graph state, attestations, contract, and evidence."""
 
 from __future__ import annotations
 
@@ -38,6 +38,7 @@ from delivery_governance import (
     source_revision_status,
 )
 from graph_contract import validate_contract
+from delivery_contracts import claim_succession_map, convergence_vector, review_budget
 
 
 ALLOWED_FILES = {
@@ -96,6 +97,7 @@ def validate_attestations(root: Path, feature_id: str, graph: dict[str, Any], st
         expected_record_keys = {
             "schema_version", "feature_id", "review_run_id", "unit_id", "lens", "component_id", "stage", "execution",
             "graph_snapshot_sha256", "subgraph_sha256", "covered_node_ids", "issues",
+            "covered_claim_ids",
             "semantic_checks", "semantic_findings", "semantic_verdict", "verdict", "reviewed_at",
         }
         if set(record) != expected_record_keys:
@@ -111,6 +113,8 @@ def validate_attestations(root: Path, feature_id: str, graph: dict[str, Any], st
             errors.append(f"attestation component identity is invalid: {unit_id}")
         if record.get("covered_node_ids") != unit["node_ids"]:
             errors.append(f"attestation node coverage is incomplete: {unit_id}")
+        if record.get("covered_claim_ids") != unit.get("claim_ids", []):
+            errors.append(f"attestation Claim coverage is incomplete: {unit_id}")
         if record.get("subgraph_sha256") != summary.get("subgraph_sha256") or record.get("verdict") != summary.get("verdict"):
             errors.append(f"attestation summary disagrees with record: {lens}")
         issues = record.get("issues")
@@ -142,12 +146,13 @@ def validate_attestations(root: Path, feature_id: str, graph: dict[str, Any], st
         if any(
             not isinstance(item, dict)
             or set(item) != {
-                "id", "unit_id", "severity", "status", "statement", "evidence", "risk_path",
-                "root_cause", "first_seen_at", "last_seen_at", "first_seen_revision", "last_seen_revision",
-                "previously_invisible_reason", "waiver", "supersedes",
+                "id", "claim_id", "severity", "status", "statement", "evidence", "risk_path",
+                "root_cause", "failure_mode", "violated_invariant", "subjects", "risk_axes",
+                "semantic_key", "observed_in_units", "merge_candidates", "first_seen_at", "last_seen_at",
+                "first_seen_revision", "last_seen_revision", "previously_invisible_reason", "waiver", "supersedes",
             }
-            or item.get("severity") not in {"critical", "major", "minor"}
-            or item.get("status") not in {"OPEN", "FIXED_PENDING_REVIEW", "VERIFIED", "OUT_OF_SCOPE", "ACCEPTED_RISK", "SUPERSEDED"}
+            or item.get("severity") not in {"critical", "major", "moderate", "minor"}
+            or item.get("status") not in {"OPEN", "FIXED_PENDING_REVIEW", "VERIFIED", "OUT_OF_SCOPE", "ACCEPTED_RISK", "SUPERSEDED", "MERGE_CANDIDATE"}
             for item in semantic_findings
         ):
             errors.append(f"attestation semantic findings are invalid: {lens}")
@@ -198,7 +203,7 @@ def validate_attestations(root: Path, feature_id: str, graph: dict[str, Any], st
         elif (
             set(execution) != {"mode", "engine", "independent"}
             or execution.get("mode") != "isolated_deterministic_lens"
-            or execution.get("engine") != "dlv-feature/graph-review-v11"
+            or execution.get("engine") != "dlv-feature/graph-review-v12"
             or execution.get("independent") is not True
         ):
             errors.append(f"deterministic attestation execution metadata is invalid: {lens}")
@@ -282,7 +287,29 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
         ledger = load_ledger(root, feature_id)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         errors.append(f"governance records are invalid: {exc}")
-        source_status, ledger = {"status": "drift"}, {"entries": {}, "campaigns": []}
+        source_status, ledger = {
+            "status": "drift"
+        }, {"entries": {}, "campaigns": [], "convergence_authority": None, "convergence_events": []}
+    graph_claims = {claim["id"]: claim for claim in graph.get("claims", []) if isinstance(claim, dict)}
+    successions = claim_succession_map(graph)
+    for finding_id, entry in ledger.get("entries", {}).items():
+        current_claim_id = successions.get(entry.get("claim_id"), entry.get("claim_id"))
+        claim = graph_claims.get(current_claim_id)
+        if claim is None:
+            errors.append(f"finding references an unknown Claim: {finding_id}")
+        else:
+            finding_subjects = set(entry.get("subjects", []))
+            if current_claim_id == entry.get("claim_id"):
+                mapped_subjects = finding_subjects
+            else:
+                succession = next(
+                    (item for item in graph.get("claim_successions", []) if item.get("predecessor") == entry.get("claim_id")),
+                    {},
+                )
+                subject_map = succession.get("subject_map", {})
+                mapped_subjects = {subject_map.get(subject) for subject in finding_subjects}
+            if None in mapped_subjects or not mapped_subjects <= set(claim.get("subjects", [])):
+                errors.append(f"finding subjects escape its Claim lineage: {finding_id}")
     source_reference = state.get("source_revision")
     if source_reference != source_status:
         errors.append("state Source Revision reference is stale")
@@ -297,8 +324,92 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     ) or ledger_reference.get("summary") != finding_summary(ledger):
         errors.append("state finding ledger reference is stale")
     convergence = state.get("convergence")
-    if not isinstance(convergence, dict) or set(convergence) != {"status", "ready_distance", "reason"}:
+    if not isinstance(convergence, dict) or set(convergence) != {
+        "status", "vector", "previous_vector", "ready_distance", "history", "budget", "used", "reason",
+    }:
         errors.append("state convergence is invalid")
+    elif (
+        not isinstance(convergence.get("history"), list)
+        or not 1 <= len(convergence["history"]) <= 3
+        or any(
+            not isinstance(item, list)
+            or len(item) != 7
+            or any(not isinstance(value, int) or isinstance(value, bool) or value < 0 for value in item)
+            for item in convergence["history"]
+        )
+        or convergence["history"][-1] != convergence.get("vector")
+    ):
+        errors.append("state convergence history is invalid")
+    else:
+        expected_readiness = readiness(graph, state.get("attestations", {}), source_status=source_status, ledger=ledger)
+        expected_vector = convergence_vector(graph, expected_readiness, ledger)
+        campaigns = ledger.get("campaigns", [])
+        expected_budget = review_budget(graph)
+        expected_used = {
+            "campaigns": len(campaigns),
+            "unit_reviews": sum(item["unit_count"] for item in campaigns),
+            "new_findings": sum(item["new_findings"] for item in campaigns),
+        }
+        exhausted = (
+            expected_used["campaigns"] >= expected_budget["max_campaigns"]
+            or expected_used["unit_reviews"] >= expected_budget["max_unit_reviews"]
+            or expected_used["new_findings"] >= expected_budget["max_new_findings"]
+        ) and expected_readiness["status"] != "ready"
+        events = ledger.get("convergence_events", [])
+        state_key = value_digest({
+            "graph_sha256": graph_digest(graph), "readiness": expected_readiness,
+            "vector": expected_vector, "used": expected_used,
+        })
+        if not events or events[-1].get("state_key") != state_key or events[-1].get("vector") != expected_vector:
+            errors.append("kernel convergence history is missing or stale")
+        distinct_history: list[list[int]] = []
+        for event in events:
+            event_vector = event.get("vector")
+            if isinstance(event_vector, list) and (not distinct_history or distinct_history[-1] != event_vector):
+                distinct_history.append(event_vector)
+        history = distinct_history[-3:]
+        metrics = lambda item: (sum(item[:-1]), item[0] + item[3], item[6])
+        consecutive_growth = len(history) == 3 and any(
+            metrics(history[0])[index] < metrics(history[1])[index] < metrics(history[2])[index]
+            for index in range(3)
+        )
+        # A repeated compile intentionally does not append a duplicate signed
+        # event.  STABLE_BLOCKED is fail-closed, so it may use the current
+        # matching event as its comparison baseline; every state that permits
+        # continued automation must still derive from the prior signed event.
+        repeated_block = (
+            convergence.get("status") == "STABLE_BLOCKED"
+            and events
+            and events[-1].get("state_key") == state_key
+        )
+        previous_event = events[-1] if repeated_block else (events[-2] if len(events) >= 2 else None)
+        expected_previous = previous_event.get("vector") if isinstance(previous_event, dict) else None
+        if expected_readiness["status"] == "ready":
+            expected_status, expected_reason = "READY", "all required review and finding obligations are closed"
+        elif (
+            expected_readiness["source_drift"]
+            or expected_readiness["prototype_blocked"]
+            or expected_readiness["open_owner_decision_findings"]
+            or exhausted
+        ):
+            expected_status, expected_reason = "NEEDS_DECISION", "source/prototype/finding decision or review budget is required"
+        elif campaigns and consecutive_growth:
+            expected_status, expected_reason = "DIVERGING", "a monitored obligation increased across two consecutive transitions"
+        elif expected_previous == expected_vector:
+            expected_status, expected_reason = "STABLE_BLOCKED", "the lexicographic obligation vector did not decrease"
+        else:
+            expected_status, expected_reason = "CONVERGING", "the lexicographic obligation vector decreased or established a baseline"
+        if (
+            convergence.get("vector") != expected_vector
+            or convergence.get("ready_distance") != sum(expected_vector[:-1])
+            or convergence.get("budget") != expected_budget
+            or convergence.get("used") != expected_used
+            or convergence.get("previous_vector") != expected_previous
+            or convergence.get("history") != history
+            or convergence.get("status") != expected_status
+            or convergence.get("reason") != expected_reason
+        ):
+            errors.append("state convergence derivation is stale or tampered")
     execution = state.get("execution")
     if not isinstance(execution, dict) or set(execution) != {"status", "checkpoint", "reason"}:
         errors.append("state execution checkpoint is invalid")
@@ -431,7 +542,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
             if not report_path.is_file() or report_path.read_text(encoding="utf-8") != expected_report:
                 errors.append("generated Verification report is missing or stale")
     elif (directory / "verification.md").exists() or (directory / "verification.md").is_symlink():
-        errors.append("verification.md exists without an active schema-v11 run")
+        errors.append("verification.md exists without an active schema-v12 run")
     if final:
         if state.get("readiness", {}).get("status") != "ready":
             errors.append("final validation requires Delivery Readiness")
@@ -450,6 +561,10 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
             errors.append("finalization token is stale")
     if directory.is_dir():
         for entry in directory.iterdir():
+            if entry.is_dir() and entry.name == "archive-v11":
+                if entry.is_symlink():
+                    errors.append("archive-v11 must not be a symlink")
+                continue
             if entry.is_dir() and entry.name != "source-revisions":
                 errors.append(f"unexpected directory in feature artifact set: {entry.name}/")
             elif entry.is_dir() and entry.name == "source-revisions":

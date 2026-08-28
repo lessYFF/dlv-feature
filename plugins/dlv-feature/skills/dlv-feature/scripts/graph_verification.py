@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
-"""Target-runtime Verification Runs for schema-v11 Delivery Graph features."""
+"""Target-runtime Verification Runs for schema-v12 Delivery Graph features."""
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import re
+import secrets
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -44,16 +48,115 @@ from runtime_evidence import (
     load_runtime_trace,
     run_bounded,
 )
+from delivery_contracts import is_boolean_only_observation
+from repository_adapter import load_adapter
+from target_attestation import attestation_key_digest, validate_attestation_config, verify_target_attestation
 
 
 ZERO_HASH = "0" * 64
 SAFE_CHECK_ID = SAFE_RUN_ID
 EVIDENCE_RECORD_KEYS = {
     "schema_version", "evidence_id", "recorded_at", "po_id", "proof_type",
-    "status", "contract_digest", "code_fingerprint", "environment_id",
+    "claim_ids", "challenge_nonce", "target_identity", "adapter_sha256", "fixture_sha256", "attestation_key_sha256",
+    "status", "contract_digest", "code_fingerprint", "commit_identity", "environment_id",
     "environment_digest", "command", "assertion_results", "observation",
     "anchors", "blocked_reason", "supersedes", "previous_hash", "record_hash",
 }
+
+
+HIGH_STRENGTH_PROOFS = {"runtime", "invariant", "visual"}
+
+
+def formal_head_identity(root: Path, feature_id: str) -> str:
+    pathspec = [".", ":(exclude)delivery/**", ":(exclude).dlv/**"]
+    for staged in (False, True):
+        command = ["git", "diff", "--quiet"]
+        if staged:
+            command.append("--cached")
+        command.extend(["HEAD", "--", *pathspec])
+        if subprocess.run(command, cwd=root, check=False).returncode != 0:
+            raise ValueError("high-strength Proof requires committed Code with no source drift")
+    untracked = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+        cwd=root, capture_output=True, check=False,
+    )
+    if untracked.returncode != 0:
+        raise ValueError("high-strength Proof cannot establish the Git commit identity")
+    paths = [
+        value.decode("utf-8", errors="surrogateescape")
+        for value in untracked.stdout.split(b"\0") if value
+    ]
+    if any(not path.startswith(("delivery/", ".dlv/")) for path in paths):
+        raise ValueError("high-strength Proof requires committed Code with no untracked source")
+    completed = subprocess.run(
+        ["git", "show", "-s", "--format=%H%x00%B", "HEAD"],
+        cwd=root, capture_output=True, check=False,
+    )
+    if completed.returncode != 0:
+        raise ValueError("high-strength Proof cannot establish the Git commit identity")
+    commit, separator, body = completed.stdout.partition(b"\0")
+    try:
+        identity = commit.decode("ascii").strip()
+        message = body.decode("utf-8", errors="strict")
+    except UnicodeDecodeError as exc:
+        raise ValueError("high-strength Proof Git identity is invalid") from exc
+    if not separator or not re.fullmatch(r"[0-9a-f]{40,64}", identity):
+        raise ValueError("high-strength Proof Git identity is invalid")
+    if not re.search(rf"(?mi)^DLV-Feature:\s*{re.escape(feature_id)}\s*$", message):
+        raise ValueError("high-strength Proof requires the HEAD commit to carry the DLV-Feature trailer")
+    return identity
+
+
+def _authenticity_snapshot(root: Path, spec: dict[str, Any]) -> dict[str, Any]:
+    required = {"target_identity", "build_identity", "deployment_identity", "adapter_sha256", "fixture", "attestation"}
+    if not required <= set(spec) or not all(
+        isinstance(spec.get(key), str) and spec[key].strip() for key in required - {"fixture", "attestation"}
+    ):
+        raise ValueError("high-strength Environment lacks target/build/deployment/adapter identity")
+    _, current_adapter = load_adapter(root)
+    if current_adapter != spec.get("adapter_sha256"):
+        raise ValueError("repository adapter fingerprint is missing or stale")
+    fixture = spec.get("fixture")
+    if not isinstance(fixture, dict) or set(fixture) != {"path", "sha256"} or not isinstance(fixture.get("path"), str):
+        raise ValueError("high-strength Environment fixture binding is invalid")
+    fixture_path = confined_project_path(root, fixture["path"], "verification fixture")
+    if not fixture_path.is_file() or file_digest(fixture_path) != fixture.get("sha256"):
+        raise ValueError("verification fixture fingerprint is missing or stale")
+    attestation = validate_attestation_config(spec.get("attestation"))
+    return {
+        "target_identity": spec["target_identity"],
+        "build_identity": spec["build_identity"],
+        "deployment_identity": spec["deployment_identity"],
+        "adapter_sha256": current_adapter or "",
+        "fixture_sha256": fixture["sha256"],
+        "attestation": attestation,
+        "attestation_key_sha256": attestation_key_digest(attestation),
+    }
+
+
+def validate_runtime_binding(observation: dict[str, Any], authenticity: dict[str, Any], challenge_nonce: str) -> None:
+    for role in ("action", "result_readback"):
+        value = observation.get(role)
+        if (
+            not isinstance(value, dict)
+            or value.get("target_identity") != authenticity.get("target_identity")
+            or value.get("challenge_nonce") != challenge_nonce
+        ):
+            raise ValueError("runtime action/readback target identity or challenge nonce mismatch")
+
+
+def asserted_measurements_are_boolean_only(observation: dict[str, Any], assertions: Any) -> bool:
+    if not isinstance(assertions, list):
+        return True
+    measured: list[Any] = []
+    for assertion in assertions:
+        source = assertion.get("oracle", {}).get("source") if isinstance(assertion, dict) else None
+        if not isinstance(source, str) or not source.startswith("/observation/"):
+            continue
+        actual = resolve_source({"observation": observation}, source)
+        if actual is not MISSING:
+            measured.append(actual)
+    return is_boolean_only_observation({"asserted_measurements": measured})
 
 
 def bounded_timeout(value: Any) -> int:
@@ -95,13 +198,14 @@ def contract_digest(contract: dict[str, Any]) -> str:
 
 def start_request_digest(
     feature_id: str, run_id: str, contract: dict[str, Any], state: dict[str, Any],
-    supplied: dict[str, Path], snapshots: dict[str, Any],
+    supplied: dict[str, Path], snapshots: dict[str, Any], commit_identity: str | None,
 ) -> str:
     return value_digest({
         "feature_id": feature_id,
         "run_id": run_id,
         "contract_digest": contract_digest(contract),
         "code_fingerprint": state.get("code", {}).get("repository_fingerprint"),
+        "commit_identity": commit_identity,
         "environments": {
             environment_id: {
                 "path": supplied[environment_id].as_posix(),
@@ -249,13 +353,15 @@ def load_pending_execution(destination: Path) -> dict[str, Any] | None:
         return None
     journal = load_json(journal_path)
     if (
-        set(journal) != {"schema_version", "request_digest", "po_id", "runner_digest"}
+        set(journal) != {"schema_version", "request_digest", "po_id", "runner_digest", "challenge_nonce"}
         or journal.get("schema_version") != SCHEMA_VERSION
         or not isinstance(journal.get("request_digest"), str)
         or not SHA256.fullmatch(journal["request_digest"])
         or not isinstance(journal.get("po_id"), str)
         or not isinstance(journal.get("runner_digest"), str)
         or not SHA256.fullmatch(journal["runner_digest"])
+        or not isinstance(journal.get("challenge_nonce"), str)
+        or not SHA256.fullmatch(journal["challenge_nonce"])
     ):
         raise ValueError("pending Proof execution is invalid")
     return journal
@@ -321,19 +427,26 @@ def start(feature_id: str, root: Path, run_id: str, environment_args: list[str])
                 f"extra={sorted(set(supplied)-set(environments))}"
             )
         snapshots: dict[str, Any] = {}
+        high_strength_environments = {
+            obligation.get("environment_id") for obligation in obligations.values()
+            if obligation.get("proof_type") in HIGH_STRENGTH_PROOFS
+        }
         for environment_id, environment in environments.items():
             path = supplied[environment_id]
             actual = load_json(path)
             if actual != environment.get("spec"):
                 raise ValueError(f"environment {environment_id} does not match its contracted structured spec")
+            authenticity = _authenticity_snapshot(root, actual) if environment_id in high_strength_environments else None
             snapshots[environment_id] = {
                 "target": environment.get("target"),
                 "spec": actual,
                 "digest": value_digest(actual),
                 "source_sha256": file_digest(path),
+                "authenticity": authenticity,
             }
+        commit_identity = formal_head_identity(root, feature_id) if high_strength_environments else None
         request_digest = start_request_digest(
-            feature_id, run_id, contract, state, supplied, snapshots,
+            feature_id, run_id, contract, state, supplied, snapshots, commit_identity,
         )
         if destination.exists():
             recovered = recover_pending_start(
@@ -391,6 +504,7 @@ def start(feature_id: str, root: Path, run_id: str, environment_args: list[str])
                 "created_at": timestamp(),
                 "contract_digest": contract_digest(contract),
                 "code_fingerprint": state["code"]["repository_fingerprint"],
+                "commit_identity": commit_identity,
                 "environments": snapshots,
                 "preflight": preflight,
                 "preflight_verdict": "PASS" if all(item["status"] == "passed" for item in preflight) else "BLOCKED",
@@ -462,10 +576,15 @@ def _copy_visual_anchors(
 ) -> tuple[list[dict[str, Any]], list[tuple[str | None, Path]]]:
     required = {"prototype_screenshot", "implementation_screenshot", "visual_diff"}
     raw_paths = observation.get("anchor_paths")
+    raw_hashes = observation.get("anchor_sha256")
     if not isinstance(raw_paths, dict) or set(raw_paths) != required or not all(
         isinstance(raw_paths.get(role), str) and raw_paths[role] for role in required
     ):
         raise ValueError("visual runner observation requires exact anchor_paths")
+    if not isinstance(raw_hashes, dict) or set(raw_hashes) != required or not all(
+        isinstance(raw_hashes.get(role), str) and SHA256.fullmatch(raw_hashes[role]) for role in required
+    ):
+        raise ValueError("visual runner observation requires exact anchor_sha256")
     if observation.get("prototype_sha256") != obligation.get("prototype_sha256"):
         raise ValueError("visual runner Prototype digest disagrees with the sealed obligation")
     if observation.get("capture_profile") != obligation.get("capture_profile"):
@@ -482,6 +601,9 @@ def _copy_visual_anchors(
     if len(set(resolved_sources)) != len(required):
         raise ValueError("visual runner must produce three distinct anchor paths")
     stored, normalized = _copy_extra_anchors(destination, evidence_id, structured)
+    stored_by_role = {anchor.get("role"): anchor.get("sha256") for anchor in stored}
+    if stored_by_role != raw_hashes:
+        raise ValueError("visual runner signed anchor hashes disagree with captured bytes")
     observation["anchor_paths"] = {
         anchor["role"]: anchor["path"] for anchor in stored if "role" in anchor
     }
@@ -525,6 +647,9 @@ def record(feature_id: str, root: Path, run_id: str, result_path: Path, supersed
             raise ValueError(f"unknown Proof obligation: {po_id}")
         if result.get("proof_type") != obligation.get("proof_type"):
             raise ValueError("result proof_type disagrees with sealed obligation")
+        proof_type = obligation.get("proof_type")
+        if proof_type in HIGH_STRENGTH_PROOFS and metadata.get("commit_identity") != formal_head_identity(root, feature_id):
+            raise ValueError("Verification Run Git commit identity is stale")
         outcome = result.get("outcome", "evaluate")
         if outcome not in {"evaluate", "blocked"}:
             raise ValueError("outcome must be evaluate or blocked")
@@ -542,6 +667,7 @@ def record(feature_id: str, root: Path, run_id: str, result_path: Path, supersed
         if not command_cwd.is_dir():
             raise ValueError("runner cwd is not a directory")
         runner_was_invoked = outcome == "evaluate"
+        challenge_nonce = secrets.token_hex(32)
         if runner_was_invoked:
             execution_path = destination / "pending-execution.json"
             atomic_write_json(execution_path, {
@@ -549,12 +675,21 @@ def record(feature_id: str, root: Path, run_id: str, result_path: Path, supersed
                 "request_digest": request_digest,
                 "po_id": po_id,
                 "runner_digest": value_digest(runner),
+                "challenge_nonce": challenge_nonce,
             })
             try:
                 completed = run_bounded(
                     runner["argv"], command_cwd,
                     bounded_timeout(runner.get("timeout_seconds", DEFAULT_TIMEOUT_SECONDS)),
+                    environment={
+                        **os.environ,
+                        "DLV_CHALLENGE_NONCE": challenge_nonce,
+                    },
+                    deny_process_fork=proof_type in HIGH_STRENGTH_PROOFS,
                 )
+            except ValueError:
+                execution_path.unlink(missing_ok=True)
+                raise
             except OSError as exc:
                 outcome = "blocked"
                 blocked_reason = f"sealed runner unavailable: {exc}"
@@ -584,8 +719,14 @@ def record(feature_id: str, root: Path, run_id: str, result_path: Path, supersed
         else:
             command = {"argv": runner["argv"], "cwd": command_cwd.relative_to(root).as_posix() or ".", "exit_code": None, "stdout": "", "stderr": "", "timed_out": False}
             observation = {"blocked_reason": blocked_reason}
+        snapshot = metadata.get("environments", {}).get(obligation.get("environment_id"), {})
+        authenticity = snapshot.get("authenticity") if isinstance(snapshot, dict) else None
         if repository_fingerprint(root, feature_id) != metadata.get("code_fingerprint"):
             raise ValueError("Code changed while the sealed runner was executing")
+        if proof_type in HIGH_STRENGTH_PROOFS:
+            current_authenticity = _authenticity_snapshot(root, snapshot.get("spec", {}))
+            if current_authenticity != authenticity:
+                raise ValueError("adapter, fixture, build, deployment, or runtime target drifted during Proof execution")
         existing = load_manifest(destination / "evidence.jsonl")
         current_head = existing[-1]["record_hash"] if existing else ZERO_HASH
         if verification.get("evidence_count") != len(existing) or verification.get("evidence_head") != current_head:
@@ -599,7 +740,16 @@ def record(feature_id: str, root: Path, run_id: str, result_path: Path, supersed
             raise ValueError("evidence can be superseded only once")
         if any(item.get("po_id") != po_id for item in existing if item.get("evidence_id") in supersedes):
             raise ValueError("evidence may supersede only the same Proof obligation")
-        proof_type = obligation.get("proof_type")
+        if outcome == "evaluate" and proof_type in HIGH_STRENGTH_PROOFS:
+            if not isinstance(authenticity, dict):
+                raise ValueError("high-strength Proof lacks sealed runtime authenticity")
+            if observation.get("challenge_nonce") != challenge_nonce or observation.get("target_identity") != authenticity.get("target_identity"):
+                raise ValueError("high-strength Proof target identity/challenge nonce mismatch")
+            verify_target_attestation(observation, authenticity, challenge_nonce)
+            if is_boolean_only_observation(observation):
+                raise ValueError("boolean-only observation cannot satisfy a high-strength Proof")
+            if asserted_measurements_are_boolean_only(observation, obligation.get("assertions", [])):
+                raise ValueError("boolean-only asserted measurement cannot satisfy a high-strength Proof")
         if outcome == "evaluate" and proof_type == "visual":
             if result.get("anchors"):
                 raise ValueError("visual anchors must come from the sealed runner observation")
@@ -626,6 +776,7 @@ def record(feature_id: str, root: Path, run_id: str, result_path: Path, supersed
             snapshot = metadata.get("environments", {}).get(obligation.get("environment_id"), {})
             if observation.get("runtime") != snapshot.get("spec", {}).get("runtime"):
                 raise ValueError("runtime_trace runtime disagrees with sealed Environment")
+            validate_runtime_binding(observation, authenticity, challenge_nonce)
             traces = [path for role, path in normalized if role == "runtime_trace"]
             if len(traces) != 1 or load_runtime_trace(traces[0]) != observation:
                 raise ValueError("runtime evidence requires one matching runtime_trace anchor")
@@ -667,9 +818,16 @@ def record(feature_id: str, root: Path, run_id: str, result_path: Path, supersed
             "recorded_at": timestamp(),
             "po_id": po_id,
             "proof_type": proof_type,
+            "claim_ids": obligation.get("claim_ids", []),
+            "challenge_nonce": challenge_nonce,
+            "target_identity": authenticity.get("target_identity") if isinstance(authenticity, dict) else None,
+            "adapter_sha256": authenticity.get("adapter_sha256") if isinstance(authenticity, dict) else None,
+            "fixture_sha256": authenticity.get("fixture_sha256") if isinstance(authenticity, dict) else None,
+            "attestation_key_sha256": authenticity.get("attestation_key_sha256") if isinstance(authenticity, dict) else None,
             "status": status,
             "contract_digest": metadata["contract_digest"],
             "code_fingerprint": metadata["code_fingerprint"],
+            "commit_identity": metadata.get("commit_identity") if proof_type in HIGH_STRENGTH_PROOFS else None,
             "environment_id": obligation.get("environment_id"),
             "environment_digest": snapshot.get("digest"),
             "command": command,
@@ -714,13 +872,25 @@ def validate_run(root: Path, feature_id: str, run_id: str, errors: list[str]) ->
     obligations, environments = contract_maps(contract)
     if set(metadata) != {
         "schema_version", "feature_id", "run_id", "created_at", "contract_digest",
-        "code_fingerprint", "environments", "preflight", "preflight_verdict",
+        "code_fingerprint", "commit_identity", "environments", "preflight", "preflight_verdict",
     }:
         errors.append("Verification Run metadata contains unknown or missing fields")
     if metadata.get("schema_version") != SCHEMA_VERSION or metadata.get("feature_id") != feature_id or metadata.get("run_id") != run_id:
         errors.append("Verification Run identity/schema is invalid")
     if metadata.get("contract_digest") != contract_digest(contract):
         errors.append("Verification Run contract digest is stale")
+    high_strength_required = any(
+        obligation.get("proof_type") in HIGH_STRENGTH_PROOFS
+        for obligation in obligations.values()
+    )
+    if high_strength_required:
+        try:
+            if metadata.get("commit_identity") != formal_head_identity(root, feature_id):
+                errors.append("Verification Run Git commit identity is stale")
+        except ValueError as exc:
+            errors.append(str(exc))
+    elif metadata.get("commit_identity") is not None:
+        errors.append("low-strength Verification Run must not claim a Git commit identity")
     if metadata.get("code_fingerprint") != repository_fingerprint(root, feature_id):
         errors.append("Verification Run code fingerprint is stale")
     if state.get("verification", {}).get("active_run_id") != run_id:
@@ -733,7 +903,7 @@ def validate_run(root: Path, feature_id: str, run_id: str, errors: list[str]) ->
         snapshot = snapshots.get(environment_id)
         if not isinstance(snapshot, dict):
             continue
-        if set(snapshot) != {"target", "spec", "digest", "source_sha256"}:
+        if set(snapshot) != {"target", "spec", "digest", "source_sha256", "authenticity"}:
             errors.append(f"Verification Run Environment snapshot shape is invalid: {environment_id}")
         if snapshot.get("target") != environment.get("target") or snapshot.get("spec") != environment.get("spec"):
             errors.append(f"Verification Run Environment snapshot is stale: {environment_id}")
@@ -792,12 +962,21 @@ def validate_run(root: Path, feature_id: str, run_id: str, errors: list[str]) ->
     known: set[str] = set()
     superseded: set[str] = set()
     records_by_id: dict[str, dict[str, Any]] = {}
+    seen_challenge_nonces: set[str] = set()
+    current_authenticity_cache: dict[str, tuple[dict[str, Any] | None, str | None]] = {}
     for index, record_value in enumerate(records, 1):
         evidence_id = record_value.get("evidence_id")
         if set(record_value) != EVIDENCE_RECORD_KEYS:
             errors.append(f"evidence record contains unknown or missing fields: {evidence_id}")
         if record_value.get("schema_version") != SCHEMA_VERSION:
             errors.append(f"evidence schema is invalid: {evidence_id}")
+        challenge_nonce = record_value.get("challenge_nonce")
+        if not isinstance(challenge_nonce, str) or not SHA256.fullmatch(challenge_nonce):
+            errors.append(f"evidence challenge nonce is invalid: {evidence_id}")
+        elif challenge_nonce in seen_challenge_nonces:
+            errors.append(f"evidence challenge nonce is reused: {evidence_id}")
+        else:
+            seen_challenge_nonces.add(challenge_nonce)
         if record_value.get("evidence_id") != f"EVID-{index:04d}":
             errors.append("evidence IDs must be append-only and contiguous")
         if record_value.get("previous_hash") != prior:
@@ -822,12 +1001,40 @@ def validate_run(root: Path, feature_id: str, run_id: str, errors: list[str]) ->
         snapshot = snapshots.get(obligation.get("environment_id"), {}) if isinstance(snapshots, dict) else {}
         if record_value.get("proof_type") != obligation.get("proof_type"):
             errors.append(f"evidence Proof type disagrees with contract: {evidence_id}")
+        if record_value.get("claim_ids") != obligation.get("claim_ids", []):
+            errors.append(f"evidence Claim binding disagrees with contract: {evidence_id}")
         if record_value.get("contract_digest") != metadata.get("contract_digest"):
             errors.append(f"evidence contract digest is stale: {evidence_id}")
         if record_value.get("code_fingerprint") != metadata.get("code_fingerprint"):
             errors.append(f"evidence Code fingerprint is stale: {evidence_id}")
         if record_value.get("environment_id") != obligation.get("environment_id") or record_value.get("environment_digest") != snapshot.get("digest"):
             errors.append(f"evidence Environment binding is stale: {evidence_id}")
+        authenticity = snapshot.get("authenticity") if isinstance(snapshot, dict) else None
+        if obligation.get("proof_type") in HIGH_STRENGTH_PROOFS:
+            if record_value.get("commit_identity") != metadata.get("commit_identity"):
+                errors.append(f"evidence Git commit identity is stale: {evidence_id}")
+            environment_id = str(record_value.get("environment_id"))
+            if environment_id not in current_authenticity_cache:
+                try:
+                    current_authenticity_cache[environment_id] = (
+                        _authenticity_snapshot(root, snapshot.get("spec", {})), None,
+                    )
+                except (OSError, ValueError) as exc:
+                    current_authenticity_cache[environment_id] = (None, str(exc))
+            current_authenticity, authenticity_error = current_authenticity_cache[environment_id]
+            if authenticity_error is not None:
+                errors.append(f"evidence authenticity cannot be validated: {evidence_id}: {authenticity_error}")
+            if authenticity != current_authenticity:
+                errors.append(f"evidence adapter/fixture/target binding is stale: {evidence_id}")
+            if (
+                record_value.get("target_identity") != (authenticity or {}).get("target_identity")
+                or record_value.get("adapter_sha256") != (authenticity or {}).get("adapter_sha256")
+                or record_value.get("fixture_sha256") != (authenticity or {}).get("fixture_sha256")
+                or record_value.get("attestation_key_sha256") != (authenticity or {}).get("attestation_key_sha256")
+            ):
+                errors.append(f"evidence authenticity fields disagree with the run: {evidence_id}")
+        elif record_value.get("commit_identity") is not None:
+            errors.append(f"low-strength evidence must not claim a Git commit identity: {evidence_id}")
         runner = obligation.get("runner") if isinstance(obligation, dict) else None
         command = record_value.get("command")
         observation = record_value.get("observation")
@@ -895,6 +1102,11 @@ def validate_run(root: Path, feature_id: str, run_id: str, errors: list[str]) ->
                 }
                 if observation.get("anchor_paths") != expected_paths:
                     errors.append(f"visual evidence anchor paths disagree with runner observation: {evidence_id}")
+                expected_hashes = {
+                    role: file_digest(path) for role, path in normalized_anchors if role in required
+                }
+                if observation.get("anchor_sha256") != expected_hashes:
+                    errors.append(f"visual evidence signed anchor hashes disagree: {evidence_id}")
                 if observation.get("prototype_sha256") != obligation.get("prototype_sha256"):
                     errors.append(f"visual evidence Prototype binding is stale: {evidence_id}")
                 if observation.get("capture_profile") != obligation.get("capture_profile"):
@@ -916,6 +1128,21 @@ def validate_run(root: Path, feature_id: str, run_id: str, errors: list[str]) ->
                 errors.append(f"runtime evidence trace is missing or stale: {evidence_id}")
             if observation.get("runtime") != snapshot.get("spec", {}).get("runtime"):
                 errors.append(f"runtime evidence target is stale: {evidence_id}")
+            for role in ("action", "result_readback"):
+                value = observation.get(role)
+                if not isinstance(value, dict) or value.get("target_identity") != (authenticity or {}).get("target_identity") or value.get("challenge_nonce") != challenge_nonce:
+                    errors.append(f"runtime evidence {role} target/nonce binding is stale: {evidence_id}")
+        if proof_type in HIGH_STRENGTH_PROOFS and record_value.get("status") != "blocked":
+            if observation.get("target_identity") != (authenticity or {}).get("target_identity") or observation.get("challenge_nonce") != challenge_nonce:
+                errors.append(f"high-strength evidence target/nonce binding is stale: {evidence_id}")
+            if is_boolean_only_observation(observation):
+                errors.append(f"high-strength evidence is boolean-only: {evidence_id}")
+            if asserted_measurements_are_boolean_only(observation, obligation.get("assertions", [])):
+                errors.append(f"high-strength asserted measurement is boolean-only: {evidence_id}")
+            try:
+                verify_target_attestation(observation, authenticity or {}, challenge_nonce)
+            except ValueError as exc:
+                errors.append(f"high-strength target attestation is invalid: {evidence_id}: {exc}")
         assertions = obligation.get("assertions", []) if isinstance(obligation, dict) else []
         explicitly_blocked = (
             isinstance(record_value.get("blocked_reason"), str)

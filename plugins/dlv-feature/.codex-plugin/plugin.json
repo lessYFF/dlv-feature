@@ -1,6 +1,6 @@
 {
   "name": "dlv-feature",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "A convergent, risk-routed, proof-carrying feature delivery workflow for Codex.",
   "author": {
     "name": "lessYFF",
@@ -13,13 +13,13 @@
   "interface": {
     "displayName": "DLV Feature",
     "shortDescription": "Deliver features with evidence-backed gates.",
-    "longDescription": "Guides a feature through a schema-v11 Delivery Graph with immutable Scope Revisions, risk-routed component reviews, a Finding Ledger, convergence control, generated proof contracts, target-runtime evidence, and deterministic finalization.",
+    "longDescription": "Guides a feature through a schema-v12 Delivery Graph with source-bound prototypes, stable Claims and Findings, budgeted convergence, repository adapters, authentic target-runtime Proof, and deterministic finalization.",
     "developerName": "lessYFF",
     "category": "Productivity",
-    "capabilities": ["Scope Revision control", "Risk-routed Delivery Graph planning", "Component-scoped review reuse", "Finding convergence", "Global system-coherence review", "Generated proof contracts", "Typed Verification runs", "Pixel-level UI comparison", "Deterministic verification and recovery"],
+    "capabilities": ["Prototype provenance", "Stable Claim contracts", "Semantic Finding convergence", "Divergence and Review budgets", "Repository adapters", "Frontend fast path", "Target-runtime authenticity", "Pixel-level UI comparison", "Deterministic recovery"],
     "websiteURL": "https://github.com/lessYFF/dlv-feature",
     "defaultPrompt": [
-      "Use $dlv-feature to deliver this feature with a schema-v11 Delivery Graph, Scope Revisions, risk-routed semantic attestations, a Finding Ledger, proof contracts, target-runtime evidence, and deterministic finalization."
+      "Use $dlv-feature to deliver this feature with schema-v12 source provenance, stable Claims and Findings, budgeted risk review, repository-adapter checks, authentic target-runtime Proof, and deterministic finalization."
     ]
   }
 }

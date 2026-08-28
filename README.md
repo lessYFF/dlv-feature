@@ -1,8 +1,13 @@
 # DLV Feature
 
-Current plugin version: **0.7.0**, Delivery Graph schema v11.
+Current plugin version: **0.8.0**, Delivery Graph schema v12.
 
-DLV Feature is a proof-carrying Codex workflow with one editable Delivery Graph, immutable Scope Revisions, risk-routed component reviews, a stable Finding Ledger, convergence/recovery control, generated delivery views and contracts, target-runtime evidence, and deterministic finalization.
+DLV Feature is a proof-carrying Codex workflow with one editable Delivery Graph, immutable Scope Revisions, source-bound Prototypes, stable Claims and semantic Findings, budgeted convergence control, thin repository adapters, target-runtime authenticity, and deterministic finalization.
+
+Review is risk-gated rather than zero-Finding-gated: critical/P0 and major/P1
+Findings block delivery, moderate/P2 requires an explicit Owner decision, and
+minor/P3 is advisory. Automatic Review is capped at three campaigns; a third
+non-Ready result moves to `NEEDS_DECISION` instead of starting another loop.
 
 Architecture and Code Spec are generated views, not serial approval stages. A local edit invalidates only its dependency component. Owner, Boundary, StateTransition, critical/major Risk, shared Fact, or shared Environment changes also invalidate the Global Skeleton attestation.
 
@@ -29,16 +34,25 @@ python3 plugins/dlv-feature/skills/dlv-feature/scripts/verification_run.py recor
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/finalize_delivery.py feature-id --root /path/to/project
 ```
 
-## Import legacy deliveries
-
-Schema v11 does not promote legacy completion claims. Import schema v10 directly:
+Pure frontend work may use the quality-preserving fast path after configuring
+`.dlv/repository-adapter.json`. On macOS each capability also needs a locally
+preinstalled `sandbox_image`; the adapter resolves it to an immutable image ID
+and never pulls during delivery:
 
 ```bash
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v10_to_v11.py feature-id --root /path/to/project
-python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v10_to_v11.py feature-id --root /path/to/project --apply
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/frontend_fast_path.py feature-id --root /path/to/project --run-id fast-01
 ```
 
-For schema v9, use `upgrade_v9_to_v10.py`; it emits an untrusted v11 candidate. Import archives mutable source bytes and invalidates all prior completion claims.
+## Import legacy deliveries
+
+Schema v12 does not promote legacy completion claims. Import schema v11 directly:
+
+```bash
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v11_to_v12.py feature-id --root /path/to/project
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/upgrade_v11_to_v12.py feature-id --root /path/to/project --apply
+```
+
+Compatibility importers for schema v9/v10 emit an untrusted v12 candidate. Import archives mutable records and invalidates all prior completion claims.
 
 ## Test
 

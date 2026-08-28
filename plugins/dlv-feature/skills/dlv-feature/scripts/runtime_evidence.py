@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Bounded command and runtime-evidence helpers for schema-v11 verification."""
+"""Bounded command and runtime-evidence helpers for schema-v12 verification."""
 
 from __future__ import annotations
 
 import json
 import os
 import re
+import shutil
 import signal
 import struct
 import subprocess
@@ -16,10 +17,122 @@ import zlib
 from pathlib import Path
 from typing import Any
 
+if sys.platform == "darwin":
+    import resource
+else:
+    resource = None
+
 DEFAULT_TIMEOUT_SECONDS = 300
 MAX_CAPTURE_BYTES = 1_048_576
 MAX_ANCHOR_BYTES = 10_485_760
 MAX_VISUAL_PIXELS = 16_777_216
+
+
+def verify_macos_signature(path: Path, *, team_id: str, identifier: str) -> Path:
+    resolved = path.resolve()
+    requirement = (
+        f'anchor apple generic and certificate leaf[subject.OU] = "{team_id}" '
+        f'and identifier "{identifier}"'
+    )
+    completed = subprocess.run(
+        ["/usr/bin/codesign", "--verify", "--strict", "--verbose=2", f"-R={requirement}", str(resolved)],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, check=False,
+    )
+    if completed.returncode != 0:
+        raise ValueError(f"untrusted signed macOS executable: {resolved}")
+    return resolved
+
+
+def trusted_sandbox_executable(name: str) -> Path | None:
+    raw = shutil.which(name)
+    if not raw:
+        return None
+    try:
+        path = Path(raw).resolve(strict=True)
+        current = path
+        while True:
+            metadata = current.stat()
+            if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+                raise ValueError(f"untrusted OS sandbox executable path: {path}")
+            if current.parent == current:
+                break
+            current = current.parent
+    except OSError as exc:
+        raise ValueError(f"untrusted OS sandbox executable path: {raw}") from exc
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise ValueError(f"untrusted OS sandbox executable path: {path}")
+    return path
+
+
+def sandboxed_argv(
+    argv: list[str], cwd: Path, *, allow_process_tree: bool = False,
+    deny_process_fork: bool = False,
+    writable_roots: list[Path] | None = None,
+    read_protected: list[Path] | None = None,
+    allowed_unix_sockets: list[Path] | None = None,
+    allow_outbound_process_tree: bool = False,
+) -> list[str]:
+    """Deny repository-controlled children access to convergence authority credentials."""
+    configured = os.environ.get("DLV_CONVERGENCE_PRIVATE_KEY")
+    key_path = Path(configured).expanduser() if configured else Path(
+        os.environ.get("CODEX_HOME", Path.home() / ".codex")
+    ).expanduser() / "dlv-feature" / "convergence-rs256.pem"
+    protected = key_path.parent.resolve()
+    sandbox_exec = trusted_sandbox_executable("sandbox-exec") if sys.platform == "darwin" else None
+    if sandbox_exec is not None:
+        hidden = [protected, *(path.resolve() for path in (read_protected or []))]
+        hidden_policy = "".join(
+            f'(deny file-read* file-write* (subpath {json.dumps(str(path))}))'
+            for path in hidden
+        )
+        network_policy = "".join(
+            f'(allow network-outbound (remote unix-socket (path {json.dumps(str(path.resolve()))})))'
+            for path in (allowed_unix_sockets or [])
+        )
+        if sum((allow_process_tree, allow_outbound_process_tree, deny_process_fork)) > 1:
+            raise ValueError("process-tree and process-fork policies conflict")
+        if allow_outbound_process_tree:
+            profile = f'(version 1)(allow default)(deny network-inbound){hidden_policy}'
+        elif allow_process_tree:
+            writable = [path.resolve() for path in (writable_roots or [])]
+            if not writable:
+                raise ValueError("macOS process trees require an explicit disposable writable root")
+            write_policy = "".join(
+                f'(allow file-write* (subpath {json.dumps(str(path))}))'
+                for path in writable
+            )
+            profile = (
+                f'(version 1)(deny default)'
+                f'(import "/System/Library/Sandbox/Profiles/system.sb")'
+                f'(allow process*)(allow file-read*)'
+                f'{write_policy}{network_policy}{hidden_policy}'
+            )
+        elif deny_process_fork:
+            profile = f'(version 1)(allow default)(deny process-fork){hidden_policy}'
+        else:
+            profile = f'(version 1)(allow default){hidden_policy}'
+        return [str(sandbox_exec), "-p", profile, *argv]
+    bwrap = trusted_sandbox_executable("bwrap") if sys.platform.startswith("linux") else None
+    if bwrap is not None:
+        home = str(Path.home().resolve())
+        writable_cwd = str(cwd.expanduser().resolve())
+        writable = [path.resolve() for path in (writable_roots or [cwd])]
+        if not any(Path(writable_cwd).is_relative_to(path) for path in writable):
+            raise ValueError("sandbox cwd must be contained by one explicit writable root")
+        network_namespace = [] if allow_outbound_process_tree else ["--unshare-net"]
+        command = [
+            str(bwrap), "--unshare-pid", *network_namespace, "--die-with-parent", "--new-session",
+            "--ro-bind", "/", "/", "--ro-bind", home, home,
+            "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp", "--tmpfs", "/run",
+        ]
+        for path in writable:
+            command.extend(["--bind", str(path), str(path)])
+        for path in [protected, *(item.resolve() for item in (read_protected or []))]:
+            command.extend(["--tmpfs", str(path)])
+        return [*command, "--", *argv]
+    raise ValueError(
+        "repository-controlled commands require an OS sandbox that denies convergence signing credentials"
+    )
 
 
 def is_supported_image(path: Path) -> bool:
@@ -202,16 +315,61 @@ def descendant_pids(parent_pid: int) -> set[int]:
     return result
 
 
-def run_bounded(argv: list[str], cwd: Path, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS) -> dict[str, Any]:
+def run_bounded(
+    argv: list[str], cwd: Path, timeout_seconds: int = DEFAULT_TIMEOUT_SECONDS, *,
+    environment: dict[str, str] | None = None,
+    max_capture_bytes: int = MAX_CAPTURE_BYTES,
+    input_text: str | None = None,
+    allow_process_tree: bool = False,
+    deny_process_fork: bool = False,
+    writable_roots: list[Path] | None = None,
+    read_protected: list[Path] | None = None,
+    allowed_unix_sockets: list[Path] | None = None,
+    allow_outbound_process_tree: bool = False,
+    isolated_codex_home: Path | None = None,
+) -> dict[str, Any]:
+    if type(max_capture_bytes) is not int or max_capture_bytes < 1:
+        raise ValueError("max_capture_bytes must be a positive integer")
+    child_environment = dict(os.environ if environment is None else environment)
+    for name in ("CODEX_HOME", "DLV_CONVERGENCE_PRIVATE_KEY"):
+        child_environment.pop(name, None)
+    if isolated_codex_home is not None:
+        isolated = isolated_codex_home.resolve()
+        writable = [path.resolve() for path in (writable_roots or [])]
+        if not isolated.is_dir() or not any(isolated.is_relative_to(path) for path in writable):
+            raise ValueError("isolated Codex home must be inside an explicit writable root")
+        child_environment["CODEX_HOME"] = str(isolated)
+    encoded_input = input_text.encode("utf-8") if input_text is not None else None
+    if encoded_input is not None and len(encoded_input) > MAX_CAPTURE_BYTES:
+        raise ValueError("bounded command input exceeds the resource contract")
     options: dict[str, Any] = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if sys.platform == "win32" else {"start_new_session": True}
-    process = subprocess.Popen(argv, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options)
+    if sys.platform == "darwin" and (allow_process_tree or allow_outbound_process_tree):
+        if resource is None:
+            raise ValueError("macOS process-tree sandbox requires Unix resource limits")
+        cpu_limit = max(1, timeout_seconds + 1)
+
+        def bound_cpu() -> None:
+            resource.setrlimit(resource.RLIMIT_CPU, (cpu_limit, cpu_limit))
+
+        options["preexec_fn"] = bound_cpu
+    process = subprocess.Popen(
+        sandboxed_argv(
+            argv, cwd, allow_process_tree=allow_process_tree,
+            deny_process_fork=deny_process_fork,
+            writable_roots=writable_roots, read_protected=read_protected,
+            allowed_unix_sockets=allowed_unix_sockets,
+            allow_outbound_process_tree=allow_outbound_process_tree,
+        ), cwd=cwd, env=child_environment,
+        stdin=subprocess.PIPE if input_text is not None else None,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, **options,
+    )
     captured = {"stdout": bytearray(), "stderr": bytearray()}
     truncated = {"stdout": False, "stderr": False}
 
     def drain(name: str, stream: Any) -> None:
         try:
             while chunk := stream.read(8192):
-                remaining = MAX_CAPTURE_BYTES - len(captured[name])
+                remaining = max_capture_bytes - len(captured[name])
                 if remaining > 0:
                     captured[name].extend(chunk[:remaining])
                 if len(chunk) > remaining:
@@ -227,6 +385,22 @@ def run_bounded(argv: list[str], cwd: Path, timeout_seconds: int = DEFAULT_TIMEO
     threads = [threading.Thread(target=drain, args=(name, stream), daemon=True) for name, stream in (("stdout", process.stdout), ("stderr", process.stderr))]
     for thread in threads:
         thread.start()
+    input_thread: threading.Thread | None = None
+    if encoded_input is not None:
+        assert process.stdin is not None
+
+        def feed_input() -> None:
+            try:
+                process.stdin.write(encoded_input)
+                process.stdin.close()
+            except (BrokenPipeError, OSError, ValueError):
+                try:
+                    process.stdin.close()
+                except (OSError, ValueError):
+                    pass
+
+        input_thread = threading.Thread(target=feed_input, daemon=True)
+        input_thread.start()
     timed_out = False
     try:
         exit_code = process.wait(timeout=timeout_seconds)
@@ -248,13 +422,20 @@ def run_bounded(argv: list[str], cwd: Path, timeout_seconds: int = DEFAULT_TIMEO
         if process.poll() is None:
             process.kill()
         exit_code = process.wait()
+    if sys.platform != "win32":
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
     for thread in threads:
         thread.join(timeout=2)
+    if input_thread is not None:
+        input_thread.join(timeout=2)
     output: dict[str, Any] = {"exit_code": 124 if timed_out else exit_code, "timed_out": timed_out}
     for name in ("stdout", "stderr"):
         text = captured[name].decode("utf-8", errors="replace")
         if truncated[name]:
-            text += f"\n[TRUNCATED at {MAX_CAPTURE_BYTES} bytes]"
+            text += f"\n[TRUNCATED at {max_capture_bytes} bytes]"
         output[name] = redact_text(text)
     if timed_out:
         output["stderr"] += f"\n[TIMED OUT after {timeout_seconds} seconds]"

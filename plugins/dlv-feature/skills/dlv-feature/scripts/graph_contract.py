@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seal and validate a schema-v11 generated Proof Contract."""
+"""Seal and validate a schema-v12 generated Proof Contract."""
 
 from __future__ import annotations
 
@@ -36,7 +36,7 @@ def validate_contract(root: Path, feature_id: str, contract: dict[str, Any], sta
     expected = generate_proof_contract(graph)
     expected_keys = {
         "schema_version", "feature_id", "graph_sha256", "subgraph_sha256",
-        "environments", "obligations", "draft_sha256", "status", "attestations",
+        "claims", "environments", "obligations", "draft_sha256", "status", "attestations",
         "sealed_at", "seal",
     }
     if set(contract) != expected_keys:
@@ -45,7 +45,7 @@ def validate_contract(root: Path, feature_id: str, contract: dict[str, Any], sta
         errors.append("Proof Contract identity/schema is invalid")
     if contract.get("draft_sha256") != expected["draft_sha256"]:
         errors.append("Proof Contract draft is stale for the current implementation/proof subgraph")
-    if contract.get("environments") != expected["environments"] or contract.get("obligations") != expected["obligations"]:
+    if contract.get("claims") != expected["claims"] or contract.get("environments") != expected["environments"] or contract.get("obligations") != expected["obligations"]:
         errors.append("Proof Contract disagrees with the deterministic graph compiler")
     if contract.get("status") != "sealed":
         errors.append("Proof Contract is not sealed")
