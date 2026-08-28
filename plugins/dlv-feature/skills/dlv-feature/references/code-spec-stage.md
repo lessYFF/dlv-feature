@@ -25,6 +25,6 @@ The compiler generates Code Spec and the Proof Contract draft from this graph. N
 
 ## Gate and seal
 
-`change-traceability` checks Change/Symbol and reviewed-decision closure. `proof-coverage` checks target coverage, exact environments, runners, assertions, and risk mitigation. The independent semantic lenses check whether the proposed symbols actually implement the decision and whether the observation/oracle truly proves the claimed result.
+`RUNTIME_AUTHENTICITY` checks Change/Symbol traceability, Claim-to-Proof coverage, exact environments, runners, assertions, adapter/fixture identities, and risk mitigation. Independent review checks whether proposed symbols implement the decision and whether the observation/oracle proves the bound Claim in the actual target.
 
 Compile, review every stale local/global unit, then seal when Delivery Readiness is `ready`. Any bound graph or attestation change returns the contract to draft.

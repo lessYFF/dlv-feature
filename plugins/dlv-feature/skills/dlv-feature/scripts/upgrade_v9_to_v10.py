@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Conservatively upgrade a schema-v9 delivery into a schema-v10 Delivery Graph."""
+"""Compatibility importer: upgrade a schema-v9 delivery into schema v12."""
 
 from __future__ import annotations
 
@@ -15,6 +15,7 @@ from typing import Any
 from delivery_graph import atomic_write_json, compile_graph, confined_project_path, feature_dir
 from delivery_governance import create_source_revision
 from delivery_proof import exclusive_file_lock, extract_state, file_digest, load_json, validate_feature_id
+from upgrade_v11_to_v12 import migrated_graph
 
 
 LEGACY_ID = re.compile(
@@ -201,7 +202,7 @@ def convert(root: Path, feature_id: str) -> dict[str, Any]:
         name: file_digest(directory / name)
         for name in LEGACY_ARTIFACTS if (directory / name).is_file()
     }
-    return {
+    v11 = {
         "schema_version": 11,
         "feature_id": feature_id,
         "title": _title(texts["prd.md"], feature_id),
@@ -217,6 +218,14 @@ def convert(root: Path, feature_id: str) -> dict[str, Any]:
             "source_artifacts_sha256": source_artifacts_sha256,
         },
     }
+    result = migrated_graph(v11)
+    result["metadata"].update({
+        "upgrade": "schema-v9-to-v12",
+        "candidate_only": True,
+        "source_state_sha256": v11["metadata"]["source_state_sha256"],
+        "source_artifacts_sha256": v11["metadata"]["source_artifacts_sha256"],
+    })
+    return result
 
 
 def apply_upgrade(root: Path, feature_id: str) -> Path:
@@ -228,12 +237,12 @@ def apply_upgrade(root: Path, feature_id: str) -> Path:
     with exclusive_file_lock(lock):
         if graph_path.is_file():
             graph = load_json(graph_path)
-            if graph.get("schema_version") != 11 or graph.get("feature_id") != feature_id:
-                raise ValueError("existing delivery-graph.json is not this feature's schema-v11 graph")
+            if graph.get("schema_version") != 12 or graph.get("feature_id") != feature_id:
+                raise ValueError("existing delivery-graph.json is not this feature's schema-v12 graph")
             upgrade = graph.get("metadata")
             if (
                 not isinstance(upgrade, dict)
-                or upgrade.get("upgrade") != "schema-v9-to-v10"
+                or upgrade.get("upgrade") != "schema-v9-to-v12"
                 or upgrade.get("candidate_only") is not True
                 or not isinstance(upgrade.get("source_state_sha256"), str)
                 or not isinstance(upgrade.get("source_artifacts_sha256"), dict)

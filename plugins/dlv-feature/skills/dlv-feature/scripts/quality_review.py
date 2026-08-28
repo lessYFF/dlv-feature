@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run every stale schema-v11 Delivery Readiness review unit."""
+"""Run every stale schema-v12 Delivery Readiness review unit."""
 
 from graph_review import main
 

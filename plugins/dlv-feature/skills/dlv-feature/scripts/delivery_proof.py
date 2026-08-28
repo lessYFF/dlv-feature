@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared integrity, locking, hashing, and evidence helpers for schema v11."""
+"""Shared integrity, locking, hashing, and evidence helpers for schema v12."""
 
 from __future__ import annotations
 
@@ -35,7 +35,11 @@ def value_digest(value: Any) -> str:
 
 
 def file_digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def repository_fingerprint(root: Path, feature_id: str) -> str:
@@ -62,7 +66,16 @@ def repository_fingerprint(root: Path, feature_id: str) -> str:
             digest.update(path.readlink().as_posix().encode("utf-8"))
         elif path.is_file():
             digest.update(b"file\0")
-            digest.update(path.read_bytes())
+            before = path.stat()
+            with path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+                after = os.fstat(handle.fileno())
+            identity = lambda value: (
+                value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+            )
+            if identity(before) != identity(after):
+                raise ValueError(f"repository file changed while fingerprinting: {relative}")
         else:
             digest.update(b"missing\0")
         digest.update(b"\0")

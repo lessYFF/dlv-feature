@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-scoped invalidation for schema-v11 Delivery Graph features."""
+"""Dependency-scoped invalidation for schema-v12 Delivery Graph features."""
 
 from __future__ import annotations
 

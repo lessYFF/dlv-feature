@@ -1,47 +1,63 @@
-# Schema v11 workflow
+# Schema v12 workflow
 
 ```text
-capture source → confirm scope epoch → edit Graph → compile/lint
-→ Review stale components + global coherence → resolve Findings
-→ seal → implement → reconcile Code risk → target-runtime Proof → finalization
+capture source → confirm epoch → declare Claims/Graph → compile
+→ review stale risk components → converge Findings
+→ seal → implement/reconcile → authentic target Proof → finalize
 ```
 
-## Review depth
+Quality contracts never change by route. Efficiency may reuse fresh component
+attestations, run cheapest checks first, or select the frontend fast path; it
+cannot weaken Claim meaning, Finding closure, Proof strength, or Ready.
 
-The universal kernel is Source Revision, minimal Graph, deterministic lint,
-semantic Review, Finding Ledger, Proof Contract, Diff/evidence reconciliation,
-and Ready decision. Risk activates additive lenses rather than another serial
-workflow.
+## Review control
 
-`UI_LOCAL` needs requirement/UI-state/component/Test/Proof traceability and
-design/interaction review. It does not invent persistence, distributed state,
-idempotency, or concurrency obligations. A local UI change touching money,
-authorization, business-state semantics, API, persistence, tenant boundaries,
-or cross-client behavior automatically becomes a higher-risk route.
+Review uses four generic risk lenses plus global coherence. Findings bind
+Claims, not units. Exact semantic duplicates merge across Graph repartition;
+partial overlap waits as `MERGE_CANDIDATE` for a decision.
 
-## Invalidation and convergence
+After each effective change append the convergence vector to the Finding
+Ledger's externally signed event stream. The confirmed Source Revision binds
+its repository-carried RSA public identity; the private key remains external.
+Cross-machine verification requires no private key, while append or rebaseline
+without the matching authority must fail. Schema v12 rejects authority rotation;
+support requires a future Owner-approved versioned migration that preserves the
+existing signed chain. Derive the
+three-point state history from the stream. Stop new units, Graph expansion, and automatic Review when
+ready distance, blocking Findings, or Review units rise across two consecutive
+transitions (`DIVERGING`), or when a source/prototype/budget decision is needed
+(`NEEDS_DECISION`). `STABLE_BLOCKED` means no progress and requires repair or an
+Owner decision. Budget exhaustion never synthesizes a waiver or PASS.
+Automatic Review has a hard maximum of three campaigns. Configuration may use
+one or two but never more than three. After the third non-Ready campaign, stop
+automatic iteration and ask the Owner to choose; do not chase a zero-Finding
+result.
 
-The compiler assigns stable component identity from typed roots, then records
-dependency paths for invalidation. A changed local Symbol should retain
-unrelated components and the Global Skeleton. Owner, boundary, state,
-material-risk, source-revision, or cross-component topology changes refresh
-global coherence.
+Risk acceptance is priority-based: critical/P0 and major/P1 Findings must be
+fixed and independently verified. Moderate/P2 Findings require an explicit
+Owner outcome (`FIXED_PENDING_REVIEW`, `OUT_OF_SCOPE`, or `ACCEPTED_RISK` with
+a reason). Minor/P3 Findings are advisory and may remain OPEN. Delivery
+continues when no known P0/P1 or undecided P2 remains, even if P3 follow-up
+Findings exist.
 
-Every campaign first verifies old Findings. New blockers need new evidence;
-repeated root causes share an ID. If remaining obligations do not decline,
-state becomes `STABLE_BLOCKED`; a pending scope capture or unplanned Code risk
-becomes `NEEDS_DECISION`. These states stop automatic Graph mutation, never
-create automatic PASS.
+## Fast path
+
+For a pure local frontend change, configure the repository adapter and set
+`metadata.delivery_mode=frontend_fast_path`. The order is provenance, lint and
+change discovery, targeted tests, typecheck, build, one composite Review, then
+fresh Proof. Any elevated API/data/auth/tenant/money/concurrency/cross-client/
+side-effect risk routes to standard delivery. A Finding repair always gets an
+independent re-review.
+The changes adapter must return structured paths/surfaces/risk axes; output that
+is malformed, empty, or crosses the frontend boundary routes to standard.
+An atomic per-feature reservation admits only one fast-path run. Long-running
+checks execute outside the feature lock, and an interrupted reservation fails
+closed until it is reconciled.
 
 ## Recovery
 
-One feature lock serializes Graph/state/ledger writes. Semantic Review uses
-independent temporary read-only processes. Failure preserves a checkpoint:
-`needs_resume` resumes recorded work; `needs_decision` waits for an Owner
-scope/design/risk decision. New source input creates drift instead of blindly
-cancelling work.
-
-Before finalization DLV reconciles formal feature commits, Code fingerprint,
-effective risk, sealed Proof Contract, environments, runners, fixtures,
-assertion observability, evidence anchors, and final state. Any mismatch is
-pending or blocked, never Ready.
+Feature locks serialize Graph/state/ledger writes. Review runs in independent
+read-only processes. Verification uses a pending-execution WAL and append-only
+hash chain. Ambiguous side effects fail closed. Source, adapter, fixture,
+environment, target, or code drift invalidates dependent claims rather than
+relabeling stale evidence.

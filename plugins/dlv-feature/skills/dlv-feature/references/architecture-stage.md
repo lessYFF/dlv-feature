@@ -17,6 +17,6 @@ Represent verified system facts, singular ownership, boundaries, state transitio
 
 ## Gate
 
-`fact-ownership` always runs. `boundary-state-safety` activates when boundary, transition, exception, risk, or owner context exists. Deterministic checks enforce exact ownership, Fact persistence, executable database DDL with column meaning, guards, transitions, and risk links. The database contract contains schema intent, not repository migration numbers or procedural migration code. Independent semantic lenses challenge second sources of truth, unsafe concurrency/tenant/authorization, ambiguous lineage, compatibility, failure modes, and whether the chosen boundary actually protects the stated fact.
+`STATE_AND_ATOMICITY` and `BOUNDARY_AND_CONCURRENCY` enforce exact ownership, Fact persistence, executable database DDL with column meaning, guards, transitions, and risk links. The database contract contains schema intent, not repository migration numbers or procedural migration code. Stable Claims bind invariants and failure boundaries; independent review challenges second sources of truth, unsafe concurrency/tenant/authorization, ambiguous lineage, compatibility, and failure modes.
 
 A PASS freezes only the exact Architecture component and its upstream dependencies. Owner, Boundary, StateTransition, critical/major Risk, or shared context changes also require a fresh Global Skeleton PASS.

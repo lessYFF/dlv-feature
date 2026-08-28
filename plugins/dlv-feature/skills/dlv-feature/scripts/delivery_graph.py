@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Schema-v11 Delivery Graph kernel and deterministic artifact compiler.
+"""Schema-v12 Delivery Graph kernel and deterministic artifact compiler.
 
-`delivery-graph.json` is the only editable delivery truth in schema v11.  This
+`delivery-graph.json` is the only editable delivery truth in schema v12.  This
 module validates it, computes dependency-scoped hashes, renders disposable
 human views, derives the Proof Contract, and keeps only references in
 `state.json`.
@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import re
 from subprocess import run as run_process
@@ -33,18 +34,29 @@ from delivery_governance import (
     RISK_AXES,
     RISK_LEVELS,
     create_source_revision,
+    append_convergence_event,
     finding_summary,
     load_ledger,
     load_source_revision,
     normalize_risk_vector,
     profiles_for,
+    recover_review_transaction,
     source_revision_status,
     union_risk_vectors,
-    write_ledger,
+)
+from delivery_contracts import (
+    CLAIM_LENSES,
+    SCHEMA_VERSION,
+    claim_errors,
+    convergence_vector,
+    prototype_provenance_errors,
+    prototype_review_blockers,
+    prototype_shape_errors,
+    review_budget,
+    target_attestation_provenance_errors,
 )
 
 
-SCHEMA_VERSION = 11
 STAGES = ("product", "architecture", "implementation_proof")
 GLOBAL_LENS = "global-system-coherence"
 GLOBAL_SKELETON_TYPES = {"Fact", "Owner", "Boundary", "StateTransition", "Risk", "Environment"}
@@ -106,36 +118,31 @@ EDGE_SHAPES: dict[str, tuple[set[str], set[str]]] = {
     "changes": ({"Change"}, {"Behavior", "Fact", "Boundary", "StateTransition", "Decision"}),
     "depends_on": ({"Symbol", "Change", "Test", "Proof", "Assertion", "Decision"}, NODE_TYPES),
     "tests": ({"Test"}, {"Acceptance", "Exception", "Boundary", "StateTransition", "Change", "Symbol"}),
-    "proves": ({"Proof", "Assertion"}, {"Acceptance", "Exception", "Boundary", "StateTransition", "Change", "Test", "Proof", "Risk"}),
+    "proves": ({"Proof", "Assertion"}, {"Acceptance", "Exception", "Fact", "Boundary", "StateTransition", "Decision", "Change", "Test", "Proof", "Risk"}),
     "runs_in": ({"Test", "Proof"}, {"Environment"}),
     "mitigates": ({"Decision", "Change", "Test", "Proof"}, {"Risk"}),
 }
 
 LENSES: dict[str, dict[str, Any]] = {
-    "product-contract": {
+    "PROVENANCE_INTEGRITY": {
         "stage": "product",
         "types": {"Requirement", "Behavior", "Acceptance", "Exception", "Persona"},
         "edges": {"derives_from"},
     },
-    "fact-ownership": {
+    "STATE_AND_ATOMICITY": {
         "stage": "architecture",
-        "types": {"Fact", "Owner", "Decision"},
-        "edges": {"owns", "derives_from", "depends_on"},
+        "types": {"Fact", "Owner", "StateTransition", "Decision"},
+        "edges": {"owns", "transitions", "derives_from", "depends_on", "mitigates"},
     },
-    "boundary-state-safety": {
+    "BOUNDARY_AND_CONCURRENCY": {
         "stage": "architecture",
         "types": {"Boundary", "StateTransition", "Exception", "Risk", "Owner"},
         "edges": {"owns", "guards", "transitions", "derives_from", "mitigates"},
     },
-    "change-traceability": {
+    "RUNTIME_AUTHENTICITY": {
         "stage": "implementation_proof",
-        "types": {"Change", "Symbol", "Decision", "Behavior", "Boundary", "StateTransition"},
-        "edges": {"changes", "depends_on", "derives_from"},
-    },
-    "proof-coverage": {
-        "stage": "implementation_proof",
-        "types": {"Acceptance", "Exception", "Test", "Environment", "Proof", "Assertion", "Risk"},
-        "edges": {"tests", "proves", "runs_in", "mitigates", "depends_on"},
+        "types": {"Acceptance", "Exception", "Test", "Environment", "Proof", "Assertion", "Risk", "Change", "Symbol"},
+        "edges": {"tests", "proves", "runs_in", "mitigates", "depends_on", "changes", "derives_from"},
     },
 }
 
@@ -143,7 +150,7 @@ LENSES: dict[str, dict[str, Any]] = {
 # otherwise independent review components merely because every proof uses the
 # same runtime or mitigates the same cross-cutting risk.
 NON_PARTITIONING_ROOT_TYPES = {
-    "proof-coverage": {"Environment", "Risk"},
+    "RUNTIME_AUTHENTICITY": {"Environment", "Risk"},
 }
 
 
@@ -190,10 +197,16 @@ def default_graph(feature_id: str, title: str | None = None) -> dict[str, Any]:
         "feature_id": feature_id,
         "title": title or feature_id.replace("-", " ").title(),
         "source_revision": "SRC-001",
+        "claims": [],
+        "claim_successions": [],
         "nodes": [],
         "edges": [],
         "prototype": {"status": "not_applicable", "reason": "No visible UI contract is in scope."},
-        "metadata": {"risk_vector": {axis: "absent" for axis in RISK_AXES}},
+        "metadata": {
+            "risk_vector": {axis: "absent" for axis in RISK_AXES},
+            "review_budget": review_budget({"metadata": {}}),
+            "delivery_mode": "standard",
+        },
     }
 
 
@@ -225,8 +238,23 @@ def edge_key(edge: dict[str, Any]) -> tuple[str, str, str]:
     return str(edge.get("source")), str(edge.get("type")), str(edge.get("target"))
 
 
+def canonical_claims(graph: dict[str, Any]) -> list[dict[str, Any]]:
+    return sorted(copy.deepcopy(graph.get("claims", [])), key=lambda claim: str(claim.get("id")))
+
+
+def canonical_claim_successions(graph: dict[str, Any]) -> list[dict[str, Any]]:
+    return sorted(
+        copy.deepcopy(graph.get("claim_successions", [])),
+        key=lambda item: (str(item.get("predecessor")), str(item.get("successor"))),
+    )
+
+
 def normalized_graph(graph: dict[str, Any]) -> dict[str, Any]:
     value = copy.deepcopy(graph)
+    if isinstance(value.get("claims"), list):
+        value["claims"] = canonical_claims(value)
+    if isinstance(value.get("claim_successions"), list):
+        value["claim_successions"] = canonical_claim_successions(value)
     if isinstance(value.get("nodes"), list):
         value["nodes"] = sorted(value["nodes"], key=lambda node: str(node.get("id")))
     if isinstance(value.get("edges"), list):
@@ -240,7 +268,7 @@ def graph_digest(graph: dict[str, Any]) -> str:
 
 def structural_errors(graph: dict[str, Any], feature_id: str | None = None) -> list[str]:
     errors: list[str] = []
-    allowed_top = {"schema_version", "feature_id", "title", "source_revision", "nodes", "edges", "prototype", "metadata"}
+    allowed_top = {"schema_version", "feature_id", "title", "source_revision", "claims", "claim_successions", "nodes", "edges", "prototype", "metadata"}
     unknown = set(graph) - allowed_top
     if unknown:
         errors.append("Delivery Graph contains unknown top-level keys: " + ", ".join(sorted(unknown)))
@@ -258,14 +286,20 @@ def structural_errors(graph: dict[str, Any], feature_id: str | None = None) -> l
     if not isinstance(graph.get("source_revision"), str) or not re.fullmatch(r"SRC-[0-9]{3,}", graph["source_revision"]):
         errors.append("Delivery Graph source_revision must reference a confirmed SRC- revision")
     metadata = graph.get("metadata")
-    allowed_metadata = {"risk_vector", "upgrade", "candidate_only", "source_state_sha256", "source_artifacts_sha256"}
+    allowed_metadata = {
+        "risk_vector", "review_budget", "delivery_mode", "upgrade", "candidate_only",
+        "source_state_sha256", "source_artifacts_sha256",
+    }
     if not isinstance(metadata, dict) or "risk_vector" not in metadata or set(metadata) - allowed_metadata:
         errors.append("Delivery Graph metadata must contain risk_vector and only recognized machine metadata")
     else:
         try:
             normalize_risk_vector(metadata.get("risk_vector"), label="Delivery Graph metadata.risk_vector")
+            review_budget(graph)
         except ValueError as exc:
             errors.append(str(exc))
+        if metadata.get("delivery_mode", "standard") not in {"standard", "frontend_fast_path"}:
+            errors.append("Delivery Graph metadata.delivery_mode is invalid")
     nodes = graph.get("nodes")
     edges = graph.get("edges")
     if not isinstance(nodes, list):
@@ -356,38 +390,19 @@ def structural_errors(graph: dict[str, Any], feature_id: str | None = None) -> l
 
     if any(visit(node_id) for node_id in sorted(dependency_graph) if node_id not in visited):
         errors.append("Delivery Graph dependency relationships must be acyclic")
-    prototype = graph.get("prototype", {"status": "not_applicable"})
-    if not isinstance(prototype, dict) or prototype.get("status") not in {"not_applicable", "reference", "contractual"}:
-        errors.append("prototype must be an object with status not_applicable, reference, or contractual")
-    elif prototype.get("status") == "not_applicable" and (
-        set(prototype) != {"status", "reason"}
-        or not isinstance(prototype.get("reason"), str)
-        or not prototype["reason"].strip()
-    ):
-        errors.append("not-applicable prototype requires exactly status and a non-empty reason")
-    elif prototype.get("status") in {"reference", "contractual"} and (
-        set(prototype) != {"status", "path", "sha256"}
-        or prototype.get("path") != "prototype.html"
-        or not isinstance(prototype.get("sha256"), str)
-        or not SHA256.fullmatch(prototype["sha256"])
-    ):
-        errors.append("reference/contractual prototype requires exactly path=prototype.html and a SHA-256")
+    errors.extend(claim_errors(graph))
+    errors.extend(prototype_shape_errors(graph.get("prototype")))
     return errors
 
 
 def prototype_errors(root: Path, feature_id: str, graph: dict[str, Any]) -> list[str]:
     """Validate the editable Prototype bytes bound by the Product contract."""
-    path = feature_dir(root, feature_id) / "prototype.html"
-    prototype = graph.get("prototype", {"status": "not_applicable"})
-    if not isinstance(prototype, dict):
-        return ["prototype declaration is invalid"]
-    if prototype.get("status") == "not_applicable":
-        return ["prototype.html exists while prototype is not_applicable"] if path.exists() or path.is_symlink() else []
-    if prototype.get("status") not in {"reference", "contractual"}:
-        return ["prototype declaration is invalid"]
-    if not path.is_file() or path.resolve() != path.absolute():
-        return ["reference/contractual Prototype requires a regular, non-symlink prototype.html"]
-    return [] if prototype.get("sha256") == file_digest(path) else ["Prototype fingerprint is missing or stale"]
+    directory = feature_dir(root, feature_id)
+    try:
+        source = load_source_revision(directory, feature_id, graph["source_revision"])
+    except (OSError, ValueError, KeyError) as exc:
+        return [str(exc)]
+    return prototype_provenance_errors(root, directory, graph, source)
 
 
 def dependency_closure(
@@ -493,7 +508,8 @@ def lens_node_ids(graph: dict[str, Any], lens: str) -> set[str]:
 
 def lens_hash(graph: dict[str, Any], lens: str) -> str:
     payload: dict[str, Any] = {"lens": lens, **subgraph(graph, lens_node_ids(graph, lens))}
-    if lens == "product-contract":
+    payload["claims"] = [claim for claim in canonical_claims(graph) if claim.get("lens") == lens]
+    if lens == "PROVENANCE_INTEGRITY":
         payload["prototype"] = graph.get("prototype", {"status": "not_applicable"})
     return value_digest(payload)
 
@@ -545,7 +561,12 @@ def lens_components(graph: dict[str, Any], lens: str) -> list[dict[str, Any]]:
             ],
             **subgraph(graph, selected),
         }
-        if lens == "product-contract":
+        component_claims = [
+            claim for claim in canonical_claims(graph)
+            if claim.get("lens") == lens and set(claim.get("subjects", [])) & selected
+        ]
+        component_payload["claims"] = component_claims
+        if lens == "PROVENANCE_INTEGRITY":
             component_payload["prototype"] = graph.get("prototype", {"status": "not_applicable"})
             component_payload["source_revision"] = graph.get("source_revision")
         result.append({
@@ -554,6 +575,7 @@ def lens_components(graph: dict[str, Any], lens: str) -> list[dict[str, Any]]:
             "component_id": component_id,
             "root_node_ids": sorted(members),
             "node_ids": sorted(selected),
+            "claim_ids": sorted(claim["id"] for claim in component_claims),
             "lens_graph_issues": component_payload["lens_graph_issues"],
             "subgraph_sha256": value_digest(component_payload),
         })
@@ -614,6 +636,8 @@ def review_units(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
         "risk_vector": graph_risk_vector(graph),
         "component_topology": topology,
         "claim_synopsis": claim_synopsis,
+        "claims": canonical_claims(graph),
+        "claim_successions": canonical_claim_successions(graph),
         **subgraph(graph, selected),
     })
     units[GLOBAL_LENS] = {
@@ -622,6 +646,7 @@ def review_units(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
         "component_id": "global",
         "root_node_ids": sorted(selected),
         "node_ids": sorted(selected),
+        "claim_ids": sorted(claim["id"] for claim in graph.get("claims", [])),
         "component_topology": topology,
         "claim_synopsis": claim_synopsis,
         "subgraph_sha256": skeleton_hash,
@@ -642,9 +667,10 @@ def readiness(
         if isinstance(attestations.get(unit_id), dict)
         and attestations[unit_id].get("verdict") != "PASS"
     )
-    finding_counts = finding_summary(ledger) if ledger is not None else {"open_blockers": 0}
+    finding_counts = finding_summary(ledger) if ledger is not None else {"open_blockers": 0, "owner_decisions": 0}
     drift = source_status is not None and source_status.get("status") != "confirmed"
-    if drift:
+    prototype_blocked = bool(prototype_review_blockers(graph))
+    if drift or prototype_blocked or finding_counts["owner_decisions"]:
         status = "needs_decision"
     elif blocked or finding_counts["open_blockers"]:
         status = "blocked"
@@ -659,7 +685,9 @@ def readiness(
         "blocked_units": blocked,
         "global_skeleton_sha256": units[GLOBAL_LENS]["subgraph_sha256"],
         "source_drift": bool(drift),
+        "prototype_blocked": prototype_blocked,
         "open_blocking_findings": finding_counts["open_blockers"],
+        "open_owner_decision_findings": finding_counts["owner_decisions"],
     }
 
 
@@ -883,21 +911,8 @@ def formal_feature_commits(root: Path, feature_id: str) -> list[str]:
 
 
 def active_review_lenses(graph: dict[str, Any]) -> list[str]:
-    """Choose additive lenses from evidence, never from a UI/backend label."""
-    nodes = node_map(graph)
-    vector = graph_risk_vector(graph)
-    result = {"product-contract", "change-traceability", "proof-coverage"}
-    if (
-        any(node["type"] in {"Fact", "Owner", "Decision"} for node in nodes.values())
-        or "CONTRACT_DATA" in profiles_for(vector)
-    ):
-        result.add("fact-ownership")
-    if (
-        any(node["type"] in {"Boundary", "StateTransition", "Risk"} for node in nodes.values())
-        or "CRITICAL_DOMAIN" in profiles_for(vector)
-    ):
-        result.add("boundary-state-safety")
-    return sorted(result)
+    """Return the deliberately small generic schema-v12 risk-lens set."""
+    return sorted(CLAIM_LENSES)
 
 
 def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict[str, str]]:
@@ -918,7 +933,7 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
         ]
 
     enabled = set(active_review_lenses(graph)) if lens is None else {lens}
-    if "product-contract" in enabled:
+    if "PROVENANCE_INTEGRITY" in enabled:
         requirements = [n for n in nodes.values() if n["type"] == "Requirement"]
         acceptances = [n for n in nodes.values() if n["type"] == "Acceptance"]
         if not requirements:
@@ -935,7 +950,7 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
                 graph, source=node["id"], relation="derives_from"
             ):
                 add("PRODUCT_ORPHAN", node["id"], f"{node['type']} must derive_from an upstream product node")
-    if "fact-ownership" in enabled:
+    if "STATE_AND_ATOMICITY" in enabled:
         architecture_claims = [
             node for node in nodes.values()
             if node["type"] in {"Fact", "Boundary", "StateTransition", "Decision", "Risk"}
@@ -976,7 +991,7 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
                 upstream = dependency_closure(graph, {node["id"]}) - {node["id"]}
                 if not any(nodes.get(node_id, {}).get("type") in {"Requirement", "Behavior", "Acceptance", "Exception"} for node_id in upstream):
                     add("ARCH_PRODUCT_TRACE_MISSING", node["id"], "Decision must transitively derive from exact product truth")
-    if "boundary-state-safety" in enabled:
+    if "BOUNDARY_AND_CONCURRENCY" in enabled:
         for node in nodes.values():
             if node["type"] == "Boundary" and not _has_edge(graph, target=node["id"], relation="owns"):
                 add("BOUNDARY_MISSING_OWNER", node["id"], "Boundary requires exactly one explicit Owner")
@@ -992,7 +1007,7 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
             if node["type"] == "Risk" and node.get("attributes", {}).get("severity") in {"critical", "major"}:
                 if not _has_edge(graph, target=node["id"], relation="mitigates"):
                     add("RISK_UNMITIGATED", node["id"], "Critical/major Risk requires an explicit mitigation")
-    if "change-traceability" in enabled:
+    if "RUNTIME_AUTHENTICITY" in enabled:
         changes = [node for node in nodes.values() if node["type"] == "Change"]
         if not changes:
             add("IMPLEMENTATION_NO_CHANGE", "GRAPH", "Implementation subgraph requires at least one Change")
@@ -1009,8 +1024,115 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
                 add("SYMBOL_ORPHAN", node["id"], "Symbol must depend_on a Change")
             if node["type"] in {"Decision", "StateTransition"} and not typed_edges(target=node["id"], relation="changes", source_type="Change"):
                 add("ARCH_CHANGE_UNMAPPED", node["id"], f"{node['type']} requires an implementation Change")
-    if "proof-coverage" in enabled:
+    if "RUNTIME_AUTHENTICITY" in enabled:
         prototype_status = graph.get("prototype", {}).get("status")
+        claims = graph.get("claims", [])
+        if not claims:
+            add("CLAIM_SET_EMPTY", "GRAPH", "Delivery Graph requires explicit stable Claims")
+        for claim in claims:
+            if not claim.get("proof_ids"):
+                add(
+                    "CLAIM_PROOF_MISSING", claim.get("id", "GRAPH"),
+                    "Claim requires at least one bound Proof obligation",
+                    "critical" if claim.get("critical") is True else "major",
+                )
+                continue
+            bound_proofs = [nodes.get(proof_id, {}) for proof_id in claim["proof_ids"]]
+            covered_subjects: set[str] = set()
+            for proof in bound_proofs:
+                covered_subjects.update(dependency_closure(graph, {proof.get("id")}))
+                covered_subjects.update(
+                    edge["source"] for edge in graph.get("edges", [])
+                    if edge.get("target") == proof.get("id") and edge.get("type") == "proves"
+                    and nodes.get(edge.get("source"), {}).get("type") == "Assertion"
+                )
+            meaningful_subjects = {
+                subject for subject in claim.get("subjects", [])
+                if nodes.get(subject, {}).get("type") not in {"Proof", "Assertion", "Environment"}
+            }
+            missing_subjects = sorted(set(claim.get("subjects", [])) - covered_subjects)
+            if not meaningful_subjects or missing_subjects:
+                add(
+                    "CLAIM_PROOF_TRACE_MISMATCH", claim["id"],
+                    "Claim requires business subjects fully covered by its Proof dependency path"
+                    + (": " + ", ".join(missing_subjects) if missing_subjects else ""), "critical",
+                )
+            allowed_critical_types = {
+                "PROVENANCE_INTEGRITY": {"artifact", "boundary", "invariant", "runtime", "visual"},
+                "STATE_AND_ATOMICITY": {"invariant", "runtime"},
+                "BOUNDARY_AND_CONCURRENCY": {"invariant", "runtime"},
+                "RUNTIME_AUTHENTICITY": {"invariant", "runtime", "visual"},
+            }
+            if claim.get("critical") is True and any(
+                proof.get("attributes", {}).get("proof_type") not in allowed_critical_types.get(claim.get("lens"), set())
+                for proof in bound_proofs
+            ):
+                add(
+                    "CLAIM_PROOF_STRENGTH_MISMATCH", claim["id"],
+                    "Critical Claim is bound to a Proof type too weak for its lens", "critical",
+                )
+            for proof in bound_proofs:
+                assertion_nodes = [
+                    nodes.get(edge.get("source"), {}) for edge in graph.get("edges", [])
+                    if edge.get("target") == proof.get("id") and edge.get("type") == "proves"
+                    and nodes.get(edge.get("source"), {}).get("type") == "Assertion"
+                ]
+                assertion_sources = {
+                    assertion.get("attributes", {}).get("oracle", {}).get("source")
+                    for assertion in assertion_nodes
+                }
+                if proof.get("attributes", {}).get("proof_type") in {"runtime", "invariant", "visual"} and not any(
+                    isinstance(source, str) and source.startswith("/observation/")
+                    and source not in {"/observation/challenge_nonce", "/observation/target_identity"}
+                    for source in assertion_sources
+                ):
+                    add(
+                        "CLAIM_MEASUREMENT_ASSERTION_MISSING", claim["id"],
+                        f"High-strength Proof {proof.get('id')} requires an assertion over a measured/read-back observation", "critical",
+                    )
+                if claim.get("critical") is True:
+                    asserted_subjects = {
+                        subject for assertion in assertion_nodes
+                        for subject in assertion.get("attributes", {}).get("subject_ids", [])
+                    }
+                    missing_asserted = sorted(meaningful_subjects - asserted_subjects)
+                    if missing_asserted:
+                        add(
+                            "CLAIM_ASSERTION_SUBJECT_MISMATCH", claim["id"],
+                            "Critical Claim subjects require explicit Assertion coverage: " + ", ".join(missing_asserted),
+                            "critical",
+                        )
+                    if claim.get("lens") in {"STATE_AND_ATOMICITY", "BOUNDARY_AND_CONCURRENCY"} and not any(
+                        assertion.get("attributes", {}).get("oracle", {}).get("kind") in {"state", "side_effect"}
+                        for assertion in assertion_nodes
+                    ):
+                        add(
+                            "CLAIM_READBACK_ASSERTION_MISSING", claim["id"],
+                            "Critical state/boundary Claim requires authoritative state or side-effect readback", "critical",
+                        )
+                    if claim.get("lens") in {"STATE_AND_ATOMICITY", "BOUNDARY_AND_CONCURRENCY"}:
+                        subject_assertions = {
+                            subject: [
+                                assertion for assertion in assertion_nodes
+                                if assertion.get("attributes", {}).get("subject_ids") == [subject]
+                                and assertion.get("attributes", {}).get("oracle", {}).get("kind") in {"state", "side_effect"}
+                            ]
+                            for subject in meaningful_subjects
+                        }
+                        invalid_bindings = sorted(
+                            subject for subject, bindings in subject_assertions.items() if len(bindings) != 1
+                        )
+                        measurement_sources = [
+                            bindings[0].get("attributes", {}).get("oracle", {}).get("source")
+                            for bindings in subject_assertions.values() if len(bindings) == 1
+                        ]
+                        if invalid_bindings or len(measurement_sources) != len(set(measurement_sources)):
+                            add(
+                                "CLAIM_SUBJECT_MEASUREMENT_BINDING_INVALID", claim["id"],
+                                "Critical state/boundary Claim requires one unique authoritative measurement Assertion per subject"
+                                + (": " + ", ".join(invalid_bindings) if invalid_bindings else ""),
+                                "critical",
+                            )
         if prototype_status == "contractual":
             product_nodes = [node for node in nodes.values() if node["type"] in {"Acceptance", "Exception"}]
             applicable = {
@@ -1091,7 +1213,9 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
                 proof_type = attrs.get("proof_type")
                 adapter = attrs.get("runner", {}).get("observation_adapter") if isinstance(attrs.get("runner"), dict) else None
                 environment = nodes.get(environment_edges[0]["target"], {}) if len(environment_edges) == 1 else {}
-                runtime = environment.get("attributes", {}).get("spec", {}).get("runtime") if isinstance(environment.get("attributes"), dict) else None
+                environment_attributes = environment.get("attributes")
+                environment_spec = environment_attributes.get("spec") if isinstance(environment_attributes, dict) else None
+                runtime = environment_spec.get("runtime") if isinstance(environment_spec, dict) else None
                 assertion_nodes = [nodes[edge["source"]] for edge in assertions if edge.get("source") in nodes]
                 sources = {item.get("attributes", {}).get("oracle", {}).get("source") for item in assertion_nodes}
                 if proof_type == "visual":
@@ -1178,7 +1302,8 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
                     if "CONCURRENCY" in axes and any("sequential" in test["statement"].lower() for test in tests):
                         add("SEQUENTIAL_CONCURRENCY_MISMATCH", node["id"], "Sequential Test cannot claim concurrency safety", "critical")
             elif node["type"] == "Assertion":
-                oracle = node.get("attributes", {}).get("oracle")
+                assertion_attributes = node.get("attributes", {})
+                oracle = assertion_attributes.get("oracle")
                 if not isinstance(oracle, dict) or not all(k in oracle for k in ("kind", "source", "operator")):
                     add("ASSERTION_ORACLE_INVALID", node["id"], "Assertion requires a structured oracle")
                 elif (
@@ -1191,6 +1316,13 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
                     add("ASSERTION_ORACLE_INVALID", node["id"], "Assertion oracle kind/source/operator/expected is invalid", "critical")
                 if len(typed_edges(source=node["id"], relation="proves")) != 1:
                     add("ASSERTION_TARGET_INVALID", node["id"], "Assertion must prove exactly one Proof")
+                subject_ids = assertion_attributes.get("subject_ids")
+                if (
+                    not isinstance(subject_ids, list) or not subject_ids
+                    or subject_ids != sorted(set(subject_ids))
+                    or any(subject not in nodes or nodes[subject]["type"] in {"Proof", "Assertion", "Environment"} for subject in subject_ids)
+                ):
+                    add("ASSERTION_SUBJECTS_INVALID", node["id"], "Assertion requires sorted explicit business subject_ids", "critical")
     return sorted(issues, key=lambda item: (item["severity"], item["code"], item["node_id"]))
 
 
@@ -1282,11 +1414,16 @@ def generate_proof_contract(graph: dict[str, Any]) -> dict[str, Any]:
                 "id": assertion_id,
                 "description": assertion["statement"],
                 "oracle": assertion_attrs.get("oracle"),
+                "subject_ids": assertion_attrs.get("subject_ids", []),
             })
         product_ids = sorted(target for target in targets if nodes.get(target, {}).get("type") in {"Acceptance", "Exception"})
         trace_ids = sorted(target for target in targets if target not in product_ids)
         obligations.append({
             "id": node["id"],
+            "claim_ids": sorted(
+                claim["id"] for claim in graph.get("claims", [])
+                if node["id"] in claim.get("proof_ids", [])
+            ),
             "product_ids": product_ids,
             "trace_ids": trace_ids,
             "proof_type": attrs.get("proof_type"),
@@ -1303,6 +1440,7 @@ def generate_proof_contract(graph: dict[str, Any]) -> dict[str, Any]:
         "feature_id": graph["feature_id"],
         "graph_sha256": graph_digest(graph),
         "subgraph_sha256": stage_hash(graph, "implementation_proof"),
+        "claims": canonical_claims(graph),
         "environments": environments,
         "obligations": obligations,
     }
@@ -1353,6 +1491,8 @@ def compile_graph(
     except (OSError, ValueError) as exc:
         errors.append(str(exc))
         source_status, source_revision = {"status": "drift", "pending_ids": []}, {"risk_vector": {}}
+    if source_revision.get("attachments") is not None:
+        errors.extend(target_attestation_provenance_errors(graph, source_revision))
     if errors:
         raise ValueError("; ".join(errors))
     state_path = directory / "state.json"
@@ -1360,12 +1500,13 @@ def compile_graph(
     lock = confined_project_path(root, Path(".dlv") / "runs" / feature_id / ".feature.lock", "feature lock")
     lock_context = nullcontext() if _lock_held else exclusive_file_lock(lock)
     with lock_context:
+        if not _lock_held:
+            recover_review_transaction(root, feature_id)
         if file_digest(source_path) != source_sha256:
             raise ValueError("Delivery Graph changed before compilation acquired the feature lock; rerun")
         previous = load_state(state_path)
         ledger = load_ledger(root, feature_id)
-        if not check and not ledger_path_exists(root, feature_id):
-            write_ledger(root, feature_id, ledger)
+        ledger_needs_write = not ledger_path_exists(root, feature_id)
         units = review_units(graph)
         attestations = {
             unit_id: summary for unit_id, summary in previous.get("attestations", {}).items()
@@ -1416,27 +1557,71 @@ def compile_graph(
             verification = {"status": "pending", "active_run_id": None, "run_digest": None, "verdict": None, "finalization": None}
         if formal_feature_commits(root, feature_id) and code.get("status") == "pending":
             code = {"status": "needs_reconcile", "repository_fingerprint": None}
-        previous_convergence = previous.get("convergence", {}) if isinstance(previous.get("convergence"), dict) else {}
-        if (
-            previous.get("graph_sha256") == graph_digest(graph)
-            and previous.get("readiness") == delivery_readiness
-            and set(previous_convergence) == {"status", "ready_distance", "reason"}
-        ):
-            convergence = previous_convergence
+        vector = convergence_vector(graph, delivery_readiness, ledger)
+        campaigns = ledger.get("campaigns", [])
+        budget = review_budget(graph)
+        used = {
+            "campaigns": len(campaigns),
+            "unit_reviews": sum(item.get("unit_count", 0) for item in campaigns if isinstance(item, dict)),
+            "new_findings": sum(item.get("new_findings", 0) for item in campaigns if isinstance(item, dict)),
+        }
+        exhausted = (
+            used["campaigns"] >= budget["max_campaigns"]
+            or used["unit_reviews"] >= budget["max_unit_reviews"]
+            or used["new_findings"] >= budget["max_new_findings"]
+        ) and delivery_readiness["status"] != "ready"
+        convergence_state_key = value_digest({
+            "graph_sha256": graph_digest(graph), "readiness": delivery_readiness,
+            "vector": vector, "used": used,
+        })
+        appended_event = append_convergence_event(ledger, convergence_state_key, vector, source_revision)
+        ledger_needs_write = ledger_needs_write or appended_event
+        ledger_content = json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ledger_sha256 = hashlib.sha256(ledger_content.encode("utf-8")).hexdigest()
+        events = ledger["convergence_events"]
+        if appended_event:
+            previous_event = events[-2] if len(events) >= 2 else None
         else:
-            if delivery_readiness["status"] == "ready":
-                convergence_status, convergence_reason = "READY", "all required review and finding obligations are closed"
-            elif delivery_readiness["source_drift"]:
-                convergence_status, convergence_reason = "NEEDS_DECISION", "a captured source revision awaits Owner confirmation"
-            elif previous_convergence.get("ready_distance") == (len(delivery_readiness["missing_units"]) + len(delivery_readiness["blocked_units"]) + delivery_readiness["open_blocking_findings"]):
-                convergence_status, convergence_reason = "STABLE_BLOCKED", "remaining obligations did not decrease"
-            else:
-                convergence_status, convergence_reason = "CONVERGING", "remaining obligations changed"
-            convergence = {
-                "status": convergence_status,
-                "ready_distance": len(delivery_readiness["missing_units"]) + len(delivery_readiness["blocked_units"]) + delivery_readiness["open_blocking_findings"],
-                "reason": convergence_reason,
-            }
+            previous_event = events[-1] if events else None
+        prior_vector = previous_event["vector"] if previous_event else None
+        distinct_history: list[list[int]] = []
+        for event in ledger["convergence_events"]:
+            if not distinct_history or distinct_history[-1] != event["vector"]:
+                distinct_history.append(event["vector"])
+        history = distinct_history[-3:]
+
+        def monitored_metrics(item: list[int]) -> tuple[int, int, int]:
+            return (sum(item[:-1]), item[0] + item[3], item[6])
+
+        consecutive_growth = False
+        if len(history) == 3:
+            first, second, third = (monitored_metrics(item) for item in history)
+            consecutive_growth = any(first[index] < second[index] < third[index] for index in range(len(first)))
+        if delivery_readiness["status"] == "ready":
+            convergence_status, convergence_reason = "READY", "all required review and finding obligations are closed"
+        elif (
+            delivery_readiness["source_drift"]
+            or delivery_readiness["prototype_blocked"]
+            or delivery_readiness["open_owner_decision_findings"]
+            or exhausted
+        ):
+            convergence_status, convergence_reason = "NEEDS_DECISION", "source/prototype/finding decision or review budget is required"
+        elif campaigns and consecutive_growth:
+            convergence_status, convergence_reason = "DIVERGING", "a monitored obligation increased across two consecutive transitions"
+        elif isinstance(prior_vector, list) and vector == prior_vector:
+            convergence_status, convergence_reason = "STABLE_BLOCKED", "the lexicographic obligation vector did not decrease"
+        else:
+            convergence_status, convergence_reason = "CONVERGING", "the lexicographic obligation vector decreased or established a baseline"
+        convergence = {
+            "status": convergence_status, "vector": vector,
+            "previous_vector": prior_vector if isinstance(prior_vector, list) else None,
+            "ready_distance": sum(vector[:-1]), "history": history,
+            "budget": budget, "used": used, "reason": convergence_reason,
+        }
+        if check and not appended_event and isinstance(previous.get("convergence"), dict):
+            # --check is observational: verify the last compiled result rather
+            # than manufacturing a second no-progress observation.
+            convergence = copy.deepcopy(previous["convergence"])
         execution = previous.get("execution") if isinstance(previous.get("execution"), dict) else None
         if not isinstance(execution, dict) or set(execution) != {"status", "checkpoint", "reason"}:
             execution = {"status": "idle", "checkpoint": "compile", "reason": None}
@@ -1452,7 +1637,7 @@ def compile_graph(
             "risk": risk,
             "finding_ledger": {
                 "record_path": f".dlv/findings/{feature_id}/ledger.json",
-                "sha256": file_digest(root / f".dlv/findings/{feature_id}/ledger.json") if ledger_path_exists(root, feature_id) else None,
+                "sha256": ledger_sha256,
                 "summary": finding_summary(ledger),
             },
             "convergence": convergence,
@@ -1468,6 +1653,7 @@ def compile_graph(
             "last_compiled_at": previous.get("last_compiled_at") if check else timestamp(),
         }
         outputs = {
+            **({root / f".dlv/findings/{feature_id}/ledger.json": ledger_content} if ledger_needs_write else {}),
             directory / "prd.md": render_stage_document(graph, "product"),
             directory / "architecture-design.md": render_stage_document(graph, "architecture"),
             directory / "code-spec.md": render_stage_document(graph, "implementation_proof"),
