@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Conservatively migrate schema-v11 delivery truth to schema v12.
+"""Conservatively import schema-v11 delivery truth into current schema v13.
 
 Source Revision and graph semantics are preserved. Mutable v11 reviews,
 findings, Proof Contracts, and Verification runs are archived and never
@@ -52,7 +52,8 @@ def migrated_graph(v11: dict[str, Any]) -> dict[str, Any]:
     if v11.get("schema_version") != 11:
         raise ValueError("delivery-graph.json must be schema v11")
     graph = copy.deepcopy(v11)
-    graph["schema_version"] = 12
+    graph["schema_version"] = 13
+    graph["product_lock"] = None
     graph["claim_successions"] = []
     lens_types = {
         "PROVENANCE_INTEGRITY": {"Requirement", "Behavior", "Acceptance", "Exception", "Persona"},
@@ -61,19 +62,26 @@ def migrated_graph(v11: dict[str, Any]) -> dict[str, Any]:
         "RUNTIME_AUTHENTICITY": {"Test", "Environment", "Proof", "Assertion", "Acceptance", "Exception"},
     }
     graph["claims"] = [claim for lens in CLAIM_LENSES if (claim := _claim_for(graph, lens, lens_types[lens]))]
-    prototype = graph.get("prototype")
-    if isinstance(prototype, dict) and prototype.get("status") in {"reference", "contractual"}:
-        graph["prototype"] = {
-            "status": "generated_candidate",
+    prototype = graph.pop("prototype", None)
+    if isinstance(prototype, dict) and prototype.get("status") in {"generated_candidate", "reference", "contractual"}:
+        graph["delivery_prototype"] = {
+            "status": "generated",
             "path": "prototype.html",
             "sha256": prototype.get("sha256"),
             "generated_from_revision": graph.get("source_revision"),
             "generator": "v11-migration-unverified-provenance",
         }
+    else:
+        graph["delivery_prototype"] = {
+            "status": "not_applicable", "reason": "Migrated v11 delivery had no UI contract.",
+        }
+    for node in graph.get("nodes", []):
+        if isinstance(node, dict) and node.get("type") in {"Requirement", "Behavior", "Acceptance", "Exception"}:
+            node["origins"] = [{"kind": "direct", "source_ref": graph["source_revision"]}]
     metadata = graph.setdefault("metadata", {})
     metadata["review_budget"] = review_budget({"metadata": {}})
     metadata["delivery_mode"] = "standard"
-    metadata["upgrade"] = {"from_schema": 11, "completion_claims_promoted": False}
+    metadata["upgrade"] = {"from_schema": 11, "completion_claims_promoted": False, "product_lock_promoted": False}
     return graph
 
 
@@ -414,13 +422,14 @@ def _apply_archived_migration(root: Path, feature_id: str, directory: Path, arch
         source = load_json(path)
         if source.get("schema_version") != 11:
             raise ValueError(f"Source Revision is not schema v11: {path.name}")
-        source["schema_version"] = 12
+        source["schema_version"] = 13
+        source["decisions"] = []
         if not any(item.get("kind") == "convergence_authority" for item in source.get("attachments", [])):
             source["attachments"] = [
                 *source.get("attachments", []),
                 _source_convergence_attachment(directory, feature_id),
             ]
-            source["source_digest"] = value_digest(canonical_source_payload(source))
+        source["source_digest"] = value_digest(canonical_source_payload(source))
         atomic_write_json(directory / "source-revisions" / path.name, source)
     for name in MUTABLE_FEATURE_FILES:
         (directory / name).unlink(missing_ok=True)
@@ -455,8 +464,8 @@ def upgrade(root: Path, feature_id: str, *, apply: bool) -> dict[str, Any]:
                 current_sources = directory / "source-revisions"
                 source_versions = [load_json(path).get("schema_version") for path in current_sources.glob("SRC-*.json")]
                 state = load_json(directory / "state.json") if (directory / "state.json").is_file() else {}
-                if graph.get("schema_version") == 12 and source_versions and all(version == 12 for version in source_versions) and state.get("schema_version") == 12:
-                    raise ValueError("feature is already upgraded to schema v12")
+                if graph.get("schema_version") == 13 and source_versions and all(version == 13 for version in source_versions) and state.get("schema_version") == 13:
+                    raise ValueError("feature is already upgraded to schema v13")
                 if graph.get("schema_version") == 11:
                     current_feature = _tree_file_identity(directory, excluded_roots={"archive-v11"})
                     archived_feature = _tree_file_identity(snapshot, excluded_roots={"manifest.json", "mutable-records"})
@@ -468,9 +477,9 @@ def upgrade(root: Path, feature_id: str, *, apply: bool) -> dict[str, Any]:
                     )
                     if graph != archived_graph or current_feature != archived_feature or not mutable_matches:
                         raise ValueError("current v11 source diverged from the promoted archive; refusing destructive recovery")
-                elif graph.get("schema_version") == 12:
+                elif graph.get("schema_version") == 13:
                     raise ValueError(
-                        "partial schema-v12 recovery is not automatic; preserve current files and use a future versioned recovery"
+                        "partial schema-v13 recovery is not automatic; preserve current files and use a future versioned recovery"
                     )
                 else:
                     raise ValueError("current migration state has an unsupported schema")

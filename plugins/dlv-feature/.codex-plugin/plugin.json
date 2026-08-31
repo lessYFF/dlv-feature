@@ -1,6 +1,6 @@
 {
   "name": "dlv-feature",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "A convergent, risk-routed, proof-carrying feature delivery workflow for Codex.",
   "author": {
     "name": "lessYFF",
@@ -13,13 +13,13 @@
   "interface": {
     "displayName": "DLV Feature",
     "shortDescription": "Deliver features with evidence-backed gates.",
-    "longDescription": "Guides a feature through a schema-v12 Delivery Graph with source-bound prototypes, stable Claims and Findings, budgeted convergence, repository adapters, authentic target-runtime Proof, and deterministic finalization.",
+    "longDescription": "Guides a feature through a schema-v13 Delivery Graph with independent Product Alignment, content-addressed Product Locks, stable Claims and Findings, authentic target-runtime Proof, and deterministic finalization.",
     "developerName": "lessYFF",
     "category": "Productivity",
-    "capabilities": ["Prototype provenance", "Stable Claim contracts", "Semantic Finding convergence", "Divergence and Review budgets", "Repository adapters", "Frontend fast path", "Target-runtime authenticity", "Pixel-level UI comparison", "Deterministic recovery"],
+    "capabilities": ["Product Alignment", "Content-addressed Product Lock", "Origin traceability", "Stable Claim contracts", "Semantic Finding convergence", "Repository adapters", "Frontend fast path", "Target-runtime authenticity", "Pixel-level UI comparison", "Deterministic recovery"],
     "websiteURL": "https://github.com/lessYFF/dlv-feature",
     "defaultPrompt": [
-      "Use $dlv-feature to deliver this feature with schema-v12 source provenance, stable Claims and Findings, budgeted risk review, repository-adapter checks, authentic target-runtime Proof, and deterministic finalization."
+      "Use $dlv-feature to deliver this feature with schema-v13 Product Alignment, a sealed Product Lock, stable Claims and Findings, authentic target-runtime Proof, and deterministic finalization."
     ]
   }
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Schema-v12 Delivery Graph regression, mutation, and security tests."""
+"""Schema-v13 Delivery Graph regression, mutation, and security tests."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import base64
 import hashlib
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -25,6 +26,7 @@ SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
 
 import delivery_graph
+import delivery_manifest
 import delivery_contracts
 import delivery_governance
 import delivery_proof
@@ -39,6 +41,10 @@ import upgrade_v9_to_v10
 import upgrade_v10_to_v11
 import upgrade_v11_to_v12
 import scope_revision
+import product_alignment
+import product_lock
+import seal_product_lock
+import upgrade_v12_to_v13
 import finding_ledger
 import frontend_fast_path
 import repository_adapter
@@ -103,12 +109,18 @@ def bind_test_attestation_source(root: Path, feature_id: str = "cross-domain-fea
             "attachments": [
                 item for item in source["attachments"] if item.get("kind") != "convergence_authority"
             ] + [test_attestation_attachment()],
+            "decisions": source.get("decisions", []),
             "risk_vector": source["risk_vector"],
         },
         owner="test",
         status="confirmed",
     )
+    previous_revision = graph["source_revision"]
     graph["source_revision"] = revision_id
+    for item in graph.get("nodes", []):
+        for origin in item.get("origins", []):
+            if origin.get("kind") == "direct" and origin.get("source_ref") == previous_revision:
+                origin["source_ref"] = revision_id
     write_json(graph_path, graph)
 
 
@@ -134,6 +146,8 @@ def sign_target_observation(observation: dict[str, object], spec: dict[str, obje
 
 def node(node_id: str, node_type: str, title: str, statement: str, **attributes: object) -> dict:
     value = {"id": node_id, "type": node_type, "title": title, "statement": statement}
+    if node_type in {"Requirement", "Behavior", "Acceptance", "Exception"}:
+        value["origins"] = [{"kind": "direct", "source_ref": "SRC-001"}]
     if attributes:
         value["attributes"] = attributes
     return value
@@ -367,11 +381,37 @@ class GraphTestCase(unittest.TestCase):
         write_json(directory / "delivery-graph.json", graph)
         return temporary, root
 
+    def product_alignment_review(
+        self, root: Path, entries: list[dict[str, object]], feature_id: str = "cross-domain-feature",
+    ) -> Path:
+        root = root.resolve()
+        graph = delivery_graph.load_graph(root, feature_id)
+        source = delivery_governance.load_source_revision(
+            root / "delivery" / feature_id, feature_id, graph["source_revision"],
+        )
+        source_entries = [
+            {
+                "source_ref": anchor, "result": "PRESERVED",
+                "node_ids": product_lock.source_anchor_node_ids(graph, source, anchor),
+                "evidence": "source anchor mapped", "reason": None, "owner_question": None,
+            }
+            for anchor in product_lock.source_anchor_refs(source)
+        ]
+
+        def completed(argv: list[str], *_args: object, **_kwargs: object) -> dict[str, object]:
+            result_path = Path(argv[argv.index("--output-last-message") + 1])
+            write_json(result_path, {"entries": entries, "source_entries": source_entries})
+            return {"exit_code": 0, "timed_out": False, "stdout": '{"type":"product.alignment"}\n', "stderr": ""}
+
+        with patch.object(product_alignment, "prepare_isolated_codex_executable", return_value="codex"), patch.object(
+            product_alignment, "run_bounded", side_effect=completed,
+        ):
+            return product_alignment.review(root, feature_id)
+
     def review_all(
         self, root: Path, feature_id: str = "cross-domain-feature", run_id: str = "readiness-01",
     ) -> None:
-        if graph_validation.validate(root, feature_id):
-            delivery_graph.compile_graph(root, feature_id)
+        self.seal_product(root, feature_id)
         with patch.object(graph_review, "run_bounded", side_effect=self.fake_semantic_run):
             graph_review.run_isolated_readiness_review(root, feature_id, run_id)
         subprocess.run(["git", "add", "-A"], cwd=root, check=True)
@@ -382,6 +422,20 @@ class GraphTestCase(unittest.TestCase):
             ],
             cwd=root, check=True,
         )
+
+    def seal_product(self, root: Path, feature_id: str = "cross-domain-feature") -> None:
+        delivery_graph.compile_graph(root, feature_id)
+        graph = delivery_graph.load_graph(root, feature_id)
+        if not product_lock.live_product_lock_errors(root.resolve(), feature_id, graph):
+            return
+        entries = [
+            {"node_id": item["id"], "result": "PRESERVED", "evidence": "test source mapping", "reason": None, "owner_question": None}
+            for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+        ]
+        result = root / ".dlv/test-product-alignment.json"
+        write_json(result, {"entries": entries})
+        alignment = self.product_alignment_review(root, entries, feature_id)
+        seal_product_lock.seal(root, feature_id, alignment)
 
     @staticmethod
     def unit_id(graph: dict[str, object], lens: str) -> str:
@@ -429,11 +483,10 @@ class GraphTestCase(unittest.TestCase):
         else:
             bind_test_attestation_source(root, feature_id)
         source = json.loads(source_path.read_text())
-        graph["prototype"] = {
-            "status": "contractual", "path": "prototype.html",
+        graph["delivery_prototype"] = {
+            "status": "generated", "path": "prototype.html",
             "sha256": hashlib.sha256(prototype.read_bytes()).hexdigest(),
-            "source_revision": "SRC-001", "source_kind": "source_revision",
-            "source_ref": "SRC-001", "source_sha256": source["source_digest"],
+            "generated_from_revision": graph["source_revision"], "generator": "test-generator",
         }
         for item in graph["nodes"]:
             if item["type"] in {"Acceptance", "Exception"}:
@@ -497,7 +550,7 @@ class GraphTestCase(unittest.TestCase):
             observation = {
                 "anchor_paths": {role: str(path) for role, path in paths.items()},
                 "anchor_sha256": {role: delivery_graph.file_digest(path) for role, path in paths.items()},
-                "prototype_sha256": graph["prototype"]["sha256"],
+                "prototype_sha256": graph["delivery_prototype"]["sha256"],
                 "capture_profile": profile,
                 "pixel_diff_ratio": 0.0,
                 "geometry_diff_max": 0,
@@ -960,7 +1013,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             write_json(directory / "state.json", {"schema_version": 10})
             upgrade_v10_to_v11.upgrade(root, "legacy-v10", apply=True)
             migrated = json.loads((directory / "delivery-graph.json").read_text())
-            self.assertEqual((12, "SRC-001"), (migrated["schema_version"], migrated["source_revision"]))
+            self.assertEqual((13, "SRC-001"), (migrated["schema_version"], migrated["source_revision"]))
             self.assertTrue((root / ".dlv/upgrades/legacy-v10/schema-v10-archive/delivery-graph.json").is_file())
             self.assertEqual({}, delivery_graph.load_state(directory / "state.json")["attestations"])
 
@@ -986,7 +1039,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertEqual(original_state, (directory / "state.json").read_bytes())
             self.assertFalse((directory / "source-revisions/SRC-001.json").exists())
             upgrade_v10_to_v11.upgrade(root, "legacy-v10", apply=True)
-            self.assertEqual(12, delivery_graph.load_graph(root, "legacy-v10")["schema_version"])
+            self.assertEqual(13, delivery_graph.load_graph(root, "legacy-v10")["schema_version"])
 
     def test_v10_compatibility_import_rejects_partial_states_and_preserves_owner_edits(self) -> None:
         for stage in ("source-written", "graph-written"):
@@ -1122,7 +1175,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
         value = copy.deepcopy(graph); value["edges"][0]["type"] = "unknown"; mutations.append(value)
         value = copy.deepcopy(graph); value["edges"][0] = edge("REQ-001", "owns", "BHV-001"); mutations.append(value)
         value = copy.deepcopy(graph); value["edges"].append(copy.deepcopy(value["edges"][0])); mutations.append(value)
-        value = copy.deepcopy(graph); value["prototype"] = {"status": "maybe"}; mutations.append(value)
+        value = copy.deepcopy(graph); value["delivery_prototype"] = {"status": "maybe"}; mutations.append(value)
         value = copy.deepcopy(graph); value["unknown"] = True; mutations.append(value)
         self.assertTrue(all(delivery_graph.structural_errors(value) for value in mutations))
 
@@ -1161,7 +1214,10 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
 
     def test_completed_prototype_requires_canonical_zero_difference_visual_proof(self) -> None:
         graph = valid_graph()
-        graph["prototype"] = {"status": "contractual", "path": "prototype.html", "sha256": "0" * 64}
+        graph["delivery_prototype"] = {
+            "status": "generated", "path": "prototype.html", "sha256": "0" * 64,
+            "generated_from_revision": "SRC-001", "generator": "test-generator",
+        }
         codes = {item["code"] for item in delivery_graph.semantic_issues(graph, "RUNTIME_AUTHENTICITY")}
         self.assertIn("PROTOTYPE_VISUAL_PROOF_MISSING", codes)
 
@@ -1214,7 +1270,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
     def test_deterministic_only_debug_reviews_cannot_seal_without_semantic_attestation(self) -> None:
         temporary, root = self.make_root()
         with temporary:
-            delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.seal_product(root)
             graph_review.record_readiness(root, "cross-domain-feature", "readiness-debug")
             with self.assertRaisesRegex(ValueError, "independent semantic attestation"):
                 graph_contract.seal_contract(root, "cross-domain-feature")
@@ -1232,7 +1288,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             graph = valid_graph()
             graph["edges"] = [e for e in graph["edges"] if e["type"] != "guards"]
             write_json(root / "delivery/cross-domain-feature/delivery-graph.json", graph)
-            delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.seal_product(root)
             graph_review.record_readiness(root, "cross-domain-feature", "readiness-bad")
             state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
             self.assertEqual("blocked", state["readiness"]["status"])
@@ -1274,6 +1330,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             ])
             write_json(path, graph)
             self.review_all(root)
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
             before = delivery_graph.load_state(path.parent / "state.json")
             units = delivery_graph.review_units(graph)
             changed_unit = next(unit_id for unit_id, unit in units.items() if "SYM-002" in unit["root_node_ids"])
@@ -1385,11 +1442,10 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             prototype.write_text("<main>version one</main>", encoding="utf-8")
             graph_path = directory / "delivery-graph.json"
             graph = json.loads(graph_path.read_text())
-            graph["prototype"] = {
-                "status": "contractual", "path": "prototype.html",
+            graph["delivery_prototype"] = {
+                "status": "generated", "path": "prototype.html",
                 "sha256": delivery_graph.file_digest(prototype),
-                "source_revision": "SRC-001", "source_kind": "source_revision",
-                "source_ref": "SRC-001", "source_sha256": json.loads((directory / "source-revisions/SRC-001.json").read_text())["source_digest"],
+                "generated_from_revision": "SRC-001", "generator": "test-generator",
             }
             write_json(graph_path, graph)
             self.review_all(root)
@@ -1398,7 +1454,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             prototype.write_text("<main>version two</main>", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "Prototype fingerprint"):
                 delivery_graph.compile_graph(root, "cross-domain-feature")
-            graph["prototype"]["sha256"] = delivery_graph.file_digest(prototype)
+            graph["delivery_prototype"]["sha256"] = delivery_graph.file_digest(prototype)
             write_json(graph_path, graph)
             delivery_graph.compile_graph(root, "cross-domain-feature")
             state = delivery_graph.load_state(directory / "state.json")
@@ -1538,7 +1594,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
     def test_isolated_semantic_lens_binds_immutable_transcript(self) -> None:
         temporary, root = self.make_root()
         with temporary:
-            delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.seal_product(root)
 
             def fake_run(argv: list[str], *args: object, **kwargs: object) -> dict[str, object]:
                 self.assertIn("--skip-git-repo-check", argv)
@@ -1601,7 +1657,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
     def test_review_transaction_restores_ledger_state_and_records_on_failure(self) -> None:
         temporary, root = self.make_root()
         with temporary:
-            delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.seal_product(root)
             ledger_path = root / ".dlv/findings/cross-domain-feature/ledger.json"
             state_path = root / "delivery/cross-domain-feature/state.json"
             before_ledger = ledger_path.read_bytes()
@@ -1623,7 +1679,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
     def test_compile_recovers_interrupted_review_transaction_and_run_id_is_retriable(self) -> None:
         temporary, root = self.make_root()
         with temporary:
-            delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.seal_product(root)
             feature_id = "cross-domain-feature"
             run_id = "crash-recovery-review"
             ledger_path = root / f".dlv/findings/{feature_id}/ledger.json"
@@ -1778,6 +1834,14 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertEqual(("PASS", []), (verdict, errors))
             graph_finalize.finalize(root, "cross-domain-feature")
             self.assertEqual([], graph_validation.validate(root, "cross-domain-feature", final=True))
+            manifest = json.loads((root / "delivery/cross-domain-feature/delivery-manifest.json").read_text())
+            self.assertEqual(13, manifest["schema_version"])
+            self.assertEqual(manifest["tree_digest"], delivery_proof.value_digest({
+                "schema_version": 13, "feature_id": "cross-domain-feature", "files": manifest["files"],
+            }))
+            manifest_paths = {item["path"] for item in manifest["files"]}
+            self.assertTrue(any(path.startswith(".dlv/product-alignments/cross-domain-feature/ALN-") for path in manifest_paths))
+            self.assertTrue(any(path.endswith(".transcript.jsonl") and path.startswith(".dlv/product-alignments/") for path in manifest_paths))
             self.assertTrue((destination / "evidence.jsonl").is_file())
 
     def test_nonzero_runner_cannot_pass_on_valid_stdout_without_exit_contract(self) -> None:
@@ -2858,12 +2922,12 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             before = {item.name: item.read_bytes() for item in directory.iterdir()}
             graph = upgrade_v9_to_v10.convert(root, "legacy-feature")
             self.assertEqual(before, {item.name: item.read_bytes() for item in directory.iterdir()})
-            self.assertEqual(12, graph["schema_version"])
+            self.assertEqual(13, graph["schema_version"])
             upgrade_v9_to_v10.apply_upgrade(root, "legacy-feature")
             self.assertFalse((directory / "state.md").exists())
             state = delivery_graph.load_state(directory / "state.json")
             self.assertEqual({}, state["attestations"])
-            self.assertEqual("pending", state["readiness"]["status"])
+            self.assertEqual("needs_decision", state["readiness"]["status"])
             self.assertEqual("draft", state["proof_contract"]["status"])
             self.assertEqual("pending", state["code"]["status"])
             archive = root / ".dlv/upgrades/legacy-feature/schema-v9-candidates"
@@ -2894,17 +2958,14 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             prototype = directory / "prototype.html"
             prototype.write_text("<main>candidate</main>", encoding="utf-8")
             graph = delivery_graph.load_graph(root, "cross-domain-feature")
-            graph["prototype"] = {"status": "contractual", "path": "prototype.html", "sha256": delivery_graph.file_digest(prototype)}
-            self.assertTrue(any("source provenance" in error for error in delivery_graph.structural_errors(graph)))
-            source = json.loads((directory / "source-revisions/SRC-001.json").read_text())
-            graph["prototype"].update({
-                "source_revision": "SRC-001", "source_kind": "source_revision",
-                "source_ref": "SRC-001", "source_sha256": "0" * 64,
-            })
+            graph["delivery_prototype"] = {
+                "status": "generated", "path": "prototype.html", "sha256": delivery_graph.file_digest(prototype),
+                "generated_from_revision": "SRC-999", "generator": "test-generator",
+            }
             write_json(directory / "delivery-graph.json", graph)
-            with self.assertRaisesRegex(ValueError, "provenance"):
-                delivery_graph.compile_graph(root, "cross-domain-feature")
-            graph["prototype"]["source_sha256"] = source["source_digest"]
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertTrue(state["readiness"]["prototype_blocked"])
+            graph["delivery_prototype"]["generated_from_revision"] = "SRC-001"
             write_json(directory / "delivery-graph.json", graph)
             delivery_graph.compile_graph(root, "cross-domain-feature")
 
@@ -2915,15 +2976,701 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             prototype = directory / "prototype.html"
             prototype.write_text("<main>generated</main>", encoding="utf-8")
             graph = delivery_graph.load_graph(root, "cross-domain-feature")
-            graph["prototype"] = {
-                "status": "generated_candidate", "path": "prototype.html", "sha256": delivery_graph.file_digest(prototype),
+            graph["delivery_prototype"] = {
+                "status": "generated", "path": "prototype.html", "sha256": delivery_graph.file_digest(prototype),
                 "generated_from_revision": "SRC-001", "generator": "test-generator",
             }
             write_json(directory / "delivery-graph.json", graph)
             state = delivery_graph.compile_graph(root, "cross-domain-feature")
             self.assertEqual("needs_decision", state["readiness"]["status"])
-            with self.assertRaisesRegex(ValueError, "generated Prototype"):
+            self.assertTrue(state["readiness"]["product_lock_blocked"])
+            with self.assertRaisesRegex(ValueError, "requires a decision"):
                 graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "generated-review")
+
+    def test_wmd_160_platform_limitation_requires_owner_then_seals_product_lock(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            source_path = root / "delivery/cross-domain-feature/source-revisions/SRC-001.json"
+            source = json.loads(source_path.read_text())
+            source["attachments"].append({
+                "ref": "product-prototype:share-choice", "kind": "product_prototype",
+                "sha256": "1" * 64,
+            })
+            source["source_digest"] = delivery_proof.value_digest(canonical_source_payload(source))
+            write_json(source_path, source)
+            write_ledger(root, "cross-domain-feature", empty_ledger("cross-domain-feature"))
+            acceptance = next(item for item in graph["nodes"] if item["id"] == "AC-001")
+            acceptance["statement"] = "The user can choose friend or timeline sharing from the product flow"
+            acceptance["origins"] = [{"kind": "direct", "source_ref": "product-prototype:share-choice"}]
+            graph["nodes"].extend([
+                node("AC-002", "Acceptance", "No normal guide", "Normal flow does not show onboarding guide"),
+                node("EX-002", "Exception", "No card module", "No 我的名片 module is introduced"),
+                node("EX-003", "Exception", "Reuse pricing", "Pricing reuses canonical 据此报价 implementation"),
+                node("EX-004", "Exception", "Keep step three", "Step 3 is not reset by route params"),
+                node("EX-005", "Exception", "No custom chooser", "No custom friend selector or share chooser is introduced"),
+            ])
+            negative_ids = ["AC-002", "EX-002", "EX-003", "EX-004", "EX-005"]
+            graph["edges"].extend(
+                [edge(item, "derives_from", "BHV-001") for item in negative_ids]
+                + [edge("TST-001", "tests", item) for item in negative_ids]
+                + [edge("PO-001", "proves", item) for item in negative_ids]
+            )
+            assertion_subjects = next(item for item in graph["nodes"] if item["id"] == "ASRT-001")["attributes"]["subject_ids"]
+            assertion_subjects[:] = sorted(set(assertion_subjects) | set(negative_ids))
+            provenance_claim = next(item for item in graph["claims"] if item["lens"] == "PROVENANCE_INTEGRITY")
+            provenance_claim["subjects"] = sorted(set(provenance_claim["subjects"]) | set(negative_ids))
+            provenance_claim["id"] = claim_id_for({key: value for key, value in provenance_claim.items() if key != "id"})
+            path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            write_json(path, graph)
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            result = root / ".dlv/wmd-before.json"
+            entries = [
+                {
+                    "node_id": item["id"],
+                    "result": "DECISION_REQUIRED" if item["id"] == "AC-001" else "PRESERVED",
+                    "evidence": "WeChat business button cannot invoke the full native share menu" if item["id"] == "AC-001" else "source mapping preserved",
+                    "reason": "platform_limitation" if item["id"] == "AC-001" else None,
+                    "owner_question": "May the delivery guide users to the upper-right native menu?" if item["id"] == "AC-001" else None,
+                }
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]
+            write_json(result, {"entries": entries})
+            blocked_alignment = self.product_alignment_review(root, entries)
+            self.assertEqual("NEEDS_DECISION", json.loads(blocked_alignment.read_text())["verdict"])
+            with self.assertRaisesRegex(ValueError, "SAFE Product Alignment"):
+                seal_product_lock.seal(root, "cross-domain-feature", blocked_alignment)
+            with self.assertRaisesRegex(ValueError, "requires a decision"):
+                graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "wmd-blocked")
+            with self.assertRaises(ValueError):
+                graph_contract.seal_contract(root, "cross-domain-feature")
+            with self.assertRaises(ValueError):
+                delivery_graph.mark_code_complete(root, "cross-domain-feature")
+            with self.assertRaises(ValueError):
+                graph_verification.start("cross-domain-feature", root, "wmd-blocked-run", [])
+            with self.assertRaises(ValueError):
+                graph_finalize.finalize(root, "cross-domain-feature")
+
+            scope_revision.resolve(
+                root, "cross-domain-feature", "DEC-001",
+                "May the delivery guide users to the upper-right native menu?",
+                "Accepted: guide the user to the upper-right native menu",
+                "platform_limitation", "owner", ["AC-001"],
+            )
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            acceptance = next(item for item in graph["nodes"] if item["id"] == "AC-001")
+            acceptance["statement"] = "The user is guided to the upper-right native menu for friend or timeline sharing"
+            acceptance["origins"] = [
+                {"kind": "direct", "source_ref": "product-prototype:share-choice"},
+                {
+                    "kind": "derived", "constraint_ref": "DEC-001",
+                    "reason": "Owner accepted the native-menu guidance for the platform limitation",
+                },
+            ]
+            write_json(path, graph)
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            safe_result = root / ".dlv/wmd-after.json"
+            write_json(safe_result, {"entries": [
+                {"node_id": item["id"], "result": "CLARIFIED" if item["id"] == "AC-001" else "PRESERVED", "evidence": "Owner decision and source mapping preserved", "reason": None, "owner_question": None}
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]})
+            safe_entries = [
+                {"node_id": item["id"], "result": "CLARIFIED" if item["id"] == "AC-001" else "PRESERVED", "evidence": "Owner decision and source mapping preserved", "reason": None, "owner_question": None}
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]
+            safe_alignment = self.product_alignment_review(root, safe_entries)
+            lock_path = seal_product_lock.seal(root, "cross-domain-feature", safe_alignment)
+            lock = json.loads(lock_path.read_text())
+            self.assertEqual(["DEC-001"], lock["owner_decision_refs"])
+            self.assertFalse(delivery_graph.load_state(path.parent / "state.json")["readiness"]["product_lock_blocked"])
+            with patch.object(graph_review, "run_bounded", side_effect=self.fake_semantic_run):
+                graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "wmd-ready")
+            subprocess.run(["git", "add", "-A"], cwd=root, check=True)
+            subprocess.run(
+                ["git", "-c", "user.name=DLV Test", "-c", "user.email=dlv@example.invalid", "commit", "-qm", "wmd ready\n\nDLV-Feature: cross-domain-feature"],
+                cwd=root, check=True,
+            )
+            wmd_state = delivery_graph.load_state(path.parent / "state.json")
+            blocked_records = [
+                json.loads((root / summary["record_path"]).read_text())
+                for summary in wmd_state["attestations"].values() if summary["verdict"] == "BLOCKED"
+            ]
+            self.assertEqual("ready", wmd_state["readiness"]["status"], blocked_records)
+            graph_contract.seal_contract(root, "cross-domain-feature")
+            delivery_graph.mark_code_complete(root, "cross-domain-feature")
+
+    def test_product_lock_drift_invalidates_downstream_evidence(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.review_all(root)
+            graph_contract.seal_contract(root, "cross-domain-feature")
+            path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            next(item for item in graph["nodes"] if item["id"] == "REQ-001")["statement"] += " with changed scope"
+            write_json(path, graph)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertTrue(state["readiness"]["product_lock_blocked"])
+            self.assertEqual({}, state["attestations"])
+            self.assertEqual("draft", state["proof_contract"]["status"])
+
+    def test_live_product_lock_tamper_blocks_review_proof_code_and_verification(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.review_all(root)
+            graph_contract.seal_contract(root, "cross-domain-feature")
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            lock_path = root / "delivery/cross-domain-feature/product-locks" / f"{graph['product_lock']['id']}.json"
+            lock_path.write_text(lock_path.read_text() + " ", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "Product Lock"):
+                graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "tampered-lock")
+            with self.assertRaises(ValueError):
+                graph_contract.seal_contract(root, "cross-domain-feature")
+            with self.assertRaises(ValueError):
+                delivery_graph.mark_code_complete(root, "cross-domain-feature")
+            with self.assertRaisesRegex(ValueError, "Product Lock"):
+                graph_verification.start("cross-domain-feature", root, "tampered-lock-run", [])
+
+    def test_origins_are_mandatory_and_raw_prototype_never_becomes_contract(self) -> None:
+        graph = valid_graph()
+        del graph["nodes"][0]["origins"]
+        self.assertTrue(any("origins" in error for error in delivery_graph.structural_errors(graph)))
+        graph = valid_graph()
+        graph["prototype"] = {"status": "contractual", "path": "prototype.html", "sha256": "0" * 64}
+        self.assertTrue(any("unknown top-level keys: prototype" in error for error in delivery_graph.structural_errors(graph)))
+
+    def test_alignment_rejects_dangling_origin_and_same_owner_reviewer(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            graph_path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            graph["nodes"][0]["origins"] = [{"kind": "direct", "source_ref": "missing-source-anchor"}]
+            write_json(graph_path, graph)
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            result = root / ".dlv/dangling-alignment.json"
+            write_json(result, {"entries": [
+                {"node_id": item["id"], "result": "PRESERVED", "evidence": "mapped", "reason": None, "owner_question": None}
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]})
+            entries = json.loads(result.read_text())["entries"]
+            with self.assertRaisesRegex(ValueError, "unmapped direct source refs"):
+                self.product_alignment_review(root, entries)
+            graph["nodes"][0]["origins"] = [{"kind": "direct", "source_ref": "SRC-001"}]
+            write_json(graph_path, graph)
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+
+    def test_alignment_schema_rejects_missing_duplicate_unknown_and_invalid_decisions(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            directory = root / "delivery/cross-domain-feature"
+            source = delivery_governance.load_source_revision(directory, "cross-domain-feature", graph["source_revision"])
+            direct_refs, constraint_refs = product_lock.known_origin_refs(directory, graph, source)
+            entries = [
+                {"node_id": item["id"], "result": "PRESERVED", "evidence": "mapped", "reason": None, "owner_question": None}
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]
+            source_entries = [
+                {
+                    "source_ref": anchor,
+                    "result": "PRESERVED",
+                    "node_ids": product_lock.source_anchor_node_ids(graph, source, anchor),
+                    "evidence": "mapped",
+                    "reason": None,
+                    "owner_question": None,
+                }
+                for anchor in product_lock.source_anchor_refs(source)
+            ]
+
+            def align(
+                candidate: list[dict[str, object]],
+                candidate_sources: list[dict[str, object]] | None = None,
+            ) -> dict[str, object]:
+                return product_lock.alignment_core(
+                    graph, source, delivery_graph.stage_hash(graph, "product"),
+                    delivery_graph.file_digest(directory / "prd.md"), candidate,
+                    source_entries if candidate_sources is None else candidate_sources,
+                    direct_refs=direct_refs, constraint_refs=constraint_refs,
+                )
+
+            invalid = [
+                entries[:-1],
+                [*entries, dict(entries[0])],
+                [*entries[:-1], {**entries[-1], "node_id": "AC-999"}],
+                [{**entries[0], "result": "UNKNOWN"}, *entries[1:]],
+                [{**entries[0], "reason": "ambiguity"}, *entries[1:]],
+                [{**entries[0], "result": "DECISION_REQUIRED", "reason": "ambiguity", "owner_question": None}, *entries[1:]],
+            ]
+            for candidate in invalid:
+                with self.subTest(candidate=candidate), self.assertRaises(ValueError):
+                    align(candidate)
+            with self.assertRaisesRegex(ValueError, "every Source anchor"):
+                align(entries, source_entries[:-1])
+            decision_source = [{
+                **source_entries[0], "result": "DECISION_REQUIRED",
+                "reason": "unmapped", "owner_question": "Where should this Source anchor map?",
+            }, *source_entries[1:]]
+            self.assertEqual("NEEDS_DECISION", align(entries, decision_source)["verdict"])
+            for reason in sorted(product_lock.DECISION_REASONS):
+                candidate = [
+                    {**entries[0], "result": "DECISION_REQUIRED", "reason": reason, "owner_question": "Owner decision?"},
+                    *entries[1:],
+                ]
+                self.assertEqual("NEEDS_DECISION", align(candidate)["verdict"])
+
+            reciprocal_graph = copy.deepcopy(graph)
+            reciprocal_source = copy.deepcopy(source)
+            reciprocal_source["attachments"].append({
+                "ref": "product-prototype:reciprocal", "kind": "product_prototype", "sha256": "1" * 64,
+            })
+            for node_id in ("REQ-001", "BHV-001"):
+                next(item for item in reciprocal_graph["nodes"] if item["id"] == node_id)["origins"] = [
+                    {"kind": "direct", "source_ref": "product-prototype:reciprocal"},
+                ]
+            reciprocal_direct, reciprocal_constraints = product_lock.known_origin_refs(
+                directory, reciprocal_graph, reciprocal_source,
+            )
+            reciprocal_sources = [
+                {
+                    "source_ref": anchor, "result": "PRESERVED",
+                    "node_ids": product_lock.source_anchor_node_ids(reciprocal_graph, reciprocal_source, anchor),
+                    "evidence": "mapped", "reason": None, "owner_question": None,
+                }
+                for anchor in product_lock.source_anchor_refs(reciprocal_source)
+            ]
+
+            def reciprocal_align(candidate_sources: list[dict[str, object]]) -> dict[str, object]:
+                return product_lock.alignment_core(
+                    reciprocal_graph, reciprocal_source, delivery_graph.stage_hash(reciprocal_graph, "product"),
+                    delivery_graph.file_digest(directory / "prd.md"), entries, candidate_sources,
+                    direct_refs=reciprocal_direct, constraint_refs=reciprocal_constraints,
+                )
+
+            attachment_entry = next(
+                item for item in reciprocal_sources if item["source_ref"] == "product-prototype:reciprocal"
+            )
+            wrong_node_sources = copy.deepcopy(reciprocal_sources)
+            next(
+                item for item in wrong_node_sources if item["source_ref"] == "product-prototype:reciprocal"
+            )["node_ids"] = ["AC-001"]
+            with self.assertRaisesRegex(ValueError, "without reciprocal origins"):
+                reciprocal_align(wrong_node_sources)
+            omitted_origin_sources = copy.deepcopy(reciprocal_sources)
+            next(
+                item for item in omitted_origin_sources if item["source_ref"] == "product-prototype:reciprocal"
+            )["node_ids"] = [attachment_entry["node_ids"][0]]
+            with self.assertRaisesRegex(ValueError, "omits a reciprocal Graph origin"):
+                reciprocal_align(omitted_origin_sources)
+
+    def test_product_lock_rejects_forged_alignment_and_symlinked_output_roots(self) -> None:
+        temporary, root = self.make_root()
+        with temporary, tempfile.TemporaryDirectory() as external_text:
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            directory = root / "delivery/cross-domain-feature"
+            source = delivery_governance.load_source_revision(directory, "cross-domain-feature", graph["source_revision"])
+            forged = {
+                "schema_version": 13, "feature_id": "cross-domain-feature",
+                "source_revision": graph["source_revision"], "source_digest": source["source_digest"],
+                "product_subgraph_sha256": delivery_graph.stage_hash(graph, "product"),
+                "prd_sha256": delivery_graph.file_digest(directory / "prd.md"),
+                "delivery_prototype_sha256": None, "verdict": "SAFE",
+            }
+            forged["alignment_digest"] = delivery_proof.value_digest(forged)
+            alignment_dir = root / ".dlv/product-alignments/cross-domain-feature"
+            alignment_dir.mkdir(parents=True)
+            forged_path = alignment_dir / f"ALN-{forged['alignment_digest'][:12]}.json"
+            write_json(forged_path, forged)
+            with self.assertRaisesRegex(ValueError, "authentic SAFE"):
+                seal_product_lock.seal(root, "cross-domain-feature", forged_path)
+
+            result = root / ".dlv/alignment-input.json"
+            write_json(result, {"entries": [
+                {"node_id": item["id"], "result": "PRESERVED", "evidence": "mapped", "reason": None, "owner_question": None}
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]})
+            alignment = self.product_alignment_review(root, json.loads(result.read_text())["entries"])
+            alignment_record = json.loads(alignment.read_text())
+            self.assertEqual("isolated_process", alignment_record["execution"]["mode"])
+            transcript = root / alignment_record["execution"]["transcript_path"]
+            self.assertTrue(transcript.is_file())
+            self.assertEqual(
+                alignment_record["execution"]["transcript_sha256"], delivery_graph.file_digest(transcript),
+            )
+            forged_full = copy.deepcopy(alignment_record)
+            forged_full["execution"]["kernel_receipt"]["signature"] = "Zm9yZ2Vk"
+            forged_full["alignment_digest"] = product_lock.alignment_digest(forged_full)
+            forged_full_path = alignment.parent / f"ALN-{forged_full['alignment_digest'][:12]}.json"
+            write_json(forged_full_path, forged_full)
+            with self.assertRaisesRegex(ValueError, "signature verification failed"):
+                seal_product_lock.seal(root, "cross-domain-feature", forged_full_path)
+            product_external = Path(external_text) / "product-locks"
+            product_external.mkdir()
+            (directory / "product-locks").symlink_to(product_external, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                seal_product_lock.seal(root, "cross-domain-feature", alignment)
+            self.assertEqual([], list(product_external.iterdir()))
+            (directory / "product-locks").unlink()
+
+            shutil.rmtree(root / ".dlv/product-alignments")
+            alignment_external = Path(external_text) / "alignments"
+            alignment_external.mkdir()
+            (root / ".dlv/product-alignments").symlink_to(alignment_external, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                product_alignment.review(root, "cross-domain-feature")
+            self.assertEqual([], list(alignment_external.iterdir()))
+
+            (root / ".dlv/product-alignments").unlink()
+            (root / ".dlv/product-alignments").mkdir()
+            swap_external = Path(external_text) / "swap-alignments"
+            swap_external.mkdir()
+            swapped_directory = root / ".dlv/product-alignments-pinned"
+            source_entries = [
+                {
+                    "source_ref": anchor, "result": "PRESERVED",
+                    "node_ids": product_lock.source_anchor_node_ids(graph, source, anchor),
+                    "evidence": "mapped", "reason": None, "owner_question": None,
+                }
+                for anchor in product_lock.source_anchor_refs(source)
+            ]
+
+            def swap_during_review(argv: list[str], *_args: object, **_kwargs: object) -> dict[str, object]:
+                result_path = Path(argv[argv.index("--output-last-message") + 1])
+                write_json(result_path, {"entries": json.loads(result.read_text())["entries"], "source_entries": source_entries})
+                active = root / ".dlv/product-alignments/cross-domain-feature"
+                active.rename(swapped_directory)
+                active.symlink_to(swap_external, target_is_directory=True)
+                return {"exit_code": 0, "timed_out": False, "stdout": "{}\n", "stderr": ""}
+
+            with patch.object(product_alignment, "prepare_isolated_codex_executable", return_value="codex"), patch.object(
+                product_alignment, "run_bounded", side_effect=swap_during_review,
+            ), self.assertRaisesRegex(ValueError, "symlink"):
+                product_alignment.review(root, "cross-domain-feature")
+            self.assertEqual([], list(swap_external.iterdir()))
+            (root / ".dlv/product-alignments/cross-domain-feature").unlink()
+            swapped_directory.rename(root / ".dlv/product-alignments/cross-domain-feature")
+
+            runs_external = Path(external_text) / "runs"
+            runs_external.mkdir()
+            shutil.rmtree(root / ".dlv/runs")
+            (root / ".dlv/runs").symlink_to(runs_external, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                self.product_alignment_review(root, json.loads(result.read_text())["entries"])
+            self.assertEqual([], list(runs_external.iterdir()))
+
+    def test_owner_resolution_keeps_generated_prototype_stale_until_regenerated(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            directory = root / "delivery/cross-domain-feature"
+            prototype = directory / "prototype.html"
+            prototype.write_text("<main>old</main>", encoding="utf-8")
+            graph_path = directory / "delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            graph["delivery_prototype"] = {
+                "status": "generated", "path": "prototype.html", "sha256": delivery_graph.file_digest(prototype),
+                "generated_from_revision": "SRC-001", "generator": "test-generator",
+            }
+            write_json(graph_path, graph)
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            scope_revision.resolve(
+                root, "cross-domain-feature", "DEC-002", "Use revised UI?", "Yes", "ambiguity", "owner", ["AC-001"],
+            )
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            self.assertEqual("SRC-001", graph["delivery_prototype"]["generated_from_revision"])
+            self.assertTrue(delivery_graph.load_state(directory / "state.json")["readiness"]["prototype_blocked"])
+            result = root / ".dlv/stale-prototype-alignment.json"
+            write_json(result, {"entries": [
+                {"node_id": item["id"], "result": "PRESERVED", "evidence": "mapped", "reason": None, "owner_question": None}
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]})
+            with self.assertRaisesRegex(ValueError, "source revision is stale"):
+                product_alignment.review(root, "cross-domain-feature")
+            prototype.write_text("<main>regenerated</main>", encoding="utf-8")
+            graph["delivery_prototype"].update({
+                "sha256": delivery_graph.file_digest(prototype), "generated_from_revision": "SRC-002",
+            })
+            next(item for item in graph["nodes"] if item["id"] == "AC-001")["origins"].append({
+                "kind": "derived", "constraint_ref": "DEC-002", "reason": "Owner approved revised UI",
+            })
+            write_json(graph_path, graph)
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.product_alignment_review(root, json.loads(result.read_text())["entries"])
+
+    def test_source_validator_rejects_unknown_owner_decision_reason(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            scope_revision.resolve(
+                root, "cross-domain-feature", "DEC-002", "Which behavior?", "Use the safe behavior",
+                "ambiguity", "owner", ["AC-001"],
+            )
+            directory = root / "delivery/cross-domain-feature"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            source_path = directory / "source-revisions" / f"{graph['source_revision']}.json"
+            source = json.loads(source_path.read_text())
+            source["decisions"][0]["reason"] = "invented_reason"
+            source["source_digest"] = delivery_proof.value_digest(canonical_source_payload(source))
+            write_json(source_path, source)
+            with self.assertRaisesRegex(ValueError, "reason is invalid"):
+                delivery_governance.load_source_revision(
+                    directory, "cross-domain-feature", graph["source_revision"],
+                )
+            errors = graph_validation.validate(root, "cross-domain-feature")
+            self.assertTrue(any("governance records are invalid" in error for error in errors), errors)
+
+    def test_source_validator_rejects_colliding_attachment_identifiers(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            directory = root / "delivery/cross-domain-feature"
+            source_path = directory / "source-revisions/SRC-001.json"
+            source = json.loads(source_path.read_text())
+            source["attachments"].extend([
+                {"ref": "product-prototype:one", "kind": "product_prototype", "sha256": "1" * 64},
+                {"ref": "product-prototype:one", "kind": "product_prototype", "sha256": "2" * 64},
+            ])
+            source["source_digest"] = delivery_proof.value_digest(canonical_source_payload(source))
+            write_json(source_path, source)
+            with self.assertRaisesRegex(ValueError, "collides"):
+                delivery_governance.load_source_revision(directory, "cross-domain-feature", "SRC-001")
+
+    def test_source_validator_rejects_attachment_collision_with_text_anchor(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            directory = root / "delivery/cross-domain-feature"
+            source_path = directory / "source-revisions/SRC-001.json"
+            source = json.loads(source_path.read_text())
+            source["attachments"].append({
+                "ref": "SRC-001:title", "kind": "product_prototype", "sha256": "1" * 64,
+            })
+            source["source_digest"] = delivery_proof.value_digest(canonical_source_payload(source))
+            write_json(source_path, source)
+            with self.assertRaisesRegex(ValueError, "Source text"):
+                delivery_governance.load_source_revision(directory, "cross-domain-feature", "SRC-001")
+
+    def test_owner_resolution_after_review_can_seal_replacement_product_lock(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.review_all(root)
+            graph_path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            old_lock = delivery_graph.load_graph(root, "cross-domain-feature")["product_lock"]["id"]
+            scope_revision.resolve(
+                root, "cross-domain-feature", "DEC-002", "Use clarified behavior?", "Yes",
+                "ambiguity", "owner", ["AC-001"],
+            )
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            acceptance = next(item for item in graph["nodes"] if item["id"] == "AC-001")
+            acceptance["origins"].append({
+                "kind": "derived", "constraint_ref": "DEC-002", "reason": "Owner clarified behavior",
+            })
+            write_json(graph_path, graph)
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            entries = [
+                {
+                    "node_id": item["id"], "result": "CLARIFIED" if item["id"] == "AC-001" else "PRESERVED",
+                    "evidence": "Owner decision and Source preserved", "reason": None, "owner_question": None,
+                }
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]
+            alignment = self.product_alignment_review(root, entries)
+            seal_product_lock.seal(root, "cross-domain-feature", alignment)
+            self.assertNotEqual(old_lock, delivery_graph.load_graph(root, "cross-domain-feature")["product_lock"]["id"])
+
+    def test_product_lock_rolls_back_when_source_changes_during_compile(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            entries = [
+                {
+                    "node_id": item["id"], "result": "PRESERVED", "evidence": "Source preserved",
+                    "reason": None, "owner_question": None,
+                }
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]
+            alignment = self.product_alignment_review(root, entries)
+            graph_path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            ledger_path = root / ".dlv/findings/cross-domain-feature/ledger.json"
+            generated = [
+                graph_path, ledger_path, root / "delivery/cross-domain-feature/prd.md",
+                root / "delivery/cross-domain-feature/architecture-design.md",
+                root / "delivery/cross-domain-feature/code-spec.md",
+                root / "delivery/cross-domain-feature/proof-contract.json",
+                root / "delivery/cross-domain-feature/state.json",
+            ]
+            originals = {path: path.read_bytes() for path in generated}
+            source_path = root / "delivery/cross-domain-feature/source-revisions/SRC-001.json"
+
+            def mutate_then_compile(*args: object, **kwargs: object) -> dict[str, object]:
+                source = json.loads(source_path.read_text())
+                source["description"] += " Concurrent Owner replacement."
+                source["source_digest"] = delivery_proof.value_digest(canonical_source_payload(source))
+                write_json(source_path, source)
+                return delivery_graph.compile_graph(*args, **kwargs)
+
+            with patch.object(seal_product_lock, "compile_graph", side_effect=mutate_then_compile):
+                with self.assertRaisesRegex(ValueError, "changed while Product Lock was compiling"):
+                    seal_product_lock.seal(root, "cross-domain-feature", alignment)
+            for path, original in originals.items():
+                self.assertEqual(original, path.read_bytes(), path)
+
+    def test_product_lock_preserves_concurrent_generated_artifact_edit_on_rollback(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            entries = [
+                {
+                    "node_id": item["id"], "result": "PRESERVED", "evidence": "Source preserved",
+                    "reason": None, "owner_question": None,
+                }
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]
+            alignment = self.product_alignment_review(root, entries)
+            source_path = root / "delivery/cross-domain-feature/source-revisions/SRC-001.json"
+            graph_path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            real_load_source = seal_product_lock.load_source_revision
+            load_count = 0
+
+            def owner_edit_before_postcheck(*args: object, **kwargs: object) -> dict[str, object]:
+                nonlocal load_count
+                load_count += 1
+                if load_count == 3:
+                    source = json.loads(source_path.read_text())
+                    source["description"] += " Concurrent Source edit."
+                    source["source_digest"] = delivery_proof.value_digest(canonical_source_payload(source))
+                    write_json(source_path, source)
+                    edited_graph = json.loads(graph_path.read_text())
+                    edited_graph["title"] = "Concurrent Owner graph edit"
+                    write_json(graph_path, edited_graph)
+                return real_load_source(*args, **kwargs)
+
+            with patch.object(seal_product_lock, "load_source_revision", side_effect=owner_edit_before_postcheck):
+                with self.assertRaisesRegex(ValueError, "concurrent generated-artifact edits were preserved"):
+                    seal_product_lock.seal(root, "cross-domain-feature", alignment)
+            self.assertEqual("Concurrent Owner graph edit", json.loads(graph_path.read_text())["title"])
+
+    @unittest.skipIf(os.name == "nt", "directory descriptor semantics differ on Windows")
+    def test_product_lock_feature_directory_swap_cannot_redirect_rollback(self) -> None:
+        temporary, root = self.make_root()
+        with temporary, tempfile.TemporaryDirectory() as external_text:
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            entries = [
+                {
+                    "node_id": item["id"], "result": "PRESERVED", "evidence": "Source preserved",
+                    "reason": None, "owner_question": None,
+                }
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]
+            alignment = self.product_alignment_review(root, entries)
+            directory = root / "delivery/cross-domain-feature"
+            displaced = root / "delivery/cross-domain-feature-pinned"
+            external = Path(external_text) / "external-feature"
+
+            def compile_then_swap(*args: object, **kwargs: object) -> dict[str, object]:
+                state = delivery_graph.compile_graph(*args, **kwargs)
+                directory.rename(displaced)
+                shutil.copytree(displaced, external)
+                external_source_path = external / "source-revisions/SRC-001.json"
+                external_source = json.loads(external_source_path.read_text())
+                external_source["description"] += " External Owner edit."
+                external_source["source_digest"] = delivery_proof.value_digest(canonical_source_payload(external_source))
+                write_json(external_source_path, external_source)
+                directory.symlink_to(external, target_is_directory=True)
+                return state
+
+            with patch.object(seal_product_lock, "compile_graph", side_effect=compile_then_swap):
+                with self.assertRaises(ValueError):
+                    seal_product_lock.seal(root, "cross-domain-feature", alignment)
+            external_graph = json.loads((external / "delivery-graph.json").read_text())
+            self.assertIsNotNone(external_graph["product_lock"])
+
+    @unittest.skipIf(os.name == "nt", "directory descriptor semantics differ on Windows")
+    def test_product_lock_directory_swap_never_writes_external_path(self) -> None:
+        temporary, root = self.make_root()
+        with temporary, tempfile.TemporaryDirectory() as external_text:
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            entries = [
+                {
+                    "node_id": item["id"], "result": "PRESERVED", "evidence": "Source preserved",
+                    "reason": None, "owner_question": None,
+                }
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]
+            alignment = self.product_alignment_review(root, entries)
+            product_dir = root / "delivery/cross-domain-feature/product-locks"
+            product_dir.mkdir()
+            pinned_dir = root / "delivery/cross-domain-feature/product-locks-pinned"
+            external = Path(external_text) / "outside"
+            external.mkdir()
+            original_write = seal_product_lock._write_exclusive_at
+
+            def swap_then_write(directory_fd: int, name: str, content: bytes) -> None:
+                product_dir.rename(pinned_dir)
+                product_dir.symlink_to(external, target_is_directory=True)
+                original_write(directory_fd, name, content)
+
+            with patch.object(seal_product_lock, "_write_exclusive_at", side_effect=swap_then_write):
+                with self.assertRaisesRegex(ValueError, "directory changed"):
+                    seal_product_lock.seal(root, "cross-domain-feature", alignment)
+            self.assertEqual([], list(external.iterdir()))
+            self.assertEqual([], list(pinned_dir.iterdir()))
+
+    @unittest.skipIf(os.name == "nt", "directory descriptor semantics differ on Windows")
+    def test_product_lock_rollback_uses_pinned_feature_directory(self) -> None:
+        temporary, root = self.make_root()
+        with temporary, tempfile.TemporaryDirectory() as external_text:
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            entries = [
+                {
+                    "node_id": item["id"], "result": "PRESERVED", "evidence": "Source preserved",
+                    "reason": None, "owner_question": None,
+                }
+                for item in graph["nodes"] if item["type"] in {"Requirement", "Behavior", "Acceptance", "Exception"}
+            ]
+            alignment = self.product_alignment_review(root, entries)
+            feature = root / "delivery/cross-domain-feature"
+            pinned = root / "delivery/cross-domain-feature-pinned"
+            external = Path(external_text) / "outside"
+            external.mkdir()
+            external_graph = external / "delivery-graph.json"
+            external_before: bytes | None = None
+
+            def swap_then_fail(*_args: object, **_kwargs: object) -> dict[str, object]:
+                nonlocal external_before
+                feature.rename(pinned)
+                external_before = (pinned / "delivery-graph.json").read_bytes()
+                external_graph.write_bytes(external_before)
+                feature.symlink_to(external, target_is_directory=True)
+                raise OSError("injected compile failure after feature swap")
+
+            with patch.object(seal_product_lock, "compile_graph", side_effect=swap_then_fail):
+                with self.assertRaisesRegex(OSError, "injected compile failure"):
+                    seal_product_lock.seal(root, "cross-domain-feature", alignment)
+            self.assertIsNotNone(external_before)
+            self.assertEqual(external_before, external_graph.read_bytes())
+            self.assertIsNone(json.loads((pinned / "delivery-graph.json").read_text())["product_lock"])
+
+    def test_linux_semantic_codex_rejects_user_owned_forged_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "lib/node_modules/@openai/codex"
+            launcher = package / "bin/codex.js"
+            native = package / "node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-gnu/codex"
+            launcher.parent.mkdir(parents=True)
+            native.parent.mkdir(parents=True)
+            launcher.write_text("#!/usr/bin/env node\n", encoding="utf-8")
+            native.write_text("#!/bin/sh\n", encoding="utf-8")
+            native.chmod(0o700)
+            write_json(package / "package.json", {"name": "@openai/codex"})
+            graph_review.semantic_codex_executable.cache_clear()
+            try:
+                with patch.object(graph_review.sys, "platform", "linux"), patch.object(
+                    graph_review.shutil, "which", return_value=str(launcher),
+                ), self.assertRaisesRegex(ValueError, "untrusted Codex CLI"):
+                    graph_review.semantic_codex_executable()
+            finally:
+                graph_review.semantic_codex_executable.cache_clear()
 
     def test_finding_identity_survives_review_unit_repartition(self) -> None:
         ledger = empty_ledger("feature")
@@ -3183,10 +3930,9 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
         temporary, root = self.make_root()
         with temporary:
             first = delivery_graph.compile_graph(root, "cross-domain-feature")
-            self.assertEqual("CONVERGING", first["convergence"]["status"])
+            self.assertEqual("NEEDS_DECISION", first["convergence"]["status"])
             second = delivery_graph.compile_graph(root, "cross-domain-feature")
-            self.assertEqual("STABLE_BLOCKED", second["convergence"]["status"])
-            self.assertEqual(second["convergence"]["vector"], second["convergence"]["previous_vector"])
+            self.assertEqual("NEEDS_DECISION", second["convergence"]["status"])
             self.assertEqual([], graph_validation.validate(root, "cross-domain-feature"))
             with patch.object(graph_review, "run_bounded") as reviewer:
                 with self.assertRaisesRegex(ValueError, "requires a decision"):
@@ -3395,7 +4141,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             graph = delivery_graph.load_graph(root, "cross-domain-feature")
             graph["metadata"]["review_budget"] = {"max_campaigns": 3, "max_unit_reviews": 1, "max_new_findings": 99}
             write_json(root / "delivery/cross-domain-feature/delivery-graph.json", graph)
-            delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.seal_product(root)
             unit_ids = list(delivery_graph.review_units(graph))[:2]
             with self.assertRaisesRegex(graph_review.ReviewBudgetExceeded, "unit-review budget"):
                 graph_review._record_units(root, "cross-domain-feature", unit_ids, "over-budget")
@@ -3413,7 +4159,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
                 "max_campaigns": 1, "max_unit_reviews": 99, "max_new_findings": 1,
             }
             write_json(root / "delivery/cross-domain-feature/delivery-graph.json", graph)
-            delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.seal_product(root)
             graph_review.record_readiness(root, "cross-domain-feature", "debug-budget-free")
             self.assertEqual([], delivery_governance.load_ledger(root, "cross-domain-feature")["campaigns"])
 
@@ -3788,11 +4534,11 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
                 patch.object(frontend_fast_path, "run_isolated_readiness_review", side_effect=review),
             ):
                 result = frontend_fast_path.run(root, "cross-domain-feature", "fast-happy")
-            self.assertEqual("PROOF_REQUIRED", result["status"])
+            self.assertEqual("BLOCKED", result["status"])
             self.assertEqual(["changes", "lint", "targeted_tests", "typecheck", "build"], calls)
             self.assertEqual(1, len(set(snapshot_bases)))
             self.assertIsNotNone(snapshot_bases[0])
-            self.assertEqual("composite_review", result["steps"][-1]["name"])
+            self.assertEqual([], result["steps"])
             with patch.object(frontend_fast_path, "execute_capability") as duplicate_execute:
                 with self.assertRaisesRegex(ValueError, "journal already exists"):
                     frontend_fast_path.run(root, "cross-domain-feature", "fast-happy")
@@ -4158,6 +4904,233 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             )
             self.assertTrue(any("escapes declared frontend_roots" in reason for reason in reasons), reasons)
 
+    def test_v12_to_v13_migration_preserves_bytes_without_promoting_product_lock(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            directory = root / "delivery/cross-domain-feature"
+            graph_path = directory / "delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            graph["schema_version"] = 12
+            graph.pop("product_lock")
+            graph["prototype"] = graph.pop("delivery_prototype")
+            for item in graph["nodes"]:
+                item.pop("origins", None)
+            write_json(graph_path, graph)
+            source_path = directory / "source-revisions/SRC-001.json"
+            source = json.loads(source_path.read_text())
+            source["schema_version"] = 12
+            source.pop("decisions")
+            source["source_digest"] = delivery_proof.value_digest({
+                key: source[key] for key in ("title", "description", "comments", "attachments", "risk_vector")
+            })
+            write_json(source_path, source)
+            original_graph = graph_path.read_bytes()
+            migrated = upgrade_v12_to_v13.upgrade(root, "cross-domain-feature", apply=True)
+            self.assertEqual(13, migrated["schema_version"])
+            self.assertIsNone(migrated["product_lock"])
+            self.assertEqual(original_graph, (directory / "archive-v12/delivery-graph.json").read_bytes())
+            state = delivery_graph.load_state(directory / "state.json")
+            self.assertTrue(state["readiness"]["product_lock_blocked"])
+            self.assertNotEqual("ready", state["readiness"]["status"])
+            self.assertEqual("draft", state["proof_contract"]["status"])
+            manifest = delivery_manifest.build_manifest(directory, "cross-domain-feature")
+            manifest_paths = {item["path"] for item in manifest["files"]}
+            self.assertIn("archive-v12/delivery-graph.json", manifest_paths)
+            self.assertIn("archive-v12/manifest.json", manifest_paths)
+            write_json(directory / "delivery-manifest.json", manifest)
+            archived_graph = directory / "archive-v12/delivery-graph.json"
+            archived_graph.chmod(0o600)
+            archived_graph.write_text("{}\n", encoding="utf-8")
+            errors = graph_validation.validate(root, "cross-domain-feature", final=True)
+            self.assertTrue(any("delivery artifact manifest is missing or stale" in error for error in errors), errors)
+
+    def test_v12_to_v13_migration_archives_mutable_records_and_rolls_back_failure(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            directory = root / "delivery/cross-domain-feature"
+            graph_path = directory / "delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            graph["schema_version"] = 12
+            graph.pop("product_lock")
+            graph["prototype"] = graph.pop("delivery_prototype")
+            for item in graph["nodes"]:
+                item.pop("origins", None)
+            write_json(graph_path, graph)
+            source_path = directory / "source-revisions/SRC-001.json"
+            source = json.loads(source_path.read_text())
+            source["schema_version"] = 12
+            source.pop("decisions")
+            source["source_digest"] = delivery_proof.value_digest({
+                key: source[key] for key in ("title", "description", "comments", "attachments", "risk_vector")
+            })
+            write_json(source_path, source)
+            ledger_path = root / ".dlv/findings/cross-domain-feature/ledger.json"
+            ledger = json.loads(ledger_path.read_text())
+            ledger["schema_version"] = 12
+            write_json(ledger_path, ledger)
+            review_path = root / ".dlv/reviews/cross-domain-feature/legacy.json"
+            run_path = root / ".dlv/runs/cross-domain-feature/legacy/evidence.json"
+            write_json(review_path, {"schema_version": 12, "legacy": "review"})
+            write_json(run_path, {"schema_version": 12, "legacy": "run"})
+            originals = {path: path.read_bytes() for path in (graph_path, source_path, ledger_path, review_path, run_path)}
+            with patch.object(upgrade_v12_to_v13, "compile_graph", side_effect=OSError("injected compile failure")):
+                with self.assertRaisesRegex(OSError, "injected compile failure"):
+                    upgrade_v12_to_v13.upgrade(root, "cross-domain-feature", apply=True)
+            self.assertFalse((directory / "archive-v12").exists())
+            for path, content in originals.items():
+                self.assertEqual(content, path.read_bytes(), path)
+
+            upgrade_v12_to_v13.upgrade(root, "cross-domain-feature", apply=True)
+            self.assertEqual(13, delivery_graph.load_graph(root, "cross-domain-feature")["schema_version"])
+            archive = directory / "archive-v12"
+            self.assertEqual(originals[ledger_path], (archive / "mutable-records/findings/ledger.json").read_bytes())
+            self.assertEqual(originals[review_path], (archive / "mutable-records/reviews/legacy.json").read_bytes())
+            self.assertEqual(originals[run_path], (archive / "mutable-records/runs/legacy/evidence.json").read_bytes())
+
+    def test_v12_to_v13_migration_recovers_hard_interrupt_and_preserves_owner_edits(self) -> None:
+        def prepare_v12(root: Path) -> tuple[Path, dict[str, object]]:
+            directory = root / "delivery/cross-domain-feature"
+            graph_path = directory / "delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            graph["schema_version"] = 12
+            graph.pop("product_lock")
+            graph["prototype"] = graph.pop("delivery_prototype")
+            for item in graph["nodes"]:
+                item.pop("origins", None)
+            write_json(graph_path, graph)
+            source_path = directory / "source-revisions/SRC-001.json"
+            source = json.loads(source_path.read_text())
+            source["schema_version"] = 12
+            source.pop("decisions")
+            source["source_digest"] = delivery_proof.value_digest({
+                key: source[key] for key in ("title", "description", "comments", "attachments", "risk_vector")
+            })
+            write_json(source_path, source)
+            state_path = directory / "state.json"
+            state = json.loads(state_path.read_text())
+            state["schema_version"] = 12
+            write_json(state_path, state)
+            return directory, graph
+
+        def promote_archive(root: Path, directory: Path) -> Path:
+            staging = root / ".dlv/v12-hard-interrupt"
+            shutil.copytree(directory, staging)
+            (staging / "mutable-records").mkdir()
+            write_json(staging / "manifest.json", upgrade_v12_to_v13._archive_manifest(staging, "cross-domain-feature"))
+            archive = directory / "archive-v12"
+            staging.rename(archive)
+            return archive
+
+        for state in ("v12", "source-only-v13", "partial-v13"):
+            with self.subTest(state=state):
+                temporary, root = self.make_root()
+                with temporary:
+                    directory, graph = prepare_v12(root)
+                    promote_archive(root, directory)
+                    if state in {"source-only-v13", "partial-v13"}:
+                        source_path = directory / "source-revisions/SRC-001.json"
+                        write_json(source_path, upgrade_v12_to_v13._migrated_source(json.loads(source_path.read_text())))
+                    if state == "partial-v13":
+                        write_json(directory / "delivery-graph.json", upgrade_v12_to_v13.migrated_graph(graph))
+                    upgrade_v12_to_v13.upgrade(root, "cross-domain-feature", apply=True)
+                    self.assertEqual(13, delivery_graph.load_graph(root, "cross-domain-feature")["schema_version"])
+                    self.assertTrue((directory / "archive-v12/manifest.json").is_file())
+
+                    owner_record = root / ".dlv/reviews/cross-domain-feature/owner-after-upgrade.json"
+                    write_json(owner_record, {"owner": "preserve"})
+                    with self.assertRaisesRegex(ValueError, "already upgraded"):
+                        upgrade_v12_to_v13.upgrade(root, "cross-domain-feature", apply=True)
+                    self.assertTrue(owner_record.is_file())
+
+        temporary, root = self.make_root()
+        with temporary:
+            directory, graph = prepare_v12(root)
+            promote_archive(root, directory)
+            candidate = upgrade_v12_to_v13.migrated_graph(graph)
+            candidate["title"] = "Owner edited after migration started"
+            write_json(directory / "delivery-graph.json", candidate)
+            source_path = directory / "source-revisions/SRC-001.json"
+            write_json(source_path, upgrade_v12_to_v13._migrated_source(json.loads(source_path.read_text())))
+            before = (directory / "delivery-graph.json").read_bytes()
+            with self.assertRaisesRegex(ValueError, "Owner edits"):
+                upgrade_v12_to_v13.upgrade(root, "cross-domain-feature", apply=True)
+            self.assertEqual(before, (directory / "delivery-graph.json").read_bytes())
+            self.assertTrue((directory / "archive-v12/manifest.json").is_file())
+
+    @unittest.skipIf(os.name == "nt", "symlink semantics differ on Windows")
+    def test_v12_to_v13_migration_rejects_symlink_without_partial_upgrade(self) -> None:
+        temporary, root = self.make_root()
+        with temporary, tempfile.TemporaryDirectory() as external_text:
+            directory = root / "delivery/cross-domain-feature"
+            graph_path = directory / "delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            graph["schema_version"] = 12
+            graph.pop("product_lock")
+            graph["prototype"] = graph.pop("delivery_prototype")
+            for item in graph["nodes"]:
+                item.pop("origins", None)
+            write_json(graph_path, graph)
+            source_path = directory / "source-revisions/SRC-001.json"
+            source = json.loads(source_path.read_text())
+            source["schema_version"] = 12
+            source.pop("decisions")
+            source["source_digest"] = delivery_proof.value_digest({
+                key: source[key] for key in ("title", "description", "comments", "attachments", "risk_vector")
+            })
+            write_json(source_path, source)
+            outside = Path(external_text) / "outside.txt"
+            outside.write_text("outside", encoding="utf-8")
+            (directory / "unsafe-link").symlink_to(outside)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                upgrade_v12_to_v13.upgrade(root, "cross-domain-feature", apply=True)
+            self.assertEqual(12, json.loads(graph_path.read_text())["schema_version"])
+            self.assertFalse((directory / "archive-v12").exists())
+            (directory / "unsafe-link").unlink()
+
+            reviews_external = Path(external_text) / "reviews"
+            reviews_external.mkdir()
+            sentinel = reviews_external / "sentinel.json"
+            sentinel.write_text('{"preserve": true}\n', encoding="utf-8")
+            reviews = root / ".dlv/reviews"
+            if reviews.exists():
+                shutil.rmtree(reviews)
+            reviews.symlink_to(reviews_external, target_is_directory=True)
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                upgrade_v12_to_v13.upgrade(root, "cross-domain-feature", apply=True)
+            self.assertEqual('{"preserve": true}\n', sentinel.read_text())
+            self.assertFalse((directory / "archive-v12").exists())
+
+    @unittest.skipIf(os.name == "nt", "symlink semantics differ on Windows")
+    def test_delivery_manifest_rejects_noncurrent_product_lock_symlink(self) -> None:
+        temporary, root = self.make_root()
+        with temporary, tempfile.TemporaryDirectory() as external_text:
+            external = Path(external_text) / "outside.json"
+            external.write_text('{"outside": true}\n', encoding="utf-8")
+            links = root / "delivery/cross-domain-feature/product-locks"
+            links.mkdir()
+            (links / "PCL-aaaaaaaaaaaa.json").symlink_to(external)
+            with self.assertRaisesRegex(ValueError, "single-linked regular file"):
+                delivery_manifest.build_manifest(root / "delivery/cross-domain-feature", "cross-domain-feature")
+            errors = graph_validation.validate(root, "cross-domain-feature")
+            self.assertTrue(any("product-locks contains an invalid artifact" in error for error in errors), errors)
+
+    def test_v11_generated_candidate_migrates_to_untrusted_delivery_prototype(self) -> None:
+        graph = valid_graph()
+        graph["schema_version"] = 11
+        graph.pop("product_lock")
+        graph.pop("delivery_prototype")
+        graph.pop("claims")
+        graph.pop("claim_successions")
+        graph["prototype"] = {
+            "status": "generated_candidate", "path": "prototype.html", "sha256": "1" * 64,
+            "generated_from_revision": "SRC-001", "generator": "legacy",
+        }
+        graph["metadata"].pop("review_budget")
+        graph["metadata"].pop("delivery_mode")
+        migrated = upgrade_v11_to_v12.migrated_graph(graph)
+        self.assertEqual("generated", migrated["delivery_prototype"]["status"])
+        self.assertEqual("1" * 64, migrated["delivery_prototype"]["sha256"])
+
     def test_v11_to_v12_migration_archives_mutable_truth_without_promoting_ready(self) -> None:
         temporary, root = self.make_root()
         with temporary:
@@ -4178,7 +5151,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             upgrade_v11_to_v12.upgrade(root, "cross-domain-feature", apply=True)
             migrated = delivery_graph.load_graph(root, "cross-domain-feature")
             state = delivery_graph.load_state(directory / "state.json")
-            self.assertEqual(12, migrated["schema_version"])
+            self.assertEqual(13, migrated["schema_version"])
             self.assertTrue(migrated["claims"])
             self.assertEqual({}, state["attestations"])
             self.assertNotEqual("ready", state["readiness"]["status"])
@@ -4239,7 +5212,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertEqual(original_source, source_path.read_bytes())
             self.assertFalse((directory / "archive-v11").exists())
             upgrade_v11_to_v12.upgrade(root, "cross-domain-feature", apply=True)
-            self.assertEqual(12, delivery_graph.load_graph(root, "cross-domain-feature")["schema_version"])
+            self.assertEqual(13, delivery_graph.load_graph(root, "cross-domain-feature")["schema_version"])
 
     @unittest.skipUnless(Path("/dev/fd").is_dir(), "open descriptor inventory is unavailable")
     def test_v11_to_v12_migration_closes_source_fd_when_archive_target_open_fails(self) -> None:
@@ -4357,15 +5330,16 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             archive = directory / "archive-v11"
             upgrade_v11_to_v12.os.replace(staging, archive)
             candidate = upgrade_v11_to_v12.migrated_graph(graph)
-            source["schema_version"] = 12
+            source["schema_version"] = 13
+            source["decisions"] = []
             write_json(source_path, source)
             write_json(directory / "delivery-graph.json", candidate)
             (directory / "state.json").unlink()
             before_graph = (directory / "delivery-graph.json").read_bytes()
             before_source = source_path.read_bytes()
-            with self.assertRaisesRegex(ValueError, "partial schema-v12 recovery is not automatic"):
+            with self.assertRaisesRegex(ValueError, "partial schema-v13 recovery is not automatic"):
                 upgrade_v11_to_v12.upgrade(root, "cross-domain-feature", apply=True)
-            self.assertEqual(12, delivery_graph.load_graph(root, "cross-domain-feature")["schema_version"])
+            self.assertEqual(13, delivery_graph.load_graph(root, "cross-domain-feature")["schema_version"])
             self.assertFalse((directory / "state.json").exists())
             self.assertEqual(before_graph, (directory / "delivery-graph.json").read_bytes())
             self.assertEqual(before_source, source_path.read_bytes())
@@ -4468,7 +5442,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             (directory / "state.md").write_text(original_state, encoding="utf-8")
             upgrade_v9_to_v10.apply_upgrade(root, "legacy-feature")
             self.assertFalse((directory / "state.md").exists())
-            self.assertEqual(12, json.loads((directory / "delivery-graph.json").read_text())["schema_version"])
+            self.assertEqual(13, json.loads((directory / "delivery-graph.json").read_text())["schema_version"])
 
     def test_v9_to_v10_recovery_rejects_changed_source_or_archive(self) -> None:
         temporary, root, directory = self.make_v9_root()

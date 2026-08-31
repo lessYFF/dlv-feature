@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create schema-v12 target-runtime Verification Runs."""
+"""Create schema-v13 target-runtime Verification Runs."""
 
 from graph_verification import main, record, render, start, validate_run
 

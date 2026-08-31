@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate schema-v12 Delivery Graph state, attestations, contract, and evidence."""
+"""Validate schema-v13 Delivery Graph state, attestations, contract, and evidence."""
 
 from __future__ import annotations
 
@@ -35,6 +35,7 @@ from delivery_governance import (
     finding_summary,
     ledger_path,
     load_ledger,
+    load_source_revision,
     source_revision_status,
 )
 from graph_contract import validate_contract
@@ -44,6 +45,7 @@ from delivery_contracts import claim_succession_map, convergence_vector, review_
 ALLOWED_FILES = {
     "delivery-graph.json", "state.json", "prd.md", "architecture-design.md",
     "code-spec.md", "proof-contract.json", "prototype.html", "verification.md",
+    "delivery-manifest.json",
 }
 
 
@@ -203,7 +205,7 @@ def validate_attestations(root: Path, feature_id: str, graph: dict[str, Any], st
         elif (
             set(execution) != {"mode", "engine", "independent"}
             or execution.get("mode") != "isolated_deterministic_lens"
-            or execution.get("engine") != "dlv-feature/graph-review-v12"
+            or execution.get("engine") != "dlv-feature/graph-review-v13"
             or execution.get("independent") is not True
         ):
             errors.append(f"deterministic attestation execution metadata is invalid: {lens}")
@@ -260,7 +262,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
         return errors + [f"state.json is not a valid object: {exc}"]
     expected_state_keys = {
         "schema_version", "feature_id", "graph_sha256", "node_hashes", "stage_hashes",
-        "readiness", "attestations", "source_revision", "risk", "finding_ledger", "convergence",
+        "readiness", "attestations", "source_revision", "product_lock", "risk", "finding_ledger", "convergence",
         "execution", "proof_contract", "code", "verification", "last_compiled_at",
     }
     if set(state) != expected_state_keys:
@@ -284,12 +286,13 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
             errors.append(f"generated artifact is missing or stale: {name}")
     try:
         source_status = source_revision_status(directory, feature_id, graph["source_revision"])
+        source_revision = load_source_revision(directory, feature_id, graph["source_revision"])
         ledger = load_ledger(root, feature_id)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         errors.append(f"governance records are invalid: {exc}")
-        source_status, ledger = {
+        source_status, source_revision, ledger = {
             "status": "drift"
-        }, {"entries": {}, "campaigns": [], "convergence_authority": None, "convergence_events": []}
+        }, None, {"entries": {}, "campaigns": [], "convergence_authority": None, "convergence_events": []}
     graph_claims = {claim["id"]: claim for claim in graph.get("claims", []) if isinstance(claim, dict)}
     successions = claim_succession_map(graph)
     for finding_id, entry in ledger.get("entries", {}).items():
@@ -313,6 +316,16 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     source_reference = state.get("source_revision")
     if source_reference != source_status:
         errors.append("state Source Revision reference is stale")
+    from product_lock import current_product_lock_errors
+    prd_path = directory / "prd.md"
+    lock_errors = ["current Product Lock cannot be validated without a valid Source Revision"]
+    if source_revision is not None:
+        lock_errors = current_product_lock_errors(
+            directory, graph, source_revision,
+            stage_hash(graph, "product"), file_digest(prd_path) if prd_path.is_file() else "",
+        )
+    if state.get("product_lock") != graph.get("product_lock"):
+        errors.append("state Product Lock reference is stale")
     risk = state.get("risk")
     if not isinstance(risk, dict) or set(risk) != {"source", "design", "observed", "effective", "profiles"}:
         errors.append("state risk assessment is invalid")
@@ -341,7 +354,10 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     ):
         errors.append("state convergence history is invalid")
     else:
-        expected_readiness = readiness(graph, state.get("attestations", {}), source_status=source_status, ledger=ledger)
+        expected_readiness = readiness(
+            graph, state.get("attestations", {}), source_status=source_status, ledger=ledger,
+            product_lock_errors=lock_errors,
+        )
         expected_vector = convergence_vector(graph, expected_readiness, ledger)
         campaigns = ledger.get("campaigns", [])
         expected_budget = review_budget(graph)
@@ -389,10 +405,13 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
         elif (
             expected_readiness["source_drift"]
             or expected_readiness["prototype_blocked"]
+            or expected_readiness["product_lock_blocked"]
             or expected_readiness["open_owner_decision_findings"]
             or exhausted
         ):
-            expected_status, expected_reason = "NEEDS_DECISION", "source/prototype/finding decision or review budget is required"
+            expected_status, expected_reason = "NEEDS_DECISION", "source/Product Lock/finding decision or review budget is required"
+        elif not campaigns and not lock_errors:
+            expected_status, expected_reason = "CONVERGING", "SAFE Product Lock established; architecture Review may begin"
         elif campaigns and consecutive_growth:
             expected_status, expected_reason = "DIVERGING", "a monitored obligation increased across two consecutive transitions"
         elif expected_previous == expected_vector:
@@ -414,7 +433,10 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     if not isinstance(execution, dict) or set(execution) != {"status", "checkpoint", "reason"}:
         errors.append("state execution checkpoint is invalid")
     validate_attestations(root, feature_id, graph, state, errors)
-    if state.get("readiness") != readiness(graph, state.get("attestations", {}), source_status=source_status, ledger=ledger):
+    if state.get("readiness") != readiness(
+        graph, state.get("attestations", {}), source_status=source_status, ledger=ledger,
+        product_lock_errors=lock_errors,
+    ):
         errors.append("state readiness disagrees with current review units/governance")
     contract_path = directory / "proof-contract.json"
     if not contract_path.is_file():
@@ -542,7 +564,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
             if not report_path.is_file() or report_path.read_text(encoding="utf-8") != expected_report:
                 errors.append("generated Verification report is missing or stale")
     elif (directory / "verification.md").exists() or (directory / "verification.md").is_symlink():
-        errors.append("verification.md exists without an active schema-v12 run")
+        errors.append("verification.md exists without an active schema-v13 run")
     if final:
         if state.get("readiness", {}).get("status") != "ready":
             errors.append("final validation requires Delivery Readiness")
@@ -559,17 +581,28 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
             errors.append("finalization record is invalid")
         elif record.get("token") != finalization_token(state, report_sha):
             errors.append("finalization token is stale")
+        from delivery_manifest import build_manifest
+        manifest_path = directory / "delivery-manifest.json"
+        if not manifest_path.is_file() or load_json(manifest_path) != build_manifest(directory, feature_id):
+            errors.append("delivery artifact manifest is missing or stale")
     if directory.is_dir():
         for entry in directory.iterdir():
-            if entry.is_dir() and entry.name == "archive-v11":
+            if entry.is_dir() and entry.name in {"archive-v11", "archive-v12"}:
                 if entry.is_symlink():
-                    errors.append("archive-v11 must not be a symlink")
+                    errors.append(f"{entry.name} must not be a symlink")
                 continue
-            if entry.is_dir() and entry.name != "source-revisions":
+            if entry.is_dir() and entry.name not in {"source-revisions", "product-locks"}:
                 errors.append(f"unexpected directory in feature artifact set: {entry.name}/")
             elif entry.is_dir() and entry.name == "source-revisions":
-                if any(not item.is_file() or item.suffix != ".json" for item in entry.iterdir()):
+                if any(item.is_symlink() or not item.is_file() or item.suffix != ".json" for item in entry.iterdir()):
                     errors.append("source-revisions contains an invalid artifact")
+            elif entry.is_dir() and entry.name == "product-locks":
+                if any(
+                    item.is_symlink() or not item.is_file()
+                    or not re.fullmatch(r"PCL-[0-9a-f]{12}\.json", item.name)
+                    for item in entry.iterdir()
+                ):
+                    errors.append("product-locks contains an invalid artifact")
             elif entry.name not in ALLOWED_FILES:
                 errors.append(f"unexpected feature artifact: {entry.name}")
     return errors

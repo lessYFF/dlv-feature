@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Quality-preserving frontend fast path for schema-v12 deliveries."""
+"""Quality-preserving frontend fast path for schema-v13 deliveries."""
 
 from __future__ import annotations
 

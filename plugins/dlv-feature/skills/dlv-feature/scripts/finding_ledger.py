@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Perform explicit Owner decisions on a schema-v12 Finding Ledger entry."""
+"""Perform explicit Owner decisions on a schema-v13 Finding Ledger entry."""
 
 from __future__ import annotations
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Deterministically finalize a schema-v12 Delivery Graph Verification Run."""
+"""Deterministically finalize a schema-v13 Delivery Graph Verification Run."""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ from pathlib import Path
 from delivery_graph import atomic_write_json, confined_project_path, feature_dir, load_state, timestamp
 from delivery_proof import atomic_write_text, exclusive_file_lock, file_digest
 from graph_validation import finalization_token, validate
+from delivery_manifest import build_manifest
 from graph_verification import recover_pending_transaction, render, run_directory, validate_run
 
 
@@ -32,6 +33,7 @@ def finalize(root: Path, feature_id: str) -> Path:
     directory = feature_dir(root, feature_id)
     state_path = directory / "state.json"
     report_path = directory / "verification.md"
+    manifest_path = directory / "delivery-manifest.json"
     state = load_state(state_path)
     run_id = state.get("verification", {}).get("active_run_id")
     if not isinstance(run_id, str) or not run_id:
@@ -44,8 +46,8 @@ def finalize(root: Path, feature_id: str) -> Path:
         # later validation failure cannot strand manifest and state at
         # different hash-chain heads.
         recover_pending_transaction(root, feature_id, run_id)
-        original_state, original_report = _text(state_path), _text(report_path)
-        expected_state, expected_report = original_state, original_report
+        original_state, original_report, original_manifest = _text(state_path), _text(report_path), _text(manifest_path)
+        expected_state, expected_report, expected_manifest = original_state, original_report, original_manifest
         try:
             state = load_state(state_path)
             errors = validate(root, feature_id)
@@ -69,13 +71,16 @@ def finalize(root: Path, feature_id: str) -> Path:
             verification["finalization"]["token"] = finalization_token(state, file_digest(report_path))
             atomic_write_json(state_path, state)
             expected_state = _text(state_path)
+            atomic_write_json(manifest_path, build_manifest(directory, feature_id))
+            expected_manifest = _text(manifest_path)
             final_errors = validate(root, feature_id, final=True)
             if final_errors:
                 raise ValueError("; ".join(final_errors))
         except BaseException:
             state_restored = _restore(state_path, original_state, expected_state)
             report_restored = _restore(report_path, original_report, expected_report)
-            if not state_restored or not report_restored:
+            manifest_restored = _restore(manifest_path, original_manifest, expected_manifest)
+            if not state_restored or not report_restored or not manifest_restored:
                 raise ValueError("finalization failed and concurrent edits were preserved")
             raise
     return state_path

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Schema-v12 Delivery Graph kernel and deterministic artifact compiler.
+"""Schema-v13 Delivery Graph kernel and deterministic artifact compiler.
 
-`delivery-graph.json` is the only editable delivery truth in schema v12.  This
+`delivery-graph.json` is the only editable delivery truth in schema v13.  This
 module validates it, computes dependency-scoped hashes, renders disposable
 human views, derives the Proof Contract, and keeps only references in
 `state.json`.
@@ -49,9 +49,10 @@ from delivery_contracts import (
     SCHEMA_VERSION,
     claim_errors,
     convergence_vector,
-    prototype_provenance_errors,
+    delivery_prototype_provenance_errors,
     prototype_review_blockers,
-    prototype_shape_errors,
+    delivery_prototype_shape_errors,
+    origin_errors,
     review_budget,
     target_attestation_provenance_errors,
 )
@@ -201,7 +202,8 @@ def default_graph(feature_id: str, title: str | None = None) -> dict[str, Any]:
         "claim_successions": [],
         "nodes": [],
         "edges": [],
-        "prototype": {"status": "not_applicable", "reason": "No visible UI contract is in scope."},
+        "product_lock": None,
+        "delivery_prototype": {"status": "not_applicable", "reason": "No visible UI contract is in scope."},
         "metadata": {
             "risk_vector": {axis: "absent" for axis in RISK_AXES},
             "review_budget": review_budget({"metadata": {}}),
@@ -268,7 +270,7 @@ def graph_digest(graph: dict[str, Any]) -> str:
 
 def structural_errors(graph: dict[str, Any], feature_id: str | None = None) -> list[str]:
     errors: list[str] = []
-    allowed_top = {"schema_version", "feature_id", "title", "source_revision", "claims", "claim_successions", "nodes", "edges", "prototype", "metadata"}
+    allowed_top = {"schema_version", "feature_id", "title", "source_revision", "product_lock", "claims", "claim_successions", "nodes", "edges", "delivery_prototype", "metadata"}
     unknown = set(graph) - allowed_top
     if unknown:
         errors.append("Delivery Graph contains unknown top-level keys: " + ", ".join(sorted(unknown)))
@@ -315,7 +317,7 @@ def structural_errors(graph: dict[str, Any], feature_id: str | None = None) -> l
         if not isinstance(node, dict):
             errors.append(f"{location} must be an object")
             continue
-        unknown_node = set(node) - {"id", "type", "title", "statement", "attributes"}
+        unknown_node = set(node) - {"id", "type", "title", "statement", "origins", "attributes"}
         if unknown_node:
             errors.append(f"{location} contains unknown keys: {', '.join(sorted(unknown_node))}")
         node_id, node_type = node.get("id"), node.get("type")
@@ -391,18 +393,19 @@ def structural_errors(graph: dict[str, Any], feature_id: str | None = None) -> l
     if any(visit(node_id) for node_id in sorted(dependency_graph) if node_id not in visited):
         errors.append("Delivery Graph dependency relationships must be acyclic")
     errors.extend(claim_errors(graph))
-    errors.extend(prototype_shape_errors(graph.get("prototype")))
+    errors.extend(origin_errors(graph))
+    errors.extend(delivery_prototype_shape_errors(graph.get("delivery_prototype")))
     return errors
 
 
 def prototype_errors(root: Path, feature_id: str, graph: dict[str, Any]) -> list[str]:
-    """Validate the editable Prototype bytes bound by the Product contract."""
+    """Validate generated Delivery Prototype bytes; raw prototypes remain Source assets."""
     directory = feature_dir(root, feature_id)
     try:
         source = load_source_revision(directory, feature_id, graph["source_revision"])
     except (OSError, ValueError, KeyError) as exc:
         return [str(exc)]
-    return prototype_provenance_errors(root, directory, graph, source)
+    return delivery_prototype_provenance_errors(root, directory, graph, source)
 
 
 def dependency_closure(
@@ -477,7 +480,7 @@ def stage_node_ids(graph: dict[str, Any], stage: str) -> set[str]:
 def stage_hash(graph: dict[str, Any], stage: str) -> str:
     payload: dict[str, Any] = {"stage": stage, **subgraph(graph, stage_node_ids(graph, stage))}
     if stage == "product":
-        payload["prototype"] = graph.get("prototype", {"status": "not_applicable"})
+        payload["delivery_prototype"] = graph.get("delivery_prototype", {"status": "not_applicable"})
     return value_digest(payload)
 
 
@@ -510,7 +513,7 @@ def lens_hash(graph: dict[str, Any], lens: str) -> str:
     payload: dict[str, Any] = {"lens": lens, **subgraph(graph, lens_node_ids(graph, lens))}
     payload["claims"] = [claim for claim in canonical_claims(graph) if claim.get("lens") == lens]
     if lens == "PROVENANCE_INTEGRITY":
-        payload["prototype"] = graph.get("prototype", {"status": "not_applicable"})
+        payload["delivery_prototype"] = graph.get("delivery_prototype", {"status": "not_applicable"})
     return value_digest(payload)
 
 
@@ -567,7 +570,7 @@ def lens_components(graph: dict[str, Any], lens: str) -> list[dict[str, Any]]:
         ]
         component_payload["claims"] = component_claims
         if lens == "PROVENANCE_INTEGRITY":
-            component_payload["prototype"] = graph.get("prototype", {"status": "not_applicable"})
+            component_payload["delivery_prototype"] = graph.get("delivery_prototype", {"status": "not_applicable"})
             component_payload["source_revision"] = graph.get("source_revision")
         result.append({
             "unit_id": f"{lens}--{component_id}",
@@ -657,6 +660,7 @@ def review_units(graph: dict[str, Any]) -> dict[str, dict[str, Any]]:
 def readiness(
     graph: dict[str, Any], attestations: dict[str, Any], *,
     source_status: dict[str, Any] | None = None, ledger: dict[str, Any] | None = None,
+    product_lock_errors: list[str] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(attestations, dict):
         attestations = {}
@@ -670,7 +674,8 @@ def readiness(
     finding_counts = finding_summary(ledger) if ledger is not None else {"open_blockers": 0, "owner_decisions": 0}
     drift = source_status is not None and source_status.get("status") != "confirmed"
     prototype_blocked = bool(prototype_review_blockers(graph))
-    if drift or prototype_blocked or finding_counts["owner_decisions"]:
+    product_lock_blocked = bool(product_lock_errors)
+    if drift or prototype_blocked or product_lock_blocked or finding_counts["owner_decisions"]:
         status = "needs_decision"
     elif blocked or finding_counts["open_blockers"]:
         status = "blocked"
@@ -686,6 +691,8 @@ def readiness(
         "global_skeleton_sha256": units[GLOBAL_LENS]["subgraph_sha256"],
         "source_drift": bool(drift),
         "prototype_blocked": prototype_blocked,
+        "product_lock_blocked": product_lock_blocked,
+        "product_lock_errors": list(product_lock_errors or []),
         "open_blocking_findings": finding_counts["open_blockers"],
         "open_owner_decision_findings": finding_counts["owner_decisions"],
     }
@@ -911,7 +918,7 @@ def formal_feature_commits(root: Path, feature_id: str) -> list[str]:
 
 
 def active_review_lenses(graph: dict[str, Any]) -> list[str]:
-    """Return the deliberately small generic schema-v12 risk-lens set."""
+    """Return the deliberately small generic schema-v13 risk-lens set."""
     return sorted(CLAIM_LENSES)
 
 
@@ -1025,7 +1032,7 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
             if node["type"] in {"Decision", "StateTransition"} and not typed_edges(target=node["id"], relation="changes", source_type="Change"):
                 add("ARCH_CHANGE_UNMAPPED", node["id"], f"{node['type']} requires an implementation Change")
     if "RUNTIME_AUTHENTICITY" in enabled:
-        prototype_status = graph.get("prototype", {}).get("status")
+        prototype_status = graph.get("delivery_prototype", {}).get("status")
         claims = graph.get("claims", [])
         if not claims:
             add("CLAIM_SET_EMPTY", "GRAPH", "Delivery Graph requires explicit stable Claims")
@@ -1133,7 +1140,7 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
                                 + (": " + ", ".join(invalid_bindings) if invalid_bindings else ""),
                                 "critical",
                             )
-        if prototype_status == "contractual":
+        if prototype_status == "generated":
             product_nodes = [node for node in nodes.values() if node["type"] in {"Acceptance", "Exception"}]
             applicable = {
                 node["id"] for node in product_nodes
@@ -1145,7 +1152,7 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
             ):
                 add(
                     "PROTOTYPE_APPLICABILITY_INVALID", "GRAPH",
-                    "Contractual Prototype requires every Acceptance/Exception to declare prototype_applicable and at least one true value",
+                    "Delivery Prototype requires every Acceptance/Exception to declare prototype_applicable and at least one true value",
                     "critical",
                 )
             visual_targets = {
@@ -1157,13 +1164,13 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
             if not applicable or not applicable <= visual_targets:
                 add(
                     "PROTOTYPE_VISUAL_PROOF_MISSING", "GRAPH",
-                    "Contractual Prototype requires zero-difference visual Proof coverage for every prototype-applicable Acceptance/Exception",
+                    "Delivery Prototype requires zero-difference visual Proof coverage for every prototype-applicable Acceptance/Exception",
                     "critical",
                 )
         if graph_risk_vector(graph)["VISUAL_CONTRACT"] != "absent" and prototype_status == "not_applicable":
             add(
                 "PROTOTYPE_MODE_MISMATCH", "GRAPH",
-                "VISUAL_CONTRACT risk requires a reference or contractual Prototype, not not_applicable",
+                "VISUAL_CONTRACT risk requires a generated Delivery Prototype, not not_applicable",
                 "major",
             )
         for required_type in ("Test", "Environment", "Proof", "Assertion"):
@@ -1431,7 +1438,7 @@ def generate_proof_contract(graph: dict[str, Any]) -> dict[str, Any]:
             "environment_id": environment_ids[0] if len(environment_ids) == 1 else None,
             "critical": attrs.get("critical", True),
             "runner": attrs.get("runner"),
-            "prototype_sha256": graph.get("prototype", {}).get("sha256") if attrs.get("proof_type") == "visual" else None,
+            "prototype_sha256": graph.get("delivery_prototype", {}).get("sha256") if attrs.get("proof_type") == "visual" else None,
             "capture_profile": attrs.get("capture_profile") if attrs.get("proof_type") == "visual" else None,
             "assertions": assertions,
         })
@@ -1440,6 +1447,7 @@ def generate_proof_contract(graph: dict[str, Any]) -> dict[str, Any]:
         "feature_id": graph["feature_id"],
         "graph_sha256": graph_digest(graph),
         "subgraph_sha256": stage_hash(graph, "implementation_proof"),
+        "product_lock_sha256": graph.get("product_lock", {}).get("sha256") if isinstance(graph.get("product_lock"), dict) else None,
         "claims": canonical_claims(graph),
         "environments": environments,
         "obligations": obligations,
@@ -1477,6 +1485,7 @@ def _valid_attestation_reference(root: Path, feature_id: str, unit_id: str, summ
 def compile_graph(
     root: Path, feature_id: str, *, check: bool = False,
     _lock_held: bool = False, expected_existing: dict[str, str] | None = None,
+    _captured_outputs: dict[Path, str] | None = None,
 ) -> dict[str, Any]:
     root = root.expanduser().resolve()
     directory = feature_dir(root, feature_id)
@@ -1484,7 +1493,13 @@ def compile_graph(
     source_path = graph_path(root, feature_id)
     source_sha256 = file_digest(source_path)
     errors = structural_errors(graph, feature_id)
-    errors.extend(prototype_errors(root, feature_id, graph))
+    # A Source epoch may legitimately make the generated prototype stale.
+    # Compile that blocked state so the user can regenerate it; all other
+    # prototype provenance failures remain structural errors.
+    errors.extend(
+        error for error in prototype_errors(root, feature_id, graph)
+        if error != "generated Delivery Prototype source revision is stale"
+    )
     try:
         source_status = source_revision_status(directory, feature_id, graph["source_revision"])
         source_revision = load_source_revision(directory, feature_id, graph["source_revision"])
@@ -1527,7 +1542,18 @@ def compile_graph(
             "effective": union_risk_vectors(source_revision["risk_vector"], design_risk, observed_risk),
         }
         risk["profiles"] = profiles_for(risk["effective"])
-        delivery_readiness = readiness(graph, attestations, source_status=source_status, ledger=ledger)
+        product_document = render_stage_document(graph, "product")
+        from product_lock import current_product_lock_errors
+        lock_errors = current_product_lock_errors(
+            directory, graph, source_revision, stage_hashes["product"],
+            hashlib.sha256(product_document.encode("utf-8")).hexdigest(),
+        )
+        if lock_errors:
+            attestations = {}
+        delivery_readiness = readiness(
+            graph, attestations, source_status=source_status, ledger=ledger,
+            product_lock_errors=lock_errors,
+        )
         contract = generate_proof_contract(graph)
         previous_contract = load_json(contract_path) if contract_path.is_file() else None
         sealed_contract_preserved = False
@@ -1542,6 +1568,7 @@ def compile_graph(
         else:
             contract["attestations"] = dict(attestations)
         implementation_changed = previous.get("stage_hashes", {}).get("implementation_proof") != stage_hashes["implementation_proof"]
+        product_lock_changed = previous.get("product_lock") != graph.get("product_lock") or bool(lock_errors)
         code = copy.deepcopy(previous.get("code", {"status": "pending", "repository_fingerprint": None}))
         verification = copy.deepcopy(previous.get("verification", {
             "status": "pending", "active_run_id": None, "run_digest": None,
@@ -1552,7 +1579,7 @@ def compile_graph(
             and previous_contract.get("status") == "sealed"
             and not sealed_contract_preserved
         )
-        if implementation_changed or sealed_contract_invalidated:
+        if implementation_changed or product_lock_changed or sealed_contract_invalidated:
             code = {"status": "stale" if code.get("status") == "completed" else "pending", "repository_fingerprint": None}
             verification = {"status": "pending", "active_run_id": None, "run_digest": None, "verdict": None, "finalization": None}
         if formal_feature_commits(root, feature_id) and code.get("status") == "pending":
@@ -1582,8 +1609,11 @@ def compile_graph(
         if appended_event:
             previous_event = events[-2] if len(events) >= 2 else None
         else:
-            previous_event = events[-1] if events else None
-        prior_vector = previous_event["vector"] if previous_event else None
+            previous_event = None
+        prior_vector = previous_event["vector"] if previous_event else (
+            previous.get("convergence", {}).get("previous_vector")
+            if isinstance(previous.get("convergence"), dict) else None
+        )
         distinct_history: list[list[int]] = []
         for event in ledger["convergence_events"]:
             if not distinct_history or distinct_history[-1] != event["vector"]:
@@ -1602,10 +1632,13 @@ def compile_graph(
         elif (
             delivery_readiness["source_drift"]
             or delivery_readiness["prototype_blocked"]
+            or delivery_readiness["product_lock_blocked"]
             or delivery_readiness["open_owner_decision_findings"]
             or exhausted
         ):
-            convergence_status, convergence_reason = "NEEDS_DECISION", "source/prototype/finding decision or review budget is required"
+            convergence_status, convergence_reason = "NEEDS_DECISION", "source/Product Lock/finding decision or review budget is required"
+        elif not campaigns and not lock_errors:
+            convergence_status, convergence_reason = "CONVERGING", "SAFE Product Lock established; architecture Review may begin"
         elif campaigns and consecutive_growth:
             convergence_status, convergence_reason = "DIVERGING", "a monitored obligation increased across two consecutive transitions"
         elif isinstance(prior_vector, list) and vector == prior_vector:
@@ -1634,6 +1667,7 @@ def compile_graph(
             "readiness": delivery_readiness,
             "attestations": attestations,
             "source_revision": source_status,
+            "product_lock": copy.deepcopy(graph.get("product_lock")),
             "risk": risk,
             "finding_ledger": {
                 "record_path": f".dlv/findings/{feature_id}/ledger.json",
@@ -1654,7 +1688,7 @@ def compile_graph(
         }
         outputs = {
             **({root / f".dlv/findings/{feature_id}/ledger.json": ledger_content} if ledger_needs_write else {}),
-            directory / "prd.md": render_stage_document(graph, "product"),
+            directory / "prd.md": product_document,
             directory / "architecture-design.md": render_stage_document(graph, "architecture"),
             directory / "code-spec.md": render_stage_document(graph, "implementation_proof"),
             contract_path: json.dumps(contract, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -1689,6 +1723,8 @@ def compile_graph(
                     raise ValueError("Delivery Graph changed during compilation")
                 if any(not path.is_file() or path.read_text(encoding="utf-8") != content for path, content in outputs.items()):
                     raise ValueError("generated artifacts changed during compilation")
+                if _captured_outputs is not None:
+                    _captured_outputs.update(outputs)
             except BaseException:
                 reconciliation_required = False
                 for path in reversed(written):
@@ -1710,12 +1746,17 @@ def compile_graph(
 def mark_code_complete(root: Path, feature_id: str) -> str:
     root = root.expanduser().resolve()
     directory = feature_dir(root, feature_id)
-    graph = load_graph(root, feature_id)
     state_path = directory / "state.json"
     lock = confined_project_path(root, Path(".dlv") / "runs" / feature_id / ".feature.lock", "feature lock")
     with exclusive_file_lock(lock):
+        graph = load_graph(root, feature_id)
         state = load_state(state_path)
-        if state.get("readiness", {}).get("status") != "ready" or state.get("convergence", {}).get("status") == "NEEDS_DECISION":
+        from product_lock import live_product_lock_errors
+        lock_errors = live_product_lock_errors(root, feature_id, graph)
+        if (
+            lock_errors or state.get("readiness", {}).get("status") != "ready"
+            or state.get("convergence", {}).get("status") != "READY"
+        ):
             raise ValueError("Code requires current Source Revision, zero blocking Findings, and Delivery Readiness")
         observed = observed_code_risk_vector(root, graph)
         planned = union_risk_vectors(

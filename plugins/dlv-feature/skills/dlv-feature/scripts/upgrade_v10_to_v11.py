@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility importer: migrate a schema-v10 Delivery Graph to schema v12.
+"""Compatibility importer: migrate a schema-v10 Delivery Graph to schema v13.
 
 The migration never rewrites prior reviews, Proofs, runs, or evidence.  It
 archives the mutable v10 delivery artifacts byte-for-byte, starts a new Source
@@ -142,7 +142,7 @@ def upgrade(root: Path, feature_id: str, *, apply: bool) -> dict[str, object]:
             archived_candidate = migrated_graph(_v11_graph(archived_graph))
             state = load_json(directory / "state.json") if (directory / "state.json").is_file() else {}
             source = load_json(directory / "source-revisions/SRC-001.json") if (directory / "source-revisions/SRC-001.json").is_file() else {}
-            if current == archived_candidate and state.get("schema_version") == 12 and source.get("schema_version") == 12:
+            if current == archived_candidate and state.get("schema_version") == 13 and source.get("schema_version") == 13:
                 return archived_candidate
             if current.get("schema_version") == 10:
                 current_artifacts = {
@@ -152,8 +152,8 @@ def upgrade(root: Path, feature_id: str, *, apply: bool) -> dict[str, object]:
                 }
                 if current != archived_graph or current_artifacts != manifest:
                     raise ValueError("schema-v10 delivery truth diverged after archive creation; preserve Owner edits")
-            elif current.get("schema_version") == 12:
-                raise ValueError("partial schema-v12 recovery is not automatic; preserve Owner edits and use a future versioned recovery")
+            elif current.get("schema_version") == 13:
+                raise ValueError("partial schema-v13 recovery is not automatic; preserve Owner edits and use a future versioned recovery")
             else:
                 raise ValueError("schema-v10 migration state is unsupported")
         if current.get("schema_version") != 10 or current.get("feature_id") != feature_id:

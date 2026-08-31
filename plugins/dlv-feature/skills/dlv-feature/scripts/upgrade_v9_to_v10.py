@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility importer: upgrade a schema-v9 delivery into schema v12."""
+"""Compatibility importer: upgrade a schema-v9 delivery into schema v13."""
 
 from __future__ import annotations
 
@@ -220,7 +220,7 @@ def convert(root: Path, feature_id: str) -> dict[str, Any]:
     }
     result = migrated_graph(v11)
     result["metadata"].update({
-        "upgrade": "schema-v9-to-v12",
+        "upgrade": "schema-v9-to-v13",
         "candidate_only": True,
         "source_state_sha256": v11["metadata"]["source_state_sha256"],
         "source_artifacts_sha256": v11["metadata"]["source_artifacts_sha256"],
@@ -237,12 +237,12 @@ def apply_upgrade(root: Path, feature_id: str) -> Path:
     with exclusive_file_lock(lock):
         if graph_path.is_file():
             graph = load_json(graph_path)
-            if graph.get("schema_version") != 12 or graph.get("feature_id") != feature_id:
-                raise ValueError("existing delivery-graph.json is not this feature's schema-v12 graph")
+            if graph.get("schema_version") != 13 or graph.get("feature_id") != feature_id:
+                raise ValueError("existing delivery-graph.json is not this feature's schema-v13 graph")
             upgrade = graph.get("metadata")
             if (
                 not isinstance(upgrade, dict)
-                or upgrade.get("upgrade") != "schema-v9-to-v12"
+                or upgrade.get("upgrade") != "schema-v9-to-v13"
                 or upgrade.get("candidate_only") is not True
                 or not isinstance(upgrade.get("source_state_sha256"), str)
                 or not isinstance(upgrade.get("source_artifacts_sha256"), dict)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Schema-v12 quality contracts shared by graph, Review, and Verification.
+"""Schema-v13 quality contracts shared by graph, Review, and Verification.
 
 This module deliberately contains policy-free deterministic checks.  It never
 decides PASS, lowers risk, or waives a Claim.
@@ -14,7 +14,7 @@ from typing import Any
 from delivery_proof import file_digest, value_digest
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 CLAIM_LENSES = (
     "PROVENANCE_INTEGRITY",
     "STATE_AND_ATOMICITY",
@@ -23,7 +23,8 @@ CLAIM_LENSES = (
 )
 CLAIM_ID = re.compile(r"^CLM-[0-9a-f]{12}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
-PROTOTYPE_SOURCE_KINDS = {"source_revision", "attachment"}
+PRODUCT_NODE_TYPES = {"Requirement", "Behavior", "Acceptance", "Exception"}
+ORIGIN_KINDS = {"direct", "derived"}
 DEFAULT_REVIEW_BUDGET = {
     "max_campaigns": 3,
     "max_unit_reviews": 24,
@@ -145,69 +146,82 @@ def review_budget(graph: dict[str, Any]) -> dict[str, int]:
     return result
 
 
-def prototype_shape_errors(prototype: Any) -> list[str]:
+def origin_errors(graph: dict[str, Any]) -> list[str]:
+    """Require every contractual product statement to explain where it came from."""
+    errors: list[str] = []
+    for index, node in enumerate(graph.get("nodes", [])):
+        if not isinstance(node, dict) or node.get("type") not in PRODUCT_NODE_TYPES:
+            continue
+        origins = node.get("origins")
+        label = f"nodes[{index}].origins"
+        if not isinstance(origins, list) or not origins:
+            errors.append(f"{label} must be a non-empty array")
+            continue
+        for origin_index, origin in enumerate(origins):
+            origin_label = f"{label}[{origin_index}]"
+            if not isinstance(origin, dict) or origin.get("kind") not in ORIGIN_KINDS:
+                errors.append(f"{origin_label} must declare direct or derived origin kind")
+                continue
+            if origin["kind"] == "direct":
+                if set(origin) != {"kind", "source_ref"} or not isinstance(origin.get("source_ref"), str) or not origin["source_ref"].strip():
+                    errors.append(f"{origin_label} direct origin requires exactly a non-empty source_ref")
+            elif (
+                set(origin) != {"kind", "constraint_ref", "reason"}
+                or not isinstance(origin.get("constraint_ref"), str) or not origin["constraint_ref"].strip()
+                or not isinstance(origin.get("reason"), str) or not origin["reason"].strip()
+            ):
+                errors.append(f"{origin_label} derived origin requires constraint_ref and reason")
+    return errors
+
+
+def delivery_prototype_shape_errors(prototype: Any) -> list[str]:
     if not isinstance(prototype, dict):
-        return ["prototype declaration must be an object"]
+        return ["delivery_prototype declaration must be an object"]
     status = prototype.get("status")
     if status == "not_applicable":
         if set(prototype) != {"status", "reason"} or not isinstance(prototype.get("reason"), str) or not prototype["reason"].strip():
-            return ["not-applicable prototype requires exactly status and a non-empty reason"]
+            return ["not-applicable delivery_prototype requires exactly status and a non-empty reason"]
         return []
-    if status == "generated_candidate":
-        expected = {"status", "path", "sha256", "generated_from_revision", "generator"}
-        if set(prototype) != expected or prototype.get("path") != "prototype.html" or not isinstance(prototype.get("generator"), str) or not prototype["generator"].strip():
-            return ["generated_candidate prototype requires path, sha256, generated_from_revision, and generator"]
-        if not isinstance(prototype.get("generated_from_revision"), str):
-            return ["generated_candidate prototype revision is invalid"]
-    elif status in {"reference", "contractual"}:
-        expected = {"status", "path", "sha256", "source_revision", "source_kind", "source_ref", "source_sha256"}
-        if set(prototype) != expected or prototype.get("path") != "prototype.html":
-            return ["reference/contractual prototype requires exact source provenance fields"]
-        if prototype.get("source_kind") not in PROTOTYPE_SOURCE_KINDS or not isinstance(prototype.get("source_ref"), str) or not prototype["source_ref"].strip():
-            return ["reference/contractual prototype source provenance is invalid"]
-    else:
-        return ["prototype status must be not_applicable, generated_candidate, reference, or contractual"]
-    for key in ("sha256", "source_sha256") if status in {"reference", "contractual"} else ("sha256",):
-        if not isinstance(prototype.get(key), str) or not SHA256.fullmatch(prototype[key]):
-            return [f"prototype {key} must be SHA-256"]
+    expected = {"status", "path", "sha256", "generated_from_revision", "generator"}
+    if status != "generated" or set(prototype) != expected or prototype.get("path") != "prototype.html":
+        return ["delivery_prototype must be not_applicable or a generated prototype.html"]
+    if not isinstance(prototype.get("generated_from_revision"), str):
+        return ["generated delivery_prototype revision is invalid"]
+    if not isinstance(prototype.get("generator"), str) or not prototype["generator"].strip():
+        return ["generated delivery_prototype generator is invalid"]
+    if not isinstance(prototype.get("sha256"), str) or not SHA256.fullmatch(prototype["sha256"]):
+        return ["delivery_prototype sha256 must be SHA-256"]
     return []
 
 
-def prototype_provenance_errors(
+def delivery_prototype_provenance_errors(
     root: Path, feature_directory: Path, graph: dict[str, Any], source_revision: dict[str, Any],
 ) -> list[str]:
-    prototype = graph.get("prototype", {})
+    prototype = graph.get("delivery_prototype", {})
     status = prototype.get("status") if isinstance(prototype, dict) else None
     if status == "not_applicable":
         path = feature_directory / "prototype.html"
-        return ["prototype.html exists while prototype is not_applicable"] if path.exists() or path.is_symlink() else []
-    if status not in {"generated_candidate", "reference", "contractual"}:
-        return ["prototype declaration is invalid"]
+        return ["prototype.html exists while delivery_prototype is not_applicable"] if path.exists() or path.is_symlink() else []
+    if status != "generated":
+        return ["delivery_prototype declaration is invalid"]
     path = feature_directory / "prototype.html"
     if not path.is_file() or path.resolve() != path.absolute():
         return ["Prototype requires a regular, non-symlink prototype.html"]
-    errors = [] if file_digest(path) == prototype.get("sha256") else ["Prototype fingerprint is missing or stale"]
-    if status == "generated_candidate":
-        if prototype.get("generated_from_revision") != graph.get("source_revision"):
-            errors.append("generated Prototype source revision is stale")
-        return errors
-    if prototype.get("source_revision") != graph.get("source_revision") or source_revision.get("revision_id") != graph.get("source_revision"):
-        errors.append("Prototype provenance is bound to a stale Source Revision")
-        return errors
-    if prototype.get("source_kind") == "source_revision":
-        if prototype.get("source_ref") != source_revision.get("revision_id") or prototype.get("source_sha256") != source_revision.get("source_digest"):
-            errors.append("Prototype source revision provenance is missing or stale")
-    else:
-        attachments = source_revision.get("attachments", [])
-        matches = [item for item in attachments if isinstance(item, dict) and item.get("ref") == prototype.get("source_ref")]
-        if len(matches) != 1 or matches[0].get("sha256") != prototype.get("source_sha256"):
-            errors.append("Prototype attachment provenance is missing or stale")
+    errors = [] if file_digest(path) == prototype.get("sha256") else ["Delivery Prototype fingerprint is missing or stale"]
+    if prototype.get("generated_from_revision") != graph.get("source_revision"):
+        errors.append("generated Delivery Prototype source revision is stale")
     return errors
 
 
 def prototype_review_blockers(graph: dict[str, Any]) -> list[str]:
-    prototype = graph.get("prototype", {})
-    return ["generated Prototype candidate must be bound to an authentic requirement source before Review"] if isinstance(prototype, dict) and prototype.get("status") == "generated_candidate" else []
+    """Return prototype provenance drift that must block Product Alignment/Review."""
+    prototype = graph.get("delivery_prototype")
+    if (
+        isinstance(prototype, dict) and prototype.get("status") == "generated"
+        and prototype.get("generated_from_revision") != graph.get("source_revision")
+    ):
+        return ["generated Delivery Prototype source revision is stale"]
+    return []
 
 
 def target_attestation_provenance_errors(graph: dict[str, Any], source_revision: dict[str, Any]) -> list[str]:

@@ -20,7 +20,7 @@ Before executing a runner, the recorder writes a pending-execution marker. If th
 
 A failed/blocked record stays in history. Rerun with `--supersedes EVID-xxxx`; supersession must reference the same Proof and can happen once. Every Proof ultimately needs exactly one active passed record.
 
-- `visual`: the caller supplies no screenshot labels. The sealed `visual_bundle` runner returns exact `anchor_paths`, the sealed Prototype SHA, and exact capture profile; the recorder snapshots those distinct Prototype/Implementation/Diff PNGs and recomputes pixel and geometry metrics before evaluating exact zero assertions.
+- `visual`: the caller supplies no screenshot labels. The sealed `visual_bundle` runner returns exact `anchor_paths`, the Product-Locked Delivery Prototype SHA, and exact capture profile; the recorder snapshots those distinct Prototype/Implementation/Diff PNGs and recomputes pixel and geometry metrics before evaluating exact zero assertions.
 - `runtime`: actual target runtime, complete action, non-empty result readback, one matching runtime-trace anchor. Action, readback, trace, and top-level observation share exact target identity and challenge nonce.
 - `boundary`: direct allow/deny entry probes plus zero side effect/projection/lineage observations.
 - `invariant`: observe database/service state, not only HTTP success.

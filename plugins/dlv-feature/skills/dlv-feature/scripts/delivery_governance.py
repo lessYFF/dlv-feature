@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Schema-v12 governance records for scope, risk, findings, and convergence.
+"""Schema-v13 governance records for scope, risk, findings, and convergence.
 
 The Delivery Graph remains the canonical design truth.  This module keeps the
 machine-maintained records that make reviews convergent rather than merely
@@ -26,7 +26,7 @@ from typing import Any
 from delivery_proof import atomic_write_text, file_digest, load_json, validate_feature_id, value_digest
 
 
-SCHEMA_VERSION = 12
+SCHEMA_VERSION = 13
 RISK_AXES = (
     "API_CONTRACT", "PERSISTENCE", "AUTHORIZATION", "TENANCY", "MONEY",
     "CONCURRENCY", "IRREVERSIBLE_SIDE_EFFECT", "CROSS_CLIENT", "VISUAL_CONTRACT",
@@ -40,6 +40,9 @@ FINDING_SEVERITIES = {"critical", "major", "moderate", "minor"}
 BLOCKING_FINDING_STATUSES = {"OPEN", "FIXED_PENDING_REVIEW", "MERGE_CANDIDATE"}
 NON_WAIVABLE_AXES = {
     "TENANCY", "AUTHORIZATION", "MONEY", "IRREVERSIBLE_SIDE_EFFECT",
+}
+DECISION_REASONS = {
+    "ambiguity", "degradation", "conflict", "new_scope", "unmapped", "platform_limitation",
 }
 SOURCE_ID = re.compile(r"^SRC-[0-9]{3,}$")
 FINDING_ID = re.compile(r"^FND-[0-9a-f]{12}$")
@@ -358,8 +361,20 @@ def _same_file_identity(left: os.stat_result, right: os.stat_result) -> bool:
 
 
 def _public_key_for(private_key_path: Path) -> str:
+    path = private_key_path.resolve(strict=True)
+    metadata = path.stat()
+    return _public_key_for_identity(
+        str(path), metadata.st_dev, metadata.st_ino, metadata.st_size,
+        metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+
+
+@functools.lru_cache(maxsize=16)
+def _public_key_for_identity(
+    private_key_path: str, _device: int, _inode: int, _size: int, _mtime_ns: int, _ctime_ns: int,
+) -> str:
     completed = _SUBPROCESS_RUN(
-        [_trusted_openssl(), "pkey", "-in", str(private_key_path), "-pubout"],
+        [_trusted_openssl(), "pkey", "-in", private_key_path, "-pubout"],
         capture_output=True, check=False, timeout=10,
     )
     if completed.returncode != 0:
@@ -481,7 +496,7 @@ def _convergence_sign(payload: dict[str, Any], authority: dict[str, Any]) -> str
     if _authority_key_id(_public_key_for(key_path)) != authority["key_id"]:
         raise ValueError(
             "DLV convergence private key does not match the repository authority; "
-            "schema v12 does not support authority rotation or history rebaseline"
+            "schema v13 does not support authority rotation or history rebaseline"
         )
     completed = _SUBPROCESS_RUN(
         [_trusted_openssl(), "dgst", "-sha256", "-sign", str(key_path)],
@@ -493,33 +508,76 @@ def _convergence_sign(payload: dict[str, Any], authority: dict[str, Any]) -> str
     return base64.b64encode(completed.stdout).decode("ascii")
 
 
-def _verify_convergence_events(authority: dict[str, Any], events: list[dict[str, Any]]) -> None:
-    with tempfile.NamedTemporaryFile() as public_file:
-        public_file.write(authority["public_key_pem"].encode("ascii"))
+@functools.lru_cache(maxsize=512)
+def _verify_rs256_bytes(public_key_pem: str, message: bytes, signature_value: str) -> bool:
+    try:
+        signature = base64.b64decode(signature_value, validate=True)
+    except (ValueError, TypeError):
+        return False
+    with tempfile.NamedTemporaryFile() as public_file, tempfile.NamedTemporaryFile() as signature_file, tempfile.NamedTemporaryFile() as message_file:
+        public_file.write(public_key_pem.encode("ascii"))
         public_file.flush()
-        for event in events:
-            payload = {
-                key: event[key]
-                for key in (
-                    "sequence", "state_key", "vector", "previous_hash", "key_id",
-                    "authority_sha256", "source_revision", "source_digest",
-                )
-            }
-            try:
-                signature = base64.b64decode(event["signature"], validate=True)
-            except (ValueError, TypeError) as exc:
-                raise ValueError("finding ledger convergence signature is invalid") from exc
-            with tempfile.NamedTemporaryFile() as signature_file, tempfile.NamedTemporaryFile() as message_file:
-                signature_file.write(signature)
-                signature_file.flush()
-                message_file.write(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8"))
-                message_file.flush()
-                completed = _SUBPROCESS_RUN(
-                    [_trusted_openssl(), "dgst", "-sha256", "-verify", public_file.name, "-signature", signature_file.name, message_file.name],
-                    capture_output=True, check=False, timeout=10,
-                )
-            if completed.returncode != 0:
-                raise ValueError("finding ledger convergence signature verification failed")
+        signature_file.write(signature)
+        signature_file.flush()
+        message_file.write(message)
+        message_file.flush()
+        completed = _SUBPROCESS_RUN(
+            [_trusted_openssl(), "dgst", "-sha256", "-verify", public_file.name, "-signature", signature_file.name, message_file.name],
+            capture_output=True, check=False, timeout=10,
+        )
+    return completed.returncode == 0
+
+
+def _verify_rs256_payload(public_key_pem: str, payload: dict[str, Any], signature_value: Any, label: str) -> None:
+    if not isinstance(signature_value, str):
+        raise ValueError(f"{label} signature is invalid")
+    message = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if not _verify_rs256_bytes(public_key_pem, message, signature_value):
+        raise ValueError(f"{label} signature verification failed")
+
+
+def sign_kernel_receipt(payload: dict[str, Any], source_revision: dict[str, Any]) -> dict[str, str]:
+    """Sign one process result with authority unavailable to the isolated reviewer."""
+    authority = _new_convergence_authority(source_revision)
+    return {
+        "algorithm": "RS256",
+        "key_id": authority["key_id"],
+        "payload_sha256": value_digest(payload),
+        "signature": _convergence_sign(payload, authority),
+    }
+
+
+def verify_kernel_receipt(
+    payload: dict[str, Any], receipt: Any, source_revision: dict[str, Any], *, label: str,
+) -> None:
+    required = {"algorithm", "key_id", "payload_sha256", "signature"}
+    if not isinstance(receipt, dict) or set(receipt) != required or receipt.get("algorithm") != "RS256":
+        raise ValueError(f"{label} receipt is invalid")
+    attachments = [
+        item for item in source_revision.get("attachments", [])
+        if isinstance(item, dict) and item.get("kind") == "convergence_authority"
+    ]
+    if len(attachments) != 1:
+        raise ValueError(f"{label} receipt authority is missing")
+    authority = _validate_convergence_attachment(attachments[0])
+    if receipt.get("key_id") != authority["key_id"] or receipt.get("payload_sha256") != value_digest(payload):
+        raise ValueError(f"{label} receipt binding is stale")
+    _verify_rs256_payload(authority["public_key_pem"], payload, receipt.get("signature"), label)
+
+
+def _verify_convergence_events(authority: dict[str, Any], events: list[dict[str, Any]]) -> None:
+    for event in events:
+        payload = {
+            key: event[key]
+            for key in (
+                "sequence", "state_key", "vector", "previous_hash", "key_id",
+                "authority_sha256", "source_revision", "source_digest",
+            )
+        }
+        _verify_rs256_payload(
+            authority["public_key_pem"], payload, event["signature"],
+            "finding ledger convergence",
+        )
 
 
 def timestamp() -> str:
@@ -533,6 +591,7 @@ def canonical_source_payload(value: dict[str, Any]) -> dict[str, Any]:
         "description": value["description"],
         "comments": value["comments"],
         "attachments": value["attachments"],
+        "decisions": value["decisions"],
         "risk_vector": value["risk_vector"],
     }
 
@@ -588,7 +647,7 @@ def _validate_source(value: Any, *, expected_feature_id: str | None = None) -> d
         raise ValueError("source revision must be an object")
     expected = {
         "schema_version", "feature_id", "revision_id", "status", "captured_at", "owner",
-        "title", "description", "comments", "attachments", "risk_vector", "source_digest",
+        "title", "description", "comments", "attachments", "decisions", "risk_vector", "source_digest",
     }
     if set(value) != expected:
         raise ValueError("source revision has unknown or missing fields")
@@ -607,6 +666,46 @@ def _validate_source(value: Any, *, expected_feature_id: str | None = None) -> d
         raise ValueError("source revision comments must be a string array")
     if not isinstance(value.get("attachments"), list) or not all(isinstance(item, dict) for item in value["attachments"]):
         raise ValueError("source revision attachments must be an object array")
+    attachment_identifiers: set[str] = set()
+    for index, attachment in enumerate(value["attachments"]):
+        if attachment.get("kind") == "convergence_authority":
+            continue
+        if not all(isinstance(attachment.get(key), str) and attachment[key].strip() for key in ("ref", "kind", "sha256")):
+            raise ValueError(f"source revision attachments[{index}] requires ref, kind, and sha256")
+        if not re.fullmatch(r"[0-9a-f]{64}", attachment["sha256"]):
+            raise ValueError(f"source revision attachments[{index}].sha256 is invalid")
+        if "locator" in attachment and (not isinstance(attachment["locator"], str) or not attachment["locator"].strip()):
+            raise ValueError(f"source revision attachments[{index}].locator must be non-empty")
+        identifiers = [attachment["ref"]]
+        if "locator" in attachment:
+            identifiers.append(attachment["locator"])
+        if any(identifier in attachment_identifiers for identifier in identifiers) or len(set(identifiers)) != len(identifiers):
+            raise ValueError(f"source revision attachments[{index}] ref/locator collides with another attachment identifier")
+        attachment_identifiers.update(identifiers)
+    decisions = value.get("decisions")
+    if not isinstance(decisions, list):
+        raise ValueError("source revision decisions must be an array")
+    seen_decisions: set[str] = set()
+    for index, decision in enumerate(decisions):
+        required = {"id", "question", "answer", "reason", "decided_by"}
+        if not isinstance(decision, dict) or set(decision) != required:
+            raise ValueError(f"source revision decisions[{index}] has invalid shape")
+        if not all(isinstance(decision.get(key), str) and decision[key].strip() for key in required):
+            raise ValueError(f"source revision decisions[{index}] fields must be non-empty")
+        if not re.fullmatch(r"DEC-[0-9]{3,}", decision["id"]) or decision["id"] in seen_decisions:
+            raise ValueError(f"source revision decisions[{index}].id is invalid or duplicated")
+        if decision["reason"] not in DECISION_REASONS:
+            raise ValueError(f"source revision decisions[{index}].reason is invalid")
+        seen_decisions.add(decision["id"])
+    reserved_anchors = {f"{value['revision_id']}:title", *seen_decisions}
+    if value.get("description"):
+        reserved_anchors.add(f"{value['revision_id']}:description")
+    reserved_anchors.update(
+        f"{value['revision_id']}:comment:{index:03d}"
+        for index, _ in enumerate(value.get("comments", []), 1)
+    )
+    if attachment_identifiers & reserved_anchors:
+        raise ValueError("source revision attachment identifiers collide with Source text or decision anchors")
     convergence_attachments = [
         item for item in value["attachments"] if item.get("kind") == "convergence_authority"
     ]
@@ -629,7 +728,7 @@ def create_source_revision(
         raise ValueError("source revision status is invalid")
     if not isinstance(source, dict):
         raise ValueError("source input must be a JSON object")
-    allowed = {"title", "description", "comments", "attachments", "risk_vector"}
+    allowed = {"title", "description", "comments", "attachments", "decisions", "risk_vector"}
     unknown = set(source) - allowed
     if unknown:
         raise ValueError("source input contains unknown fields: " + ", ".join(sorted(unknown)))
@@ -637,12 +736,15 @@ def create_source_revision(
     description = source.get("description", "")
     comments = source.get("comments", [])
     attachments = source.get("attachments", [])
+    decisions = source.get("decisions", [])
     if not isinstance(title, str) or not title.strip() or not isinstance(description, str):
         raise ValueError("source input title and description must be strings; title must be non-empty")
     if not isinstance(comments, list) or not all(isinstance(item, str) for item in comments):
         raise ValueError("source input comments must be a string array")
     if not isinstance(attachments, list) or not all(isinstance(item, dict) for item in attachments):
         raise ValueError("source input attachments must be an object array")
+    if not isinstance(decisions, list):
+        raise ValueError("source input decisions must be an array")
     if not any(item.get("kind") == "convergence_authority" for item in attachments):
         attachments = [*attachments, _source_convergence_attachment(feature_directory, feature_id)]
     if not isinstance(owner, str) or not owner.strip():
@@ -658,6 +760,7 @@ def create_source_revision(
         "description": description,
         "comments": comments,
         "attachments": attachments,
+        "decisions": decisions,
         "risk_vector": normalize_risk_vector(source.get("risk_vector"), label="source input risk_vector"),
     }
     value["source_digest"] = value_digest(canonical_source_payload(value))
@@ -861,7 +964,7 @@ def append_convergence_event(
     if events and events[-1]["state_key"] == state_key:
         return False
     if len(events) >= MAX_CONVERGENCE_EVENTS:
-        raise ValueError("convergence history reached the schema-v12 terminal; a future versioned migration is required")
+        raise ValueError("convergence history reached the schema-v13 terminal; a future versioned migration is required")
     if ledger["convergence_authority"] is None:
         ledger["convergence_authority"] = _new_convergence_authority(source_revision)
     authority = _validate_convergence_authority(ledger["convergence_authority"])

@@ -10,7 +10,7 @@ coverage = 100%, critical invariant Proof coverage = 100%, unresolved P0/P1
 Findings = 0, unresolved P2 Findings without an Owner decision = 0, and false
 Ready = 0. P3 Findings are advisory and never require a zero-Finding loop.
 
-Schema v12 makes Claims, Review, and Proof quality contracts. Scope Revision, deterministic
+Schema v13 makes Product Lock, Claims, Review, and Proof quality contracts. Source Revision, deterministic
 lint, risk routing, precise invalidation, Finding convergence, and recovery are
 efficiency mechanisms. Do not trade the first set away to optimize the second.
 
@@ -27,7 +27,8 @@ never part of Claim or Finding identity. Use only the initial generic lenses:
 `BOUNDARY_AND_CONCURRENCY`, and `RUNTIME_AUTHENTICITY`.
 
 `source-revisions/SRC-*.json` is the immutable capture of issue title,
-description, comments, attachments, and R0 risk. Read
+description, comments, typed attachments, Owner decisions, and R0 risk. Raw
+product prototypes are Source attachments, never direct implementation contracts. Read
 [artifact-contracts.md](references/artifact-contracts.md) before editing the
 Graph. Consult a stage reference only when it applies: [PRD](references/prd-stage.md),
 [Architecture](references/architecture-stage.md), [Code Spec](references/code-spec-stage.md),
@@ -41,12 +42,28 @@ python3 <skill-dir>/scripts/init_feature.py <feature-id> --root <project-root> -
 python3 <skill-dir>/scripts/scope_revision.py <feature-id> --root <project-root> capture --source /abs/issue-source.json --owner <owner>
 python3 <skill-dir>/scripts/scope_revision.py <feature-id> --root <project-root> confirm --revision SRC-002 --owner <owner> --affected-node REQ-001
 python3 <skill-dir>/scripts/delivery_graph.py compile <feature-id> --root <project-root>
+python3 <skill-dir>/scripts/product_alignment.py <feature-id> --root <project-root>
+python3 <skill-dir>/scripts/seal_product_lock.py <feature-id> --root <project-root> --alignment /abs/ALN-....json
 ```
 
 Capture creates `SOURCE_DRIFT`; it does not mutate Graph or cancel a running
 Review. Confirmation starts a new scope epoch. Name affected nodes for precise
 invalidation; omission conservatively invalidates all attestations. Never carry
 an old Source Revision into Ready.
+
+When Product Alignment returns `NEEDS_DECISION`, persist only the precise Owner
+answer and its reported decision subtype as a new confirmed Source epoch:
+
+```bash
+python3 <skill-dir>/scripts/scope_revision.py <feature-id> --root <project-root> resolve \
+  --decision-id DEC-001 --question "..." --answer "..." \
+  --reason platform_limitation --owner <owner> --affected-node AC-001
+```
+
+Then update the affected Graph nodes and `origins`, rebuild `prototype.html` and
+its declaration when UI applies, compile to regenerate the PRD, rerun Product
+Alignment, and seal the replacement Product Lock. Never request or record an
+Owner decision for a safe clarification.
 
 Risk is an additive vector, not a frontend/backend label:
 
@@ -63,6 +80,21 @@ irreversible-side-effect impact. It still has Graph, semantic Review and Proof.
 Compile after each Graph change. The compiler runs deterministic lint first,
 derives stable typed components, retains exact fresh attestations, renders all
 views, and refreshes global coherence.
+
+Product work is source-first: normalize Source into product nodes, generate
+`prd.md` and `prototype.html`, then compare both outputs to Source in an isolated
+Codex process. Every Requirement, Behavior, Acceptance, and Exception declares
+`origins`: `direct` points to source text/attachments; `derived` points to a
+repository or platform constraint and records why. Safe clarification advances
+automatically. `ambiguity`, `degradation`, `conflict`, `new_scope`, `unmapped`,
+or `platform_limitation` produces `NEEDS_DECISION` with one precise Owner question.
+Only a `SAFE` Product Alignment can seal `product-locks/PCL-*.json`.
+
+The Product Lock binds Source revision/digest, product subgraph, generated PRD,
+generated Delivery Prototype, alignment digest/verdict, source coverage, and
+Owner decision references. It is content-addressed and immutable. Missing or
+stale Product Lock blocks quality/architecture Review, Code, Proof, and finalization;
+product drift invalidates every downstream attestation and Proof Contract.
 
 ```bash
 python3 <skill-dir>/scripts/delivery_graph.py compile <feature-id> --root <project-root>
@@ -90,7 +122,7 @@ start a fourth automatic repair/review loop.
 The Finding Ledger owns a convergence event record signed by an external RSA
 private key. The confirmed Source Revision binds the repository-carried public
 identity, so another machine or CI can verify history without signing authority.
-Appending without the matching private key fails explicitly. Schema v12 does
+Appending without the matching private key fails explicitly. Schema v13 does
 not rotate authority in place; a future versioned rotation protocol must require
 Owner approval and preserve the signed history. `state.json`
 history/status are derived views and cannot reset divergence together.
@@ -120,11 +152,11 @@ TENANCY, AUTHORIZATION, MONEY, and irreversible-side-effect risks are not
 waivable. `STABLE_BLOCKED`, `DIVERGING`, or `NEEDS_DECISION` requires Owner action; do not
 automatically rewrite the Graph until a decision changes the facts.
 
-Prototype is `generated_candidate`, `reference`, `contractual`, or
-`not_applicable`. AI output begins as `generated_candidate`. Reference and
-contractual modes must bind the current Source Revision plus source
-kind/ref/SHA; missing or stale provenance blocks Review and Ready.
-Contractual Prototype requires visual Proof; reference is reviewed as intent.
+Delivery Prototype is `generated` or `not_applicable`. There is no
+`reference`/`contractual` escape hatch. A visible UI uses generated
+`prototype.html`, bound to the current Source Revision and then sealed by the
+Product Lock. Visual Proof compares implementation only with that locked
+Delivery Prototype, never with a raw product prototype attachment.
 Architecture and Code Spec remain generated Graph views, never serial approval
 stages.
 
@@ -139,7 +171,7 @@ Its `frontend_roots` and adapter SHA bind a `repository_adapter` attachment in
 the confirmed Source Revision. The kernel freezes Git base/merge-base OIDs,
 changed paths, adapter SHA, and Code fingerprint before execution, then
 rechecks them after every capability.
-Its `changes` capability emits exact schema-v12 JSON with sorted `paths`,
+Its `changes` capability emits exact adapter schema-v12 JSON with sorted `paths`,
 `surfaces`, and `risk_axes`; invalid, empty, or elevated output routes to the
 standard path.
 
@@ -200,7 +232,11 @@ jobs retain `needs_resume` checkpoints and use `needs_decision` for Owner work.
 
 Import v11 with `upgrade_v11_to_v12.py`. It preserves Source Revision and Graph
 semantics, archives mutable review/finding/proof records, and promotes no old
-seal, PASS, or Ready claim. Compatibility importers for v9/v10 emit the same
-untrusted v12 state.
+seal, PASS, Ready, or Product Lock claim. Import v12 with
+`upgrade_v12_to_v13.py`; it preserves the original bytes under `archive-v12`
+and requires fresh Product Alignment. Compatibility importers for v9/v10 emit
+the same untrusted v13 state. Finalization emits `delivery-manifest.json` with a
+deterministic tree digest for Multica artifact retention; remote upload receipts
+remain outside the DLV schema.
 Read [workflow.md](references/workflow.md) for operating detail. Claim
 completion only when final validation reports zero errors.

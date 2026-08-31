@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Dependency-scoped invalidation for schema-v12 Delivery Graph features."""
+"""Dependency-scoped invalidation for schema-v13 Delivery Graph features."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ from delivery_graph import (
     node_hashes,
     review_units,
 )
-from delivery_proof import exclusive_file_lock, repository_fingerprint
+from delivery_proof import atomic_write_text, exclusive_file_lock, repository_fingerprint
 
 
 def invalidate(
@@ -35,6 +35,8 @@ def invalidate(
     with lock_context:
         graph = load_graph(root, feature_id)
         before = load_state(state_path)
+        original_state = state_path.read_text(encoding="utf-8") if state_path.is_file() else None
+        expected_state = original_state
         current_hashes = node_hashes(graph)
         detected = {
             node_id for node_id in set(before.get("node_hashes", {})) | set(current_hashes)
@@ -47,19 +49,30 @@ def invalidate(
         changed = detected | requested
         impacted = impact_closure(graph, changed & set(current_hashes)) | (changed - set(current_hashes))
         old_attestations = set(before.get("attestations", {}))
-        if requested and impacted:
-            before = load_state(state_path)
-            units = review_units(graph)
-            before["attestations"] = {
-                unit_id: summary for unit_id, summary in before.get("attestations", {}).items()
-                if unit_id in units and not (set(units[unit_id]["node_ids"]) & impacted)
-            }
-            atomic_write_json(state_path, before)
-        if reset_reviews:
-            before = load_state(state_path)
-            before["attestations"] = {}
-            atomic_write_json(state_path, before)
-        state = compile_graph(root, feature_id, _lock_held=True)
+        try:
+            if requested and impacted:
+                before = load_state(state_path)
+                units = review_units(graph)
+                before["attestations"] = {
+                    unit_id: summary for unit_id, summary in before.get("attestations", {}).items()
+                    if unit_id in units and not (set(units[unit_id]["node_ids"]) & impacted)
+                }
+                atomic_write_json(state_path, before)
+                expected_state = state_path.read_text(encoding="utf-8")
+            if reset_reviews:
+                before = load_state(state_path)
+                before["attestations"] = {}
+                atomic_write_json(state_path, before)
+                expected_state = state_path.read_text(encoding="utf-8")
+            state = compile_graph(root, feature_id, _lock_held=True)
+        except BaseException:
+            current_state = state_path.read_text(encoding="utf-8") if state_path.is_file() else None
+            if current_state == expected_state:
+                if original_state is None:
+                    state_path.unlink(missing_ok=True)
+                else:
+                    atomic_write_text(state_path, original_state)
+            raise
         invalidated = old_attestations - set(state.get("attestations", {}))
         # Source changes after Code completion invalidate only Code and runtime
         # claims. Graph reviews and the sealed plan remain reusable.

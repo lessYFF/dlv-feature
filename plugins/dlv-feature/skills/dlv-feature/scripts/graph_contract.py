@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Seal and validate a schema-v12 generated Proof Contract."""
+"""Seal and validate a schema-v13 generated Proof Contract."""
 
 from __future__ import annotations
 
@@ -33,9 +33,11 @@ def seal_payload(contract: dict[str, Any]) -> dict[str, Any]:
 def validate_contract(root: Path, feature_id: str, contract: dict[str, Any], state: dict[str, Any], errors: list[str]) -> None:
     root = root.expanduser().resolve()
     graph = load_graph(root, feature_id)
+    from product_lock import live_product_lock_errors
+    errors.extend(live_product_lock_errors(root, feature_id, graph))
     expected = generate_proof_contract(graph)
     expected_keys = {
-        "schema_version", "feature_id", "graph_sha256", "subgraph_sha256",
+        "schema_version", "feature_id", "graph_sha256", "subgraph_sha256", "product_lock_sha256",
         "claims", "environments", "obligations", "draft_sha256", "status", "attestations",
         "sealed_at", "seal",
     }
