@@ -1,4 +1,4 @@
-# Schema v12 workflow
+# Schema v13 workflow
 
 ```text
 capture source → confirm epoch → declare Claims/Graph → compile
@@ -20,12 +20,12 @@ After each effective change append the convergence vector to the Finding
 Ledger's externally signed event stream. The confirmed Source Revision binds
 its repository-carried RSA public identity; the private key remains external.
 Cross-machine verification requires no private key, while append or rebaseline
-without the matching authority must fail. Schema v12 rejects authority rotation;
+without the matching authority must fail. Schema v13 rejects authority rotation;
 support requires a future Owner-approved versioned migration that preserves the
 existing signed chain. Derive the
 three-point state history from the stream. Stop new units, Graph expansion, and automatic Review when
 ready distance, blocking Findings, or Review units rise across two consecutive
-transitions (`DIVERGING`), or when a source/prototype/budget decision is needed
+transitions (`DIVERGING`), or when a source/Product Lock/budget decision is needed
 (`NEEDS_DECISION`). `STABLE_BLOCKED` means no progress and requires repair or an
 Owner decision. Budget exhaustion never synthesizes a waiver or PASS.
 Automatic Review has a hard maximum of three campaigns. Configuration may use

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Target-runtime Verification Runs for schema-v12 Delivery Graph features."""
+"""Target-runtime Verification Runs for schema-v13 Delivery Graph features."""
 
 from __future__ import annotations
 

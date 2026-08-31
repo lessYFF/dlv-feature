@@ -1,10 +1,10 @@
-# Schema v12 artifact contracts
+# Schema v13 artifact contracts
 
 ## Editable truth
 
 `delivery/{feature}/delivery-graph.json` is the sole editable delivery truth.
-It contains `schema_version: 12`, feature/source identity, `claims`, typed nodes
-and edges, Prototype declaration, risk vector, Review budget, and delivery
+It contains `schema_version: 13`, feature/source identity, current Product Lock
+reference, `claims`, typed nodes and edges, Delivery Prototype declaration, risk vector, Review budget, and delivery
 mode. Generated Markdown, state, reviews, ledgers, contracts, and evidence are
 derived records and must not be repaired by hand.
 
@@ -20,17 +20,25 @@ obligation; the predecessor Finding remains separate and blocking until explicit
 independent Review resolves it. Graph/unit repartitioning needs no succession:
 unchanged Claim IDs and semantic Finding IDs already survive it.
 
-## Source and Prototype provenance
+## Source, Alignment, and Product Lock
 
-The Graph references one confirmed immutable `SRC-*` capture. A later pending
-capture creates source drift and blocks Ready.
+The Graph references one confirmed immutable `SRC-*` capture. It contains typed
+attachments and structured Owner decisions. Raw product prototypes remain Source
+attachments. Every Requirement, Behavior, Acceptance, and Exception has non-empty
+`origins`: direct source references or derived repository/platform constraints
+with an explicit reason.
 
-AI-created Prototype bytes are `generated_candidate` and cannot enter Review.
-`reference` and `contractual` require `path=prototype.html`, Prototype SHA,
-current `source_revision`, `source_kind`, `source_ref`, and `source_sha256`.
-`source_revision` provenance binds the Source digest; `attachment` provenance
-must exactly match one captured attachment descriptor. Missing, invented, or
-stale provenance blocks Review and Ready.
+`prd.md` and `prototype.html` are regenerated delivery views. Delivery Prototype
+is only `generated` or `not_applicable`; v13 removes `reference` and `contractual`.
+Independent Product Alignment covers every product node with `PRESERVED`,
+`CLARIFIED`, or `DECISION_REQUIRED` and returns only `SAFE` or `NEEDS_DECISION`.
+Only SAFE seals `product-locks/PCL-<digest>.json`.
+
+The Product Lock binds Source revision/digest, product subgraph, PRD SHA,
+Delivery Prototype SHA, alignment digest/verdict, source coverage, and Owner
+decision refs. Missing/freshness failure blocks Review and all downstream stages.
+Product, PRD, Prototype, or Source drift invalidates every downstream attestation,
+Proof Contract, Code completion, and Verification result.
 
 ## Findings and convergence
 
@@ -84,13 +92,13 @@ private key remains external (`$CODEX_HOME/dlv-feature/convergence-rs256.pem` or
 `DLV_CONVERGENCE_PRIVATE_KEY`). The confirmed Source Revision binds that public
 identity. Any machine or CI can verify existing history; appending without the
 matching private key fails explicitly. Rebinding the source or changing the key
-invalidates the chain. Schema v12 intentionally has no in-place rotation command;
+invalidates the chain. Schema v13 intentionally has no in-place rotation command;
 any future versioned rotation protocol must require Owner approval and preserve
 prior events. The compiler and validator derive state history, previous vector,
 status, budget use, and reason from that stream and current records. Ledger size
 is capped at 8 MiB and convergence history at 256 events; reaching the event cap
-is a hard schema-v12 terminal that requires a future versioned migration. Schema
-v12 provides no manual checkpoint, truncation, rebaseline, or rotation escape hatch.
+is a hard schema-v13 terminal that requires a future versioned migration. Schema
+v13 provides no manual checkpoint, truncation, rebaseline, or rotation escape hatch.
 
 ## Repository adapter and fast path
 
@@ -134,7 +142,7 @@ Proof, and Ready contracts and ends at fresh Proof required.
 
 ## Proof authenticity
 
-The generated one-way-sealed Proof Contract binds Claims, obligations,
+The generated one-way-sealed Proof Contract binds the Product Lock SHA, Claims, obligations,
 environments, runners, assertions, and Review attestations. High-strength
 runtime/invariant/visual evidence binds the Code fingerprint and real Git HEAD
 OID; HEAD carries the feature trailer and non-kernel source is fully committed.
@@ -165,9 +173,10 @@ and state or side-effect readback. Visual captures
 come only from the sealed runner; core copies distinct Prototype,
 Implementation, and Diff PNGs and recomputes pixel/geometry metrics.
 
-Ready requires confirmed Source, authentic Prototype, fresh PASS attestations,
+Ready requires confirmed Source, a current SAFE Product Lock, fresh PASS attestations,
 zero P0/P1 Findings and zero undecided P2 Findings, complete critical Claim Proof coverage, sealed
 contract, matching Code fingerprint, and one active fresh passed record per
 Proof. Schema v11 migration archives old mutable records and promotes no prior
-seal, PASS, or Ready claim. Migration prevalidates symlinks, stages a complete
+seal, PASS, Ready, or Product Lock claim. v12 migration preserves original bytes
+under `archive-v12` and promotes no prototype. Migration prevalidates symlinks, stages a complete
 archive, and rolls back every mutated record if compilation fails.

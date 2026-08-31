@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded command and runtime-evidence helpers for schema-v12 verification."""
+"""Bounded command and runtime-evidence helpers for schema-v13 verification."""
 
 from __future__ import annotations
 

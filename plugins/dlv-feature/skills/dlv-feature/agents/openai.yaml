@@ -1,4 +1,4 @@
 interface:
   display_name: "DLV Feature"
   short_description: "以组件级复核、全局骨架和真实运行时证据驱动功能交付"
-  default_prompt: "Use $dlv-feature to deliver this feature with schema-v12 source provenance, stable Claims and Findings, budgeted risk review, repository-adapter checks, authentic target-runtime Proof, and deterministic finalization."
+  default_prompt: "Use $dlv-feature to deliver this feature with schema-v13 Product Alignment, a sealed Product Lock, stable Claims and Findings, authentic target-runtime Proof, and deterministic finalization."

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run compositional schema-v12 Delivery Graph review lenses."""
+"""Run compositional schema-v13 Delivery Graph review lenses."""
 
 from __future__ import annotations
 
@@ -55,14 +55,52 @@ from delivery_governance import (
 from delivery_contracts import claims_by_id, prototype_review_blockers, review_budget
 
 
+def _root_owned_immutable_chain(path: Path, stop: Path | None = None) -> bool:
+    """Require a resolved Linux package path and its ancestors to be admin-owned."""
+    path = path.resolve(strict=True)
+    stop = stop.resolve(strict=True) if stop is not None else None
+    current = path
+    while True:
+        metadata = current.lstat()
+        if metadata.st_uid != 0 or metadata.st_mode & 0o022:
+            return False
+        if current == stop or current == current.parent:
+            return stop is None or current == stop
+        current = current.parent
+
+
 @functools.lru_cache(maxsize=1)
 def semantic_codex_executable() -> str:
     launcher = shutil.which("codex")
     if not launcher:
         raise ValueError("semantic Review requires the Codex CLI")
+    resolved_launcher = Path(launcher).resolve(strict=True)
     if sys.platform != "darwin":
-        return launcher
-    package = Path(launcher).resolve().parent.parent
+        package = resolved_launcher.parent.parent
+        manifest_path = package / "package.json"
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("semantic Review cannot verify the Codex CLI package") from exc
+        candidates = [
+            path for path in package.glob("node_modules/@openai/codex-linux-*/vendor/*-unknown-linux-*/codex")
+            if path.is_file() and os.access(path, os.X_OK)
+        ]
+        candidate = candidates[0].resolve(strict=True) if len(candidates) == 1 else package
+        if (
+            resolved_launcher != package / "bin" / "codex.js"
+            or manifest.get("name") != "@openai/codex"
+            or len(candidates) != 1
+            or resolved_launcher.is_relative_to(Path(tempfile.gettempdir()).resolve())
+            or resolved_launcher.is_relative_to(Path.cwd().resolve())
+            or not _root_owned_immutable_chain(package)
+            or not _root_owned_immutable_chain(resolved_launcher, package)
+            or not _root_owned_immutable_chain(manifest_path, package)
+            or not _root_owned_immutable_chain(candidate, package)
+        ):
+            raise ValueError("semantic Review rejected an untrusted Codex CLI executable")
+        return str(candidate)
+    package = resolved_launcher.parent.parent
     machine = {"arm64": "aarch64", "x86_64": "x86_64"}.get(os.uname().machine)
     if machine is None:
         raise ValueError("semantic Review does not support this macOS architecture")
@@ -73,6 +111,57 @@ def semantic_codex_executable() -> str:
     if len(candidates) != 1:
         raise ValueError("semantic Review cannot resolve one trusted native Codex executable")
     return str(verify_macos_signature(candidates[0], team_id="2DC432GLL2", identifier="codex"))
+
+
+def prepare_isolated_codex_executable(temp: Path) -> str:
+    raw = semantic_codex_executable()
+    source = Path(raw)
+    if not source.is_absolute():
+        return raw
+    destination = temp / "codex"
+    if sys.platform == "darwin":
+        shutil.copy2(source, destination)
+        destination.chmod(0o500)
+        if file_digest(destination) != file_digest(source):
+            raise ValueError("isolated Codex executable copy is stale")
+        verify_macos_signature(destination, team_id="2DC432GLL2", identifier="codex")
+        return str(destination)
+    package = source
+    while package.name != "codex" or package.parent.name != "@openai":
+        if package == package.parent:
+            raise ValueError("isolated Codex executable package is untrusted")
+        package = package.parent
+    if not _root_owned_immutable_chain(source, package) or not _root_owned_immutable_chain(package):
+        raise ValueError("isolated Codex executable package changed before copy")
+    before = source.lstat()
+    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    destination_fd: int | None = None
+    digest = hashlib.sha256()
+    try:
+        opened = os.fstat(source_fd)
+        identity = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+        if identity != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
+            raise ValueError("isolated Codex executable changed before copy")
+        destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o500)
+        while chunk := os.read(source_fd, 1024 * 1024):
+            digest.update(chunk)
+            view = memoryview(chunk)
+            while view:
+                written = os.write(destination_fd, view)
+                if written <= 0:
+                    raise OSError("isolated Codex executable copy made no progress")
+                view = view[written:]
+        closed = os.fstat(source_fd)
+        if identity != (closed.st_dev, closed.st_ino, closed.st_size, closed.st_mtime_ns, closed.st_ctime_ns):
+            raise ValueError("isolated Codex executable changed during copy")
+        os.fsync(destination_fd)
+    finally:
+        os.close(source_fd)
+        if destination_fd is not None:
+            os.close(destination_fd)
+    if file_digest(destination) != digest.hexdigest():
+        raise ValueError("isolated Codex executable copy is stale")
+    return str(destination)
 
 
 def prepare_isolated_codex_home(temp: Path) -> tuple[Path, Path]:
@@ -209,7 +298,7 @@ def evaluate_unit(
         "stage": stage,
         "execution": semantic.get("execution") if semantic else {
             "mode": "isolated_deterministic_lens",
-            "engine": "dlv-feature/graph-review-v12",
+            "engine": "dlv-feature/graph-review-v13",
             "independent": True,
         },
         "graph_snapshot_sha256": graph_digest(graph),
@@ -266,8 +355,10 @@ def _record_units(
     graph = load_graph(root, feature_id)
     errors = structural_errors(graph, feature_id)
     errors.extend(prototype_errors(root, feature_id, graph))
+    from product_lock import live_product_lock_errors
+    errors.extend(live_product_lock_errors(root, feature_id, graph))
     if errors:
-        raise ValueError("; ".join(errors))
+        raise ValueError("automatic Review requires a decision: " + "; ".join(errors))
     units = review_units(graph)
     unknown = set(unit_ids) - set(units)
     if unknown:
@@ -296,6 +387,9 @@ def _record_units(
         state = load_state(state_path)
         if state.get("graph_sha256") != graph_digest(graph):
             raise ValueError("compile the current Delivery Graph before review")
+        lock_errors = live_product_lock_errors(root, feature_id, current)
+        if lock_errors:
+            raise ValueError("quality/architecture Review requires a current SAFE Product Lock")
         ledger_file = ledger_path(root, feature_id)
         original_ledger = delivery_governance.read_bounded_regular(
             ledger_file, delivery_governance.MAX_LEDGER_BYTES, "finding ledger", missing_ok=True,
@@ -393,6 +487,7 @@ def _record_units(
             graph, attestations,
             source_status=source_revision_status(directory, feature_id, graph["source_revision"]),
             ledger=ledger,
+            product_lock_errors=lock_errors,
         )
         state["execution"] = {"status": "idle", "checkpoint": "review-recorded", "reason": None}
         state["last_compiled_at"] = timestamp()
@@ -508,6 +603,7 @@ def _run_semantic_unit(
     # project instructions cannot bias an allegedly independent review.
     with tempfile.TemporaryDirectory(prefix="dlv-graph-review-") as temporary:
         temp = Path(temporary)
+        codex_executable = prepare_isolated_codex_executable(temp)
         isolated_codex_home, source_codex_home = prepare_isolated_codex_home(temp)
         snapshot = temp / "subgraph.json"
         selected = set(unit["node_ids"])
@@ -538,9 +634,9 @@ def _run_semantic_unit(
             snapshot_value["component_topology"] = unit["component_topology"]
             snapshot_value["claim_synopsis"] = unit["claim_synopsis"]
         if lens == "PROVENANCE_INTEGRITY":
-            prototype = graph.get("prototype", {"status": "not_applicable"})
-            snapshot_value["prototype"] = prototype
-            if prototype.get("status") in {"reference", "contractual"}:
+            prototype = graph.get("delivery_prototype", {"status": "not_applicable"})
+            snapshot_value["delivery_prototype"] = prototype
+            if prototype.get("status") == "generated":
                 prototype_source = feature_dir(root, feature_id) / "prototype.html"
                 prototype_snapshot = temp / "prototype.html"
                 prototype_bytes = delivery_governance.read_bounded_regular(
@@ -576,7 +672,7 @@ def _run_semantic_unit(
             "and sorted risk_axes. Reuse an exact prior semantic finding ID. Never merge on wording alone; expose partial overlap. "
             "Classify severity as critical=P0, major=P1, moderate=P2, or minor=P3. P0/P1 are delivery blockers; "
             "P2 requires an explicit Owner decision; P3 is advisory and does not block delivery. "
-            "When the snapshot declares a reference or contractual Prototype, inspect its inline prototype_content and "
+            "When the snapshot declares a generated Delivery Prototype, inspect its inline prototype_content and "
             "check that it covers the applicable behaviors, acceptance states, and exception states. "
             f"Lens: {lens}. Review unit: {unit_id}. Exact subgraph hash: {unit['subgraph_sha256']}. "
             "Return PASS only when every check passes and there is no open critical/major finding. Return schema JSON only. "
@@ -584,7 +680,7 @@ def _run_semantic_unit(
         )
         completed = run_bounded(
             [
-                semantic_codex_executable(), "exec", "--ephemeral", "--disable", "apps", "--disable", "plugins",
+                codex_executable, "exec", "--ephemeral", "--disable", "apps", "--disable", "plugins",
                 "-c", "mcp_servers={}", "--json", "--sandbox", "read-only",
                 "--skip-git-repo-check", "--cd", str(temp), "--output-schema", str(schema_path),
                 "--output-last-message", str(result_path), "-",
@@ -594,7 +690,7 @@ def _run_semantic_unit(
             max_capture_bytes=MAX_CAPTURE_BYTES,
             input_text=prompt,
             writable_roots=[temp],
-            read_protected=[root, source_codex_home],
+            read_protected=[root, source_codex_home, Path.home()],
             allow_outbound_process_tree=True,
             isolated_codex_home=isolated_codex_home,
         )
@@ -636,10 +732,12 @@ def run_isolated_readiness_review(root: Path, feature_id: str, run_id: str) -> l
     errors = structural_errors(graph, feature_id)
     errors.extend(prototype_errors(root, feature_id, graph))
     errors.extend(prototype_review_blockers(graph))
+    from product_lock import live_product_lock_errors
+    errors.extend(live_product_lock_errors(root, feature_id, graph))
     if errors:
-        raise ValueError("; ".join(errors))
+        raise ValueError("automatic Review requires a decision: " + "; ".join(errors))
     state = load_state(feature_dir(root, feature_id) / "state.json")
-    if state.get("convergence", {}).get("status") in {"DIVERGING", "NEEDS_DECISION", "STABLE_BLOCKED"}:
+    if state.get("convergence", {}).get("status") in {"STABLE_BLOCKED", "DIVERGING", "NEEDS_DECISION"}:
         raise ValueError("automatic Review is stopped because convergence requires a decision")
     ledger = load_ledger(root, feature_id)
     budget = review_budget(graph)

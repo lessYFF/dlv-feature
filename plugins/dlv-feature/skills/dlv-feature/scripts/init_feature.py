@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Initialize a schema-v12 Delivery Graph feature."""
+"""Initialize a schema-v13 Delivery Graph feature."""
 
 from __future__ import annotations
 
