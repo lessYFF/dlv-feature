@@ -48,6 +48,7 @@ import upgrade_v12_to_v13
 import finding_ledger
 import frontend_fast_path
 import repository_adapter
+import semantic_review_preflight
 import target_attestation
 from delivery_governance import apply_review_findings, canonical_source_payload, create_source_revision, empty_ledger, finding_summary, load_ledger, write_ledger
 from delivery_contracts import claim_id_for, is_boolean_only_observation
@@ -389,18 +390,19 @@ class GraphTestCase(unittest.TestCase):
         source = delivery_governance.load_source_revision(
             root / "delivery" / feature_id, feature_id, graph["source_revision"],
         )
-        source_entries = [
+        entry_verdicts = [dict(entry) for entry in entries]
+        source_verdicts = [
             {
-                "source_ref": anchor, "result": "PRESERVED",
-                "node_ids": product_lock.source_anchor_node_ids(graph, source, anchor),
-                "evidence": "source anchor mapped", "reason": None, "owner_question": None,
+                "source_ref": anchor,
+                "result": "PRESERVED", "evidence": "source anchor mapped",
+                "reason": None, "owner_question": None,
             }
             for anchor in product_lock.source_anchor_refs(source)
         ]
 
         def completed(argv: list[str], *_args: object, **_kwargs: object) -> dict[str, object]:
             result_path = Path(argv[argv.index("--output-last-message") + 1])
-            write_json(result_path, {"entries": entries, "source_entries": source_entries})
+            write_json(result_path, {"entries": entry_verdicts, "source_entries": source_verdicts})
             return {"exit_code": 0, "timed_out": False, "stdout": '{"type":"product.alignment"}\n', "stderr": ""}
 
         with patch.object(product_alignment, "prepare_isolated_codex_executable", return_value="codex"), patch.object(
@@ -2771,6 +2773,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             config = source / "config.toml"
             config.write_text(
                 'model = "test"\n[model_providers.test]\nname = "test"\n'
+                'mcp_servers = { hidden = true }\n'
                 '[mcp_servers.untrusted]\nurl = "https://example.invalid"\n[plugins."x"]\nenabled = true\n',
                 encoding="utf-8",
             )
@@ -2785,6 +2788,136 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertIn("model_providers.test", sanitized)
             self.assertNotIn("mcp_servers", sanitized)
             self.assertNotIn("plugins", sanitized)
+
+    def test_semantic_review_rejects_symlinked_codex_auth(self) -> None:
+        with tempfile.TemporaryDirectory() as source_raw, tempfile.TemporaryDirectory() as target_raw:
+            source = Path(source_raw)
+            private_auth = source / "private-auth.json"
+            private_auth.write_text("{}\n", encoding="utf-8")
+            private_auth.chmod(0o600)
+            (source / "auth.json").symlink_to(private_auth)
+            with patch.dict(os.environ, {"CODEX_HOME": str(source)}), self.assertRaisesRegex(
+                ValueError, "auth.json is not a trusted private file",
+            ):
+                graph_review.prepare_isolated_codex_home(Path(target_raw))
+
+    def test_semantic_review_preflight_reports_environment_without_self_attesting_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as source_raw:
+            source = Path(source_raw)
+            auth = source / "auth.json"
+            auth.write_text('{"secret":"must-not-leak"}\n', encoding="utf-8")
+            auth.chmod(0o600)
+            config = source / "config.toml"
+            config.write_text('model = "test"\n', encoding="utf-8")
+            config.chmod(0o600)
+            plugin_root = SCRIPTS.parents[2]
+            expected_plugin_sha256 = semantic_review_preflight.plugin_tree_digest(plugin_root)
+            with patch.dict(os.environ, {"CODEX_HOME": str(source)}), patch.object(
+                semantic_review_preflight, "semantic_codex_executable", return_value="codex",
+            ):
+                payload = semantic_review_preflight.preflight_payload(plugin_root=plugin_root)
+            self.assertEqual("environment_ready", payload["status"])
+            self.assertIs(False, payload["plugin_identity_verified"])
+            self.assertIs(True, payload["host_verification_required"])
+            self.assertEqual("dlv-feature", payload["plugin"])
+            self.assertEqual("0.9.1", payload["diagnostic_version"])
+            self.assertEqual(expected_plugin_sha256, payload["diagnostic_plugin_sha256"])
+            self.assertEqual("0600", payload["bootstrap_files"]["auth.json"]["mode"])
+            self.assertEqual(
+                delivery_graph.file_digest(SCRIPTS / "product_alignment.py"),
+                payload["diagnostic_product_alignment_sha256"],
+            )
+            self.assertNotIn("must-not-leak", json.dumps(payload))
+
+    def test_semantic_review_bootstrap_rejects_untrusted_file_contracts(self) -> None:
+        def write_private(path: Path, content: bytes = b"{}\n") -> None:
+            path.write_bytes(content)
+            path.chmod(0o600)
+
+        for case in ("wide_mode", "hard_link", "non_regular", "oversized", "untrusted_home", "invalid_utf8"):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as source_raw, tempfile.TemporaryDirectory() as target_raw:
+                source = Path(source_raw)
+                auth = source / "auth.json"
+                config = source / "config.toml"
+                write_private(auth)
+                write_private(config, b'model = "test"\n')
+                if case == "wide_mode":
+                    auth.chmod(0o644)
+                elif case == "hard_link":
+                    os.link(auth, source / "auth-copy.json")
+                elif case == "non_regular":
+                    auth.unlink()
+                    auth.mkdir(mode=0o700)
+                elif case == "oversized":
+                    with auth.open("r+b") as handle:
+                        handle.truncate(graph_review.MAX_CODEX_BOOTSTRAP_BYTES + 1)
+                elif case == "untrusted_home":
+                    source.chmod(0o777)
+                elif case == "invalid_utf8":
+                    write_private(config, b"\xff")
+                with patch.dict(os.environ, {"CODEX_HOME": str(source)}), self.assertRaises(
+                    (OSError, ValueError, UnicodeDecodeError),
+                ):
+                    graph_review.prepare_isolated_codex_home(Path(target_raw))
+
+    def test_semantic_review_preflight_tree_bounds_and_main_statuses(self) -> None:
+        with tempfile.TemporaryDirectory() as plugin_raw:
+            root = Path(plugin_raw)
+            with self.assertRaisesRegex(ValueError, "empty"):
+                semantic_review_preflight.plugin_tree_digest(root)
+            (root / "one").write_text("1", encoding="utf-8")
+            (root / "link").symlink_to(root / "one")
+            with self.assertRaisesRegex(ValueError, "symlink"):
+                semantic_review_preflight.plugin_tree_digest(root)
+            (root / "link").unlink()
+            (root / "two").write_text("2", encoding="utf-8")
+            with patch.object(semantic_review_preflight, "MAX_PLUGIN_FILES", 1), self.assertRaisesRegex(
+                ValueError, "file-count",
+            ):
+                semantic_review_preflight.plugin_tree_digest(root)
+            with patch.object(semantic_review_preflight, "MAX_PLUGIN_FILE_BYTES", 0), self.assertRaisesRegex(
+                ValueError, "bounded regular-file",
+            ):
+                semantic_review_preflight.plugin_tree_digest(root)
+
+        ready = {"status": "environment_ready"}
+        with patch.object(semantic_review_preflight, "preflight_payload", return_value=ready), patch(
+            "builtins.print",
+        ) as output:
+            self.assertEqual(0, semantic_review_preflight.main())
+            output.assert_called_once()
+        with patch.object(semantic_review_preflight, "preflight_payload", side_effect=ValueError("blocked")), patch(
+            "builtins.print",
+        ) as output:
+            self.assertEqual(1, semantic_review_preflight.main())
+            self.assertIn('"status": "blocked"', output.call_args.args[0])
+
+    def test_semantic_review_preflight_rejects_missing_or_dangling_bootstrap_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as source_raw, tempfile.TemporaryDirectory() as plugin_raw:
+            source = Path(source_raw)
+            config = source / "config.toml"
+            config.write_text('model = "test"\n', encoding="utf-8")
+            config.chmod(0o600)
+            with patch.dict(os.environ, {"CODEX_HOME": str(source)}), self.assertRaisesRegex(
+                ValueError, "auth.json is required",
+            ):
+                graph_review.trusted_codex_bootstrap_snapshot()
+
+            (source / "auth.json").symlink_to(source / "missing-auth.json")
+            with patch.dict(os.environ, {"CODEX_HOME": str(source)}), self.assertRaisesRegex(
+                ValueError, "auth.json is not a trusted private file",
+            ):
+                graph_review.trusted_codex_bootstrap_snapshot()
+
+            plugin_root = Path(plugin_raw) / "dlv-feature"
+            shutil.copytree(SCRIPTS.parents[2], plugin_root)
+            expected_plugin_sha256 = semantic_review_preflight.plugin_tree_digest(plugin_root)
+            alignment = plugin_root / "skills/dlv-feature/scripts/product_alignment.py"
+            alignment.write_text(alignment.read_text(encoding="utf-8") + "\n# tampered\n", encoding="utf-8")
+            self.assertNotEqual(
+                expected_plugin_sha256,
+                semantic_review_preflight.plugin_tree_digest(plugin_root),
+            )
 
     @unittest.skipUnless(sys.platform == "darwin" and runtime_evidence.shutil.which("sandbox-exec"), "macOS sandbox-exec required")
     def test_macos_isolated_process_tree_cannot_mutate_protected_workspace(self) -> None:
@@ -3158,6 +3291,80 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             write_json(graph_path, graph)
             delivery_graph.compile_graph(root, "cross-domain-feature")
 
+    def test_product_alignment_kernel_binds_identities_and_reciprocal_source_mappings(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            directory = root / "delivery/cross-domain-feature"
+            source = delivery_governance.load_source_revision(
+                directory, "cross-domain-feature", graph["source_revision"],
+            )
+            node_ids = product_lock.product_node_ids(graph)
+            anchors = product_lock.source_anchor_refs(source)
+            verdict = {
+                "result": "PRESERVED", "evidence": "mapped",
+                "reason": None, "owner_question": None,
+            }
+            raw_entries = [
+                {"node_id": node_id, **verdict} for node_id in reversed(node_ids)
+            ]
+            raw_sources = [
+                {"source_ref": anchor, **verdict} for anchor in reversed(anchors)
+            ]
+
+            schema = product_alignment._output_schema(node_ids, anchors)
+            self.assertEqual("array", schema["properties"]["entries"]["type"])
+            self.assertEqual("array", schema["properties"]["source_entries"]["type"])
+            self.assertNotIn(
+                "node_ids",
+                schema["properties"]["source_entries"]["items"]["properties"],
+            )
+            large_schema = product_alignment._output_schema(
+                [f"REQ-{index:05d}" for index in range(10_000)], [],
+            )
+            self.assertLess(len(json.dumps(large_schema)), 10_000)
+
+            entries = product_alignment._bind_identified_verdicts(
+                raw_entries, node_ids, "node_id", "entries",
+            )
+            source_entries = product_alignment._bind_source_verdicts(
+                graph, source, raw_sources, anchors,
+            )
+            self.assertEqual(node_ids, [entry["node_id"] for entry in entries])
+            self.assertEqual(anchors, [entry["source_ref"] for entry in source_entries])
+            self.assertEqual(
+                {
+                    anchor: product_lock.source_anchor_node_ids(graph, source, anchor)
+                    for anchor in anchors
+                },
+                {entry["source_ref"]: entry["node_ids"] for entry in source_entries},
+            )
+            self.assertTrue(all("node_ids" not in item for item in raw_sources))
+
+            with self.assertRaisesRegex(ValueError, "exactly cover"):
+                product_alignment._bind_identified_verdicts(
+                    raw_entries[1:],
+                    node_ids, "node_id", "entries",
+                )
+            with self.assertRaisesRegex(ValueError, "identities do not exactly match"):
+                product_alignment._bind_identified_verdicts(
+                    [*raw_entries[:-1], dict(raw_entries[0])], node_ids, "node_id", "entries",
+                )
+            invalid_shape = [dict(entry) for entry in raw_entries]
+            invalid_shape[0].pop("evidence")
+            invalid_type = [dict(entry) for entry in raw_entries]
+            invalid_type[0]["node_id"] = 7
+            invalid_unknown = [dict(entry) for entry in raw_entries]
+            invalid_unknown[0]["node_id"] = "REQ-999"
+            for invalid in (None, invalid_shape, invalid_type, invalid_unknown):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    ValueError, "cover|shape|identities",
+                ):
+                    product_alignment._bind_identified_verdicts(
+                        invalid, node_ids, "node_id", "entries",
+                    )
+
     def test_alignment_schema_rejects_missing_duplicate_unknown_and_invalid_decisions(self) -> None:
         temporary, root = self.make_root()
         with temporary:
@@ -3336,7 +3543,18 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
 
             def swap_during_review(argv: list[str], *_args: object, **_kwargs: object) -> dict[str, object]:
                 result_path = Path(argv[argv.index("--output-last-message") + 1])
-                write_json(result_path, {"entries": json.loads(result.read_text())["entries"], "source_entries": source_entries})
+                entry_verdicts = json.loads(result.read_text())["entries"]
+                source_verdicts = [
+                    {
+                        "source_ref": str(entry["source_ref"]),
+                        **{
+                            key: value for key, value in entry.items()
+                            if key not in {"source_ref", "node_ids"}
+                        },
+                    }
+                    for entry in source_entries
+                ]
+                write_json(result_path, {"entries": entry_verdicts, "source_entries": source_verdicts})
                 active = root / ".dlv/product-alignments/cross-domain-feature"
                 active.rename(swapped_directory)
                 active.symlink_to(swap_external, target_is_directory=True)

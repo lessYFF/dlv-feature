@@ -38,6 +38,7 @@ or [runtime verification](references/verification-stage.md).
 ## Workflow
 
 ```bash
+python3 <skill-dir>/scripts/semantic_review_preflight.py
 python3 <skill-dir>/scripts/init_feature.py <feature-id> --root <project-root> --title "Feature title"
 python3 <skill-dir>/scripts/scope_revision.py <feature-id> --root <project-root> capture --source /abs/issue-source.json --owner <owner>
 python3 <skill-dir>/scripts/scope_revision.py <feature-id> --root <project-root> confirm --revision SRC-002 --owner <owner> --affected-node REQ-001
@@ -45,6 +46,12 @@ python3 <skill-dir>/scripts/delivery_graph.py compile <feature-id> --root <proje
 python3 <skill-dir>/scripts/product_alignment.py <feature-id> --root <project-root>
 python3 <skill-dir>/scripts/seal_product_lock.py <feature-id> --root <project-root> --alignment /abs/ALN-....json
 ```
+
+Before running this plugin, the host or package manager must verify the release
+digest/signature outside the plugin and load it from the verified snapshot.
+`semantic_review_preflight.py` checks only the Codex executable and private
+bootstrap-file environment. Its diagnostic plugin version/hashes are untrusted
+observations, not a self-attested identity or permission to start Product Alignment.
 
 Capture creates `SOURCE_DRIFT`; it does not mutate Graph or cancel a running
 Review. Confirmation starts a new scope epoch. Name affected nodes for precise

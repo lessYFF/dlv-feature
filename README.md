@@ -1,8 +1,19 @@
 # DLV Feature
 
-Current plugin version: **0.9.0**, Delivery Graph schema v13.
+Current plugin version: **0.9.1**, Delivery Graph schema v13.
 
 DLV Feature is a proof-carrying Codex workflow with immutable Source Revisions, generated PRD and Delivery Prototype views, independent Product Alignment, a content-addressed Product Lock, stable Claims and semantic Findings, budgeted convergence control, target-runtime authenticity, and deterministic finalization.
+
+Version 0.9.1 keeps the schema-v13 artifact format and makes Product Alignment
+identity-safe: the reviewer returns order-independent verdicts carrying immutable
+Product node and Source anchor IDs, while the trusted kernel binds identities and derives exact
+Source-to-Graph reciprocal mappings. Hosts must provision `CODEX_HOME/auth.json`
+and `config.toml` as owner-controlled, single-linked regular files with permissions
+no broader than `0600`; missing files and symlinks are rejected by design. A host
+must verify the release digest or signature outside the plugin before loading or
+executing any plugin code. Preflight reports `environment_ready` plus untrusted
+diagnostic version/hash values; it never attests its own plugin identity and its
+success does not authorize Product Alignment without that prior host verification.
 
 Review is risk-gated rather than zero-Finding-gated: critical/P0 and major/P1
 Findings block delivery, moderate/P2 requires an explicit Owner decision, and
@@ -21,6 +32,7 @@ codex plugin add dlv-feature@dlv-feature-marketplace
 ## Core flow
 
 ```bash
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/semantic_review_preflight.py
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/init_feature.py feature-id --root /path/to/project --title "Feature title"
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/scope_revision.py feature-id --root /path/to/project capture --source /path/to/issue-source.json --owner owner
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/scope_revision.py feature-id --root /path/to/project confirm --revision SRC-002 --owner owner --affected-node REQ-001
