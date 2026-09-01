@@ -103,9 +103,9 @@ Owner decision references. It is content-addressed and immutable. Missing or
 stale Product Lock blocks quality/architecture Review, Code, Proof, and finalization;
 product drift invalidates every downstream attestation and Proof Contract.
 
-After every compile, first honor `state.json.convergence`: `DIVERGING` or
-`NEEDS_DECISION` stops automation for the precise Owner decision. Otherwise
-route from `state.json.readiness`. The kernel
+After every compile, first honor `state.json.convergence`: `STABLE_BLOCKED`,
+`DIVERGING`, or `NEEDS_DECISION` stops automation for repair or the precise
+Owner decision. Otherwise route from `state.json.readiness`. The kernel
 derives `authoring_stage`, typed `authoring_blockers`, `product_lock_state`, and
 one `next_action`; the host must execute that action before considering Review:
 
