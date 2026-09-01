@@ -935,6 +935,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             write_ledger(root, "cross-domain-feature", ledger)
             state = delivery_graph.compile_graph(root, "cross-domain-feature")
             self.assertEqual("needs_decision", state["readiness"]["status"])
+            self.assertEqual("request_owner_decision", state["readiness"]["next_action"])
             self.assertEqual(1, state["readiness"]["open_owner_decision_findings"])
             finding_ledger.transition(
                 root, "cross-domain-feature", p2_entries[0]["id"], "ACCEPTED_RISK",
@@ -1441,14 +1442,11 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
         with temporary:
             directory = root / "delivery/cross-domain-feature"
             prototype = directory / "prototype.html"
+            self.configure_visual_graph(root)
             prototype.write_text("<main>version one</main>", encoding="utf-8")
             graph_path = directory / "delivery-graph.json"
             graph = json.loads(graph_path.read_text())
-            graph["delivery_prototype"] = {
-                "status": "generated", "path": "prototype.html",
-                "sha256": delivery_graph.file_digest(prototype),
-                "generated_from_revision": "SRC-001", "generator": "test-generator",
-            }
+            graph["delivery_prototype"]["sha256"] = delivery_graph.file_digest(prototype)
             write_json(graph_path, graph)
             self.review_all(root)
             prior_unit = self.unit_id(graph, "PROVENANCE_INTEGRITY")
@@ -2820,7 +2818,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertIs(False, payload["plugin_identity_verified"])
             self.assertIs(True, payload["host_verification_required"])
             self.assertEqual("dlv-feature", payload["plugin"])
-            self.assertEqual("0.9.1", payload["diagnostic_version"])
+            self.assertEqual("0.9.2", payload["diagnostic_version"])
             self.assertEqual(expected_plugin_sha256, payload["diagnostic_plugin_sha256"])
             self.assertEqual("0600", payload["bootstrap_files"]["auth.json"]["mode"])
             self.assertEqual(
@@ -3060,7 +3058,8 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertFalse((directory / "state.md").exists())
             state = delivery_graph.load_state(directory / "state.json")
             self.assertEqual({}, state["attestations"])
-            self.assertEqual("needs_decision", state["readiness"]["status"])
+            self.assertEqual("pending", state["readiness"]["status"])
+            self.assertIn(state["readiness"]["next_action"], {"author_product_graph", "run_product_alignment"})
             self.assertEqual("draft", state["proof_contract"]["status"])
             self.assertEqual("pending", state["code"]["status"])
             archive = root / ".dlv/upgrades/legacy-feature/schema-v9-candidates"
@@ -3098,6 +3097,9 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             write_json(directory / "delivery-graph.json", graph)
             state = delivery_graph.compile_graph(root, "cross-domain-feature")
             self.assertTrue(state["readiness"]["prototype_blocked"])
+            self.assertEqual("prototype", state["readiness"]["authoring_stage"])
+            self.assertEqual("regenerate_prototype", state["readiness"]["next_action"])
+            self.assertNotEqual("needs_decision", state["readiness"]["status"])
             graph["delivery_prototype"]["generated_from_revision"] = "SRC-001"
             write_json(directory / "delivery-graph.json", graph)
             delivery_graph.compile_graph(root, "cross-domain-feature")
@@ -3115,9 +3117,10 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             }
             write_json(directory / "delivery-graph.json", graph)
             state = delivery_graph.compile_graph(root, "cross-domain-feature")
-            self.assertEqual("needs_decision", state["readiness"]["status"])
+            self.assertEqual("pending", state["readiness"]["status"])
             self.assertTrue(state["readiness"]["product_lock_blocked"])
-            with self.assertRaisesRegex(ValueError, "requires a decision"):
+            self.assertEqual("run_product_alignment", state["readiness"]["next_action"])
+            with self.assertRaisesRegex(ValueError, "run_product_alignment"):
                 graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "generated-review")
 
     def test_wmd_160_platform_limitation_requires_owner_then_seals_product_lock(self) -> None:
@@ -3173,7 +3176,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertEqual("NEEDS_DECISION", json.loads(blocked_alignment.read_text())["verdict"])
             with self.assertRaisesRegex(ValueError, "SAFE Product Alignment"):
                 seal_product_lock.seal(root, "cross-domain-feature", blocked_alignment)
-            with self.assertRaisesRegex(ValueError, "requires a decision"):
+            with self.assertRaisesRegex(ValueError, "run_product_alignment"):
                 graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "wmd-blocked")
             with self.assertRaises(ValueError):
                 graph_contract.seal_contract(root, "cross-domain-feature")
@@ -3243,8 +3246,394 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             write_json(path, graph)
             state = delivery_graph.compile_graph(root, "cross-domain-feature")
             self.assertTrue(state["readiness"]["product_lock_blocked"])
+            self.assertEqual("content_stale", state["readiness"]["product_lock_state"])
+            self.assertEqual("run_product_alignment", state["readiness"]["next_action"])
+            self.assertNotEqual("needs_decision", state["readiness"]["status"])
             self.assertEqual({}, state["attestations"])
             self.assertEqual("draft", state["proof_contract"]["status"])
+
+    def test_product_node_set_drift_routes_to_alignment_not_lock_recovery(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            graph["nodes"].append(
+                node("EX-002", "Exception", "Second denial", "A second invalid transition is denied"),
+            )
+            graph["edges"].append(edge("EX-002", "derives_from", "BHV-001"))
+            write_json(path, graph)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("content_stale", state["readiness"]["product_lock_state"])
+            self.assertEqual("run_product_alignment", state["readiness"]["next_action"])
+
+    def test_alignment_tamper_cannot_hide_behind_simultaneous_product_drift(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            lock_path = root / "delivery/cross-domain-feature/product-locks" / f"{graph['product_lock']['id']}.json"
+            lock = json.loads(lock_path.read_text())
+            alignment_path = root / ".dlv/product-alignments/cross-domain-feature" / f"ALN-{lock['alignment_digest'][:12]}.json"
+            alignment = json.loads(alignment_path.read_text())
+            transcript = root / alignment["execution"]["transcript_path"]
+            transcript.write_text("tampered", encoding="utf-8")
+            next(item for item in graph["nodes"] if item["id"] == "REQ-001")["statement"] += " with drift"
+            write_json(root / "delivery/cross-domain-feature/delivery-graph.json", graph)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("invalid", state["readiness"]["product_lock_state"])
+            self.assertEqual("recover_product_lock", state["readiness"]["next_action"])
+
+    def test_forged_safe_lock_cannot_wrap_a_non_safe_alignment(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            directory = root / "delivery/cross-domain-feature"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            old_lock_path = directory / "product-locks" / f"{graph['product_lock']['id']}.json"
+            forged_lock = json.loads(old_lock_path.read_text())
+            old_alignment = root / ".dlv/product-alignments/cross-domain-feature" / f"ALN-{forged_lock['alignment_digest'][:12]}.json"
+            alignment = json.loads(old_alignment.read_text())
+            alignment["verdict"] = "NEEDS_DECISION"
+            alignment["alignment_digest"] = product_lock.alignment_digest(alignment)
+            forged_alignment = root / ".dlv/product-alignments/cross-domain-feature" / f"ALN-{alignment['alignment_digest'][:12]}.json"
+            write_json(forged_alignment, alignment)
+            forged_lock["alignment_digest"] = alignment["alignment_digest"]
+            forged_lock["alignment_verdict"] = "SAFE"
+            forged_lock["lock_digest"] = product_lock.lock_digest(forged_lock)
+            forged_id = f"PCL-{forged_lock['lock_digest'][:12]}"
+            forged_lock_path = directory / "product-locks" / f"{forged_id}.json"
+            write_json(forged_lock_path, forged_lock)
+            graph["product_lock"] = {"id": forged_id, "sha256": delivery_graph.file_digest(forged_lock_path)}
+            write_json(directory / "delivery-graph.json", graph)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("invalid", state["readiness"]["product_lock_state"])
+            self.assertEqual("recover_product_lock", state["readiness"]["next_action"])
+
+    def test_stage_aware_readiness_routes_authoring_before_review(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            product_ids = {
+                item["id"] for item in graph["nodes"]
+                if delivery_graph.TYPE_STAGE[item["type"]] == "product"
+            }
+            graph["nodes"] = [item for item in graph["nodes"] if item["id"] in product_ids]
+            graph["edges"] = [
+                item for item in graph["edges"]
+                if item["source"] in product_ids and item["target"] in product_ids
+            ]
+            graph["claims"] = []
+            write_json(path, graph)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("product_alignment", state["readiness"]["authoring_stage"])
+            self.assertEqual("run_product_alignment", state["readiness"]["next_action"])
+            self.assertEqual("missing", state["readiness"]["product_lock_state"])
+            self.assertNotEqual("needs_decision", state["readiness"]["status"])
+
+            graph["nodes"] = [item for item in graph["nodes"] if item["id"] != "AC-001"]
+            graph["edges"] = [
+                item for item in graph["edges"]
+                if item["source"] != "AC-001" and item["target"] != "AC-001"
+            ]
+            write_json(path, graph)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("product", state["readiness"]["authoring_stage"])
+            self.assertEqual("author_product_graph", state["readiness"]["next_action"])
+            self.assertIn(
+                "PRODUCT_NO_ACCEPTANCE",
+                {item["code"] for item in state["readiness"]["authoring_blockers"]},
+            )
+
+    def test_safe_lock_requires_post_lock_authoring_before_quality_review(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            removed = {
+                item["id"] for item in graph["nodes"]
+                if delivery_graph.TYPE_STAGE[item["type"]] != "product"
+            }
+            graph["nodes"] = [item for item in graph["nodes"] if item["id"] not in removed]
+            graph["edges"] = [
+                item for item in graph["edges"]
+                if item["source"] not in removed and item["target"] not in removed
+            ]
+            graph["claims"] = []
+            write_json(path, graph)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("safe", state["readiness"]["product_lock_state"])
+            self.assertEqual("architecture", state["readiness"]["authoring_stage"])
+            self.assertEqual("author_architecture_graph", state["readiness"]["next_action"])
+            self.assertIn(
+                "ARCH_NO_CLAIM",
+                {item["code"] for item in state["readiness"]["authoring_blockers"]},
+            )
+            global_record = graph_review.evaluate_unit(
+                graph,
+                delivery_graph.review_units(graph)[delivery_graph.GLOBAL_LENS],
+                "global-deterministic",
+            )
+            self.assertIn("ARCH_NO_CLAIM", {item["code"] for item in global_record["issues"]})
+            self.assertEqual("BLOCKED", global_record["verdict"])
+            fake_attestations = {
+                unit_id: {"verdict": "PASS"}
+                for unit_id in delivery_graph.review_units(graph)
+            }
+            derived = delivery_graph.readiness(
+                graph,
+                fake_attestations,
+                source_status=state["source_revision"],
+                ledger=delivery_governance.load_ledger(root, "cross-domain-feature"),
+                product_lock_status={"state": "safe", "errors": []},
+            )
+            self.assertNotEqual("ready", derived["status"])
+
+    def test_deterministic_authoring_blocker_never_starts_or_records_review(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            architecture_ids = {
+                item["id"] for item in graph["nodes"]
+                if delivery_graph.TYPE_STAGE[item["type"]] == "architecture"
+            }
+            graph["nodes"] = [item for item in graph["nodes"] if item["id"] not in architecture_ids]
+            graph["edges"] = [
+                item for item in graph["edges"]
+                if item["source"] not in architecture_ids and item["target"] not in architecture_ids
+            ]
+            graph["claims"] = [
+                item for item in graph["claims"]
+                if item["lens"] not in {"STATE_AND_ATOMICITY", "BOUNDARY_AND_CONCURRENCY"}
+            ]
+            write_json(path, graph)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            before_execution = copy.deepcopy(state["execution"])
+            before_ledger = delivery_governance.load_ledger(root, "cross-domain-feature")
+            with patch.object(graph_review, "run_bounded") as reviewer, self.assertRaisesRegex(
+                ValueError, "author_architecture_graph",
+            ):
+                graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "must-not-run")
+            reviewer.assert_not_called()
+            after_state = delivery_graph.load_state(path.parent / "state.json")
+            after_ledger = delivery_governance.load_ledger(root, "cross-domain-feature")
+            self.assertEqual(before_execution, after_state["execution"])
+            self.assertEqual(before_ledger["campaigns"], after_ledger["campaigns"])
+            self.assertFalse(list((root / ".dlv/reviews/cross-domain-feature").glob("must-not-run*")))
+
+    def test_review_preflight_rederives_route_instead_of_trusting_tampered_state(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            directory = root / "delivery/cross-domain-feature"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            architecture_ids = {
+                item["id"] for item in graph["nodes"]
+                if delivery_graph.TYPE_STAGE[item["type"]] == "architecture"
+            }
+            graph["nodes"] = [item for item in graph["nodes"] if item["id"] not in architecture_ids]
+            graph["edges"] = [
+                item for item in graph["edges"]
+                if item["source"] not in architecture_ids and item["target"] not in architecture_ids
+            ]
+            graph["claims"] = [
+                item for item in graph["claims"]
+                if item["lens"] not in {"STATE_AND_ATOMICITY", "BOUNDARY_AND_CONCURRENCY"}
+            ]
+            write_json(directory / "delivery-graph.json", graph)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            state["readiness"]["authoring_stage"] = "quality_review"
+            state["readiness"]["authoring_blockers"] = []
+            state["readiness"]["next_action"] = "run_quality_review"
+            write_json(directory / "state.json", state)
+            with patch.object(graph_review, "run_bounded") as reviewer, self.assertRaisesRegex(
+                ValueError, "author_architecture_graph",
+            ):
+                graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "tampered-route")
+            reviewer.assert_not_called()
+            self.assertFalse(list((root / ".dlv/reviews/cross-domain-feature").glob("tampered-route*")))
+
+    def test_review_preflight_rejects_aliased_attestation_summaries(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.review_all(root)
+            state_path = root / "delivery/cross-domain-feature/state.json"
+            state = delivery_graph.load_state(state_path)
+            unit_ids = sorted(state["attestations"])
+            self.assertGreater(len(unit_ids), 1)
+            aliased = copy.deepcopy(state["attestations"][unit_ids[0]])
+            for unit_id in unit_ids[1:]:
+                state["attestations"][unit_id] = copy.deepcopy(aliased)
+            write_json(state_path, state)
+            with patch.object(graph_review, "run_bounded") as reviewer, self.assertRaisesRegex(
+                ValueError, "invalid attestation state",
+            ):
+                graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "aliased-state")
+            reviewer.assert_not_called()
+
+    def test_compile_refuses_an_active_review_lease(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            lease_path = root / ".dlv/runs/cross-domain-feature/.review-execution.lock"
+            state_path = root / "delivery/cross-domain-feature/state.json"
+            state = delivery_graph.load_state(state_path)
+            state["execution"] = {"status": "reviewing", "checkpoint": "semantic-review", "reason": "lease-test"}
+            write_json(state_path, state)
+            with delivery_proof.nonblocking_exclusive_file_lock(lease_path):
+                with self.assertRaisesRegex(ValueError, "holds the feature lease"):
+                    delivery_graph.compile_graph(root, "cross-domain-feature")
+
+    def test_compile_recovers_stale_review_state_when_os_lease_is_free(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            state_path = root / "delivery/cross-domain-feature/state.json"
+            state = delivery_graph.load_state(state_path)
+            state["execution"] = {"status": "reviewing", "checkpoint": "semantic-review", "reason": "killed"}
+            write_json(state_path, state)
+            compiled = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("needs_resume", compiled["execution"]["status"])
+            self.assertIn("recovered stale Review lease", compiled["execution"]["reason"])
+
+    def test_second_review_refuses_an_active_review_lease_without_model_calls(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            lease_path = root / ".dlv/runs/cross-domain-feature/.review-execution.lock"
+            state_path = root / "delivery/cross-domain-feature/state.json"
+            state = delivery_graph.load_state(state_path)
+            state["execution"] = {"status": "reviewing", "checkpoint": "semantic-review", "reason": "review-a"}
+            write_json(state_path, state)
+            before_ledger = delivery_governance.load_ledger(root, "cross-domain-feature")
+            with delivery_proof.nonblocking_exclusive_file_lock(lease_path):
+                with patch.object(graph_review, "run_bounded") as reviewer, self.assertRaisesRegex(
+                    ValueError, "already active",
+                ):
+                    graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "review-b")
+            reviewer.assert_not_called()
+            self.assertEqual(
+                before_ledger["campaigns"],
+                delivery_governance.load_ledger(root, "cross-domain-feature")["campaigns"],
+            )
+            self.assertFalse(list((root / ".dlv/reviews/cross-domain-feature").glob("review-b*")))
+
+    def test_post_lock_implementation_authoring_and_finding_repair_both_precede_review(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            directory = root / "delivery/cross-domain-feature"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            implementation_ids = {
+                item["id"] for item in graph["nodes"]
+                if delivery_graph.TYPE_STAGE[item["type"]] == "implementation_proof"
+            }
+            graph["nodes"] = [item for item in graph["nodes"] if item["id"] not in implementation_ids]
+            graph["edges"] = [
+                item for item in graph["edges"]
+                if item["source"] not in implementation_ids and item["target"] not in implementation_ids
+            ]
+            graph["edges"].append(edge("DEC-001", "mitigates", "RISK-001"))
+            for item in graph["claims"]:
+                item["subjects"] = [subject for subject in item["subjects"] if subject not in implementation_ids]
+                item["proof_ids"] = []
+                item["id"] = claim_id_for({key: value for key, value in item.items() if key != "id"})
+            write_json(directory / "delivery-graph.json", graph)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("implementation_proof", state["readiness"]["authoring_stage"])
+            self.assertEqual("author_implementation_proof_graph", state["readiness"]["next_action"])
+            with patch.object(graph_review, "run_bounded") as reviewer, self.assertRaisesRegex(
+                ValueError, "author_implementation_proof_graph",
+            ):
+                graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "implementation-missing")
+            reviewer.assert_not_called()
+
+        temporary, root = self.make_root()
+        with temporary:
+            self.review_all(root)
+            ledger, _ = apply_review_findings(
+                load_ledger(root, "cross-domain-feature"),
+                unit_id="global-system-coherence",
+                source_revision="SRC-001",
+                findings=[{
+                    "id": "NEW", "severity": "major", "status": "OPEN",
+                    "statement": "A blocking regression remains", "evidence": "independent reproduction",
+                    "risk_path": "CONCURRENCY → duplicate side effect", "root_cause": "missing repair",
+                    "claim_id": valid_graph()["claims"][0]["id"],
+                    "failure_mode": "duplicate side effect",
+                    "violated_invariant": valid_graph()["claims"][0]["invariant"],
+                    "subjects": ["REQ-001"], "risk_axes": ["CONCURRENCY"],
+                    "previously_invisible_reason": "review exposed the regression",
+                }],
+            )
+            write_ledger(root, "cross-domain-feature", ledger)
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("repair_blocking_findings", state["readiness"]["next_action"])
+            with patch.object(graph_review, "run_bounded") as reviewer, self.assertRaisesRegex(
+                ValueError, "repair_blocking_findings",
+            ):
+                graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "repair-first")
+            reviewer.assert_not_called()
+
+    def test_global_graph_issues_are_reproducible_in_deterministic_debug_records(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            directory = root / "delivery/cross-domain-feature"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            removed = {
+                item["id"] for item in graph["nodes"]
+                if delivery_graph.TYPE_STAGE[item["type"]] != "product"
+            }
+            graph["nodes"] = [item for item in graph["nodes"] if item["id"] not in removed]
+            graph["edges"] = [
+                item for item in graph["edges"]
+                if item["source"] not in removed and item["target"] not in removed
+            ]
+            graph["claims"] = []
+            write_json(directory / "delivery-graph.json", graph)
+            delivery_graph.compile_graph(root, "cross-domain-feature")
+            graph_review.record_readiness(root, "cross-domain-feature", "global-debug")
+            self.assertEqual([], graph_validation.validate(root, "cross-domain-feature"))
+
+    def test_full_authored_graph_routes_to_quality_review(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+            self.assertEqual("safe", state["readiness"]["product_lock_state"])
+            self.assertEqual("quality_review", state["readiness"]["authoring_stage"])
+            self.assertEqual("run_quality_review", state["readiness"]["next_action"])
+
+    def test_compiler_and_validator_share_canonical_convergence_derivation(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+            ledger = delivery_governance.load_ledger(root, "cross-domain-feature")
+            self.assertEqual(
+                delivery_graph.derive_convergence(graph, state["readiness"], ledger),
+                state["convergence"],
+            )
+            self.assertEqual([], graph_validation.validate(root, "cross-domain-feature"))
+
+    def test_tampered_product_lock_routes_to_fail_closed_recovery(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            lock_path = root / "delivery/cross-domain-feature/product-locks" / f"{graph['product_lock']['id']}.json"
+            lock_path.write_text(lock_path.read_text() + " ", encoding="utf-8")
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertEqual("invalid", state["readiness"]["product_lock_state"])
+            self.assertEqual("product_lock_recovery", state["readiness"]["authoring_stage"])
+            self.assertEqual("recover_product_lock", state["readiness"]["next_action"])
+            self.assertNotEqual("run_product_alignment", state["readiness"]["next_action"])
 
     def test_live_product_lock_tamper_blocks_review_proof_code_and_verification(self) -> None:
         temporary, root = self.make_root()
@@ -4144,16 +4533,18 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             with self.assertRaisesRegex(ValueError, "requires a decision"):
                 graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "diverging-review")
 
-    def test_unchanged_compile_becomes_stable_blocked_and_stops_automatic_review(self) -> None:
+    def test_unchanged_pre_lock_compile_keeps_routing_to_product_alignment(self) -> None:
         temporary, root = self.make_root()
         with temporary:
             first = delivery_graph.compile_graph(root, "cross-domain-feature")
-            self.assertEqual("NEEDS_DECISION", first["convergence"]["status"])
+            self.assertEqual("CONVERGING", first["convergence"]["status"])
+            self.assertEqual("run_product_alignment", first["readiness"]["next_action"])
             second = delivery_graph.compile_graph(root, "cross-domain-feature")
-            self.assertEqual("NEEDS_DECISION", second["convergence"]["status"])
+            self.assertEqual("CONVERGING", second["convergence"]["status"])
+            self.assertEqual("run_product_alignment", second["readiness"]["next_action"])
             self.assertEqual([], graph_validation.validate(root, "cross-domain-feature"))
             with patch.object(graph_review, "run_bounded") as reviewer:
-                with self.assertRaisesRegex(ValueError, "requires a decision"):
+                with self.assertRaisesRegex(ValueError, "run_product_alignment"):
                     graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "stable-review")
                 reviewer.assert_not_called()
 
@@ -4715,6 +5106,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
         temporary, root = self.make_root()
         with temporary:
             delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.seal_product(root)
             (root / "src").mkdir()
             (root / "src/view.tsx").write_text("export const View = () => null;\n", encoding="utf-8")
             adapter = {
@@ -4752,11 +5144,14 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
                 patch.object(frontend_fast_path, "run_isolated_readiness_review", side_effect=review),
             ):
                 result = frontend_fast_path.run(root, "cross-domain-feature", "fast-happy")
-            self.assertEqual("BLOCKED", result["status"])
+            self.assertEqual("PROOF_REQUIRED", result["status"])
             self.assertEqual(["changes", "lint", "targeted_tests", "typecheck", "build"], calls)
             self.assertEqual(1, len(set(snapshot_bases)))
             self.assertIsNotNone(snapshot_bases[0])
-            self.assertEqual([], result["steps"])
+            self.assertEqual(
+                ["provenance", "changes", "lint", "targeted_tests", "typecheck", "build", "composite_review"],
+                [item["name"] for item in result["steps"]],
+            )
             with patch.object(frontend_fast_path, "execute_capability") as duplicate_execute:
                 with self.assertRaisesRegex(ValueError, "journal already exists"):
                     frontend_fast_path.run(root, "cross-domain-feature", "fast-happy")

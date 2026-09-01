@@ -1,10 +1,24 @@
 # Schema v13 workflow
 
 ```text
-capture source → confirm epoch → declare Claims/Graph → compile
+capture source → confirm epoch → author Product Graph → compile
+→ regenerate prototype when stale → Product Alignment → SAFE Product Lock
+→ author Architecture + implementation-proof Graph → deterministic clean gate
 → review stale risk components → converge Findings
 → seal → implement/reconcile → authentic target Proof → finalize
 ```
+
+`state.json.convergence` stop states take precedence; otherwise
+`state.json.readiness.next_action` is the executable routing contract. Programs
+capture and hash inputs, validate Graph/prototype/Lock integrity, derive stages
+and convergence, preserve attestations, enforce budgets, and write atomic
+records. The Author LLM interprets Source and repository facts to author the
+Product, Architecture, and implementation-proof Graph sections. The Reviewer
+LLM runs only for `run_quality_review`, in an isolated process, after all
+deterministic critical/major blockers are clean. Missing/content-stale Locks
+route to Product Alignment; invalid/tampered Locks route to fail-closed
+recovery. Neither condition is silently converted into an Owner product
+decision.
 
 Quality contracts never change by route. Efficiency may reuse fresh component
 attestations, run cheapest checks first, or select the frontend fast path; it

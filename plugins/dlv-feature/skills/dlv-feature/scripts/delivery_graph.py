@@ -16,7 +16,7 @@ import json
 import re
 from subprocess import run as run_process
 import sys
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -26,6 +26,7 @@ from delivery_proof import (
     exclusive_file_lock,
     file_digest,
     load_json,
+    nonblocking_exclusive_file_lock,
     repository_fingerprint,
     value_digest,
     validate_feature_id,
@@ -661,6 +662,7 @@ def readiness(
     graph: dict[str, Any], attestations: dict[str, Any], *,
     source_status: dict[str, Any] | None = None, ledger: dict[str, Any] | None = None,
     product_lock_errors: list[str] | None = None,
+    product_lock_status: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(attestations, dict):
         attestations = {}
@@ -671,15 +673,82 @@ def readiness(
         if isinstance(attestations.get(unit_id), dict)
         and attestations[unit_id].get("verdict") != "PASS"
     )
-    finding_counts = finding_summary(ledger) if ledger is not None else {"open_blockers": 0, "owner_decisions": 0}
+    ledger = ledger if isinstance(ledger, dict) else {"entries": {}}
+    finding_counts = finding_summary(ledger) if "campaigns" in ledger else {
+        "open_blockers": 0, "owner_decisions": 0,
+    }
     drift = source_status is not None and source_status.get("status") != "confirmed"
-    prototype_blocked = bool(prototype_review_blockers(graph))
-    product_lock_blocked = bool(product_lock_errors)
-    if drift or prototype_blocked or product_lock_blocked or finding_counts["owner_decisions"]:
+    prototype_blockers = prototype_review_blockers(graph)
+    prototype_blocked = bool(prototype_blockers)
+    if product_lock_status is None:
+        legacy_errors = list(product_lock_errors or [])
+        product_lock_status = {
+            "state": "invalid" if legacy_errors else "safe",
+            "errors": legacy_errors,
+        }
+    lock_state = product_lock_status.get("state")
+    lock_errors = list(product_lock_status.get("errors", []))
+    if lock_state not in {"missing", "content_stale", "invalid", "safe"}:
+        lock_state, lock_errors = "invalid", [*lock_errors, "Product Lock status is invalid"]
+    product_lock_blocked = lock_state != "safe"
+
+    def blockers_for(stage: str) -> list[dict[str, str]]:
+        by_key: dict[tuple[str, str], dict[str, str]] = {}
+        for lens, specification in LENSES.items():
+            if specification["stage"] != stage:
+                continue
+            for issue in semantic_issues(graph, lens):
+                if issue.get("severity") in {"critical", "major"}:
+                    by_key[(issue["code"], issue["node_id"])] = issue
+        return [by_key[key] for key in sorted(by_key)]
+
+    product_blockers = blockers_for("product")
+    entries = ledger.get("entries", {}) if isinstance(ledger.get("entries"), dict) else {}
+    repairable_blockers = [
+        entry for entry in entries.values()
+        if isinstance(entry, dict)
+        and entry.get("severity") in {"critical", "major"}
+        and entry.get("status") in {"OPEN", "MERGE_CANDIDATE"}
+    ]
+
+    if drift or finding_counts["owner_decisions"]:
+        authoring_stage, authoring_blockers, next_action = "owner_decision", [], "request_owner_decision"
+    elif product_blockers:
+        authoring_stage, authoring_blockers, next_action = "product", product_blockers, "author_product_graph"
+    elif prototype_blocked:
+        authoring_stage = "prototype"
+        authoring_blockers = [
+            {"code": "PROTOTYPE_STALE", "node_id": "GRAPH", "severity": "major", "statement": item}
+            for item in prototype_blockers
+        ]
+        next_action = "regenerate_prototype"
+    elif lock_state in {"missing", "content_stale"}:
+        authoring_stage, authoring_blockers, next_action = "product_alignment", [], "run_product_alignment"
+    elif lock_state == "invalid":
+        authoring_stage = "product_lock_recovery"
+        authoring_blockers = [
+            {"code": "PRODUCT_LOCK_INVALID", "node_id": "GRAPH", "severity": "critical", "statement": item}
+            for item in lock_errors
+        ]
+        next_action = "recover_product_lock"
+    elif (architecture_blockers := blockers_for("architecture")):
+        authoring_stage, authoring_blockers, next_action = "architecture", architecture_blockers, "author_architecture_graph"
+    elif (implementation_blockers := blockers_for("implementation_proof")):
+        authoring_stage, authoring_blockers, next_action = (
+            "implementation_proof", implementation_blockers, "author_implementation_proof_graph",
+        )
+    elif repairable_blockers:
+        authoring_stage, authoring_blockers, next_action = "finding_repair", [], "repair_blocking_findings"
+    elif missing or blocked or finding_counts["open_blockers"]:
+        authoring_stage, authoring_blockers, next_action = "quality_review", [], "run_quality_review"
+    else:
+        authoring_stage, authoring_blockers, next_action = "complete", [], "seal_or_continue_delivery"
+
+    if drift or finding_counts["owner_decisions"]:
         status = "needs_decision"
-    elif blocked or finding_counts["open_blockers"]:
+    elif next_action in {"recover_product_lock", "repair_blocking_findings"} or blocked or finding_counts["open_blockers"]:
         status = "blocked"
-    elif missing:
+    elif next_action != "seal_or_continue_delivery" or missing:
         status = "pending"
     else:
         status = "ready"
@@ -692,9 +761,100 @@ def readiness(
         "source_drift": bool(drift),
         "prototype_blocked": prototype_blocked,
         "product_lock_blocked": product_lock_blocked,
-        "product_lock_errors": list(product_lock_errors or []),
+        "product_lock_state": lock_state,
+        "product_lock_errors": lock_errors,
+        "authoring_stage": authoring_stage,
+        "authoring_blockers": authoring_blockers,
+        "next_action": next_action,
         "open_blocking_findings": finding_counts["open_blockers"],
         "open_owner_decision_findings": finding_counts["owner_decisions"],
+    }
+
+
+def convergence_snapshot(
+    graph: dict[str, Any], delivery_readiness: dict[str, Any], ledger: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the canonical inputs bound into one convergence transition."""
+    vector = convergence_vector(graph, delivery_readiness, ledger)
+    campaigns = ledger.get("campaigns", [])
+    budget = review_budget(graph)
+    used = {
+        "campaigns": len(campaigns),
+        "unit_reviews": sum(item.get("unit_count", 0) for item in campaigns if isinstance(item, dict)),
+        "new_findings": sum(item.get("new_findings", 0) for item in campaigns if isinstance(item, dict)),
+    }
+    return {
+        "vector": vector,
+        "budget": budget,
+        "used": used,
+        "state_key": value_digest({
+            "graph_sha256": graph_digest(graph),
+            "readiness": delivery_readiness,
+            "vector": vector,
+            "used": used,
+        }),
+    }
+
+
+def derive_convergence(
+    graph: dict[str, Any], delivery_readiness: dict[str, Any], ledger: dict[str, Any],
+) -> dict[str, Any]:
+    """Derive convergence once for both compilation and validation."""
+    snapshot = convergence_snapshot(graph, delivery_readiness, ledger)
+    vector = snapshot["vector"]
+    events = ledger.get("convergence_events", [])
+    previous_event = events[-2] if len(events) >= 2 else None
+    previous_vector = previous_event.get("vector") if isinstance(previous_event, dict) else None
+    distinct_history: list[list[int]] = []
+    for event in events:
+        event_vector = event.get("vector") if isinstance(event, dict) else None
+        if isinstance(event_vector, list) and (not distinct_history or distinct_history[-1] != event_vector):
+            distinct_history.append(event_vector)
+    history = distinct_history[-3:]
+
+    def monitored_metrics(item: list[int]) -> tuple[int, int, int]:
+        return (sum(item[:-1]), item[0] + item[3], item[6])
+
+    consecutive_growth = False
+    if len(history) == 3:
+        first, second, third = (monitored_metrics(item) for item in history)
+        consecutive_growth = any(
+            first[index] < second[index] < third[index] for index in range(3)
+        )
+    exhausted = (
+        snapshot["used"]["campaigns"] >= snapshot["budget"]["max_campaigns"]
+        or snapshot["used"]["unit_reviews"] >= snapshot["budget"]["max_unit_reviews"]
+        or snapshot["used"]["new_findings"] >= snapshot["budget"]["max_new_findings"]
+    ) and delivery_readiness["status"] != "ready"
+    campaigns = ledger.get("campaigns", [])
+    if delivery_readiness["status"] == "ready":
+        status, reason = "READY", "all required review and finding obligations are closed"
+    elif (
+        delivery_readiness["source_drift"]
+        or delivery_readiness["open_owner_decision_findings"]
+        or exhausted
+    ):
+        status, reason = "NEEDS_DECISION", "source/finding decision or review budget is required"
+    elif not campaigns:
+        status, reason = (
+            "CONVERGING",
+            f"continue deterministic workflow action: {delivery_readiness['next_action']}",
+        )
+    elif consecutive_growth:
+        status, reason = "DIVERGING", "a monitored obligation increased across two consecutive transitions"
+    elif isinstance(previous_vector, list) and vector == previous_vector:
+        status, reason = "STABLE_BLOCKED", "the lexicographic obligation vector did not decrease"
+    else:
+        status, reason = "CONVERGING", "the lexicographic obligation vector decreased or established a baseline"
+    return {
+        "status": status,
+        "vector": vector,
+        "previous_vector": previous_vector if isinstance(previous_vector, list) else None,
+        "ready_distance": sum(vector[:-1]),
+        "history": history,
+        "budget": snapshot["budget"],
+        "used": snapshot["used"],
+        "reason": reason,
     }
 
 
@@ -1514,12 +1674,31 @@ def compile_graph(
     contract_path = directory / "proof-contract.json"
     lock = confined_project_path(root, Path(".dlv") / "runs" / feature_id / ".feature.lock", "feature lock")
     lock_context = nullcontext() if _lock_held else exclusive_file_lock(lock)
-    with lock_context:
+    with ExitStack() as lock_stack:
+        lock_stack.enter_context(lock_context)
         if not _lock_held:
+            review_lease = confined_project_path(
+                root, Path(".dlv") / "runs" / feature_id / ".review-execution.lock",
+                "Review execution lease",
+            )
+            try:
+                lock_stack.enter_context(nonblocking_exclusive_file_lock(review_lease))
+            except BlockingIOError as exc:
+                raise ValueError("automatic Review holds the feature lease; finish Review before compiling") from exc
             recover_review_transaction(root, feature_id)
         if file_digest(source_path) != source_sha256:
             raise ValueError("Delivery Graph changed before compilation acquired the feature lock; rerun")
         previous = load_state(state_path)
+        if (
+            not _lock_held
+            and isinstance(previous.get("execution"), dict)
+            and previous["execution"].get("status") == "reviewing"
+        ):
+            previous["execution"] = {
+                "status": "needs_resume",
+                "checkpoint": "semantic-review",
+                "reason": "recovered stale Review lease before compile",
+            }
         ledger = load_ledger(root, feature_id)
         ledger_needs_write = not ledger_path_exists(root, feature_id)
         units = review_units(graph)
@@ -1543,16 +1722,17 @@ def compile_graph(
         }
         risk["profiles"] = profiles_for(risk["effective"])
         product_document = render_stage_document(graph, "product")
-        from product_lock import current_product_lock_errors
-        lock_errors = current_product_lock_errors(
+        from product_lock import current_product_lock_status
+        lock_status = current_product_lock_status(
             directory, graph, source_revision, stage_hashes["product"],
             hashlib.sha256(product_document.encode("utf-8")).hexdigest(),
         )
+        lock_errors = lock_status["errors"]
         if lock_errors:
             attestations = {}
         delivery_readiness = readiness(
             graph, attestations, source_status=source_status, ledger=ledger,
-            product_lock_errors=lock_errors,
+            product_lock_status=lock_status,
         )
         contract = generate_proof_contract(graph)
         previous_contract = load_json(contract_path) if contract_path.is_file() else None
@@ -1584,73 +1764,14 @@ def compile_graph(
             verification = {"status": "pending", "active_run_id": None, "run_digest": None, "verdict": None, "finalization": None}
         if formal_feature_commits(root, feature_id) and code.get("status") == "pending":
             code = {"status": "needs_reconcile", "repository_fingerprint": None}
-        vector = convergence_vector(graph, delivery_readiness, ledger)
-        campaigns = ledger.get("campaigns", [])
-        budget = review_budget(graph)
-        used = {
-            "campaigns": len(campaigns),
-            "unit_reviews": sum(item.get("unit_count", 0) for item in campaigns if isinstance(item, dict)),
-            "new_findings": sum(item.get("new_findings", 0) for item in campaigns if isinstance(item, dict)),
-        }
-        exhausted = (
-            used["campaigns"] >= budget["max_campaigns"]
-            or used["unit_reviews"] >= budget["max_unit_reviews"]
-            or used["new_findings"] >= budget["max_new_findings"]
-        ) and delivery_readiness["status"] != "ready"
-        convergence_state_key = value_digest({
-            "graph_sha256": graph_digest(graph), "readiness": delivery_readiness,
-            "vector": vector, "used": used,
-        })
-        appended_event = append_convergence_event(ledger, convergence_state_key, vector, source_revision)
+        snapshot = convergence_snapshot(graph, delivery_readiness, ledger)
+        appended_event = append_convergence_event(
+            ledger, snapshot["state_key"], snapshot["vector"], source_revision,
+        )
         ledger_needs_write = ledger_needs_write or appended_event
         ledger_content = json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         ledger_sha256 = hashlib.sha256(ledger_content.encode("utf-8")).hexdigest()
-        events = ledger["convergence_events"]
-        if appended_event:
-            previous_event = events[-2] if len(events) >= 2 else None
-        else:
-            previous_event = None
-        prior_vector = previous_event["vector"] if previous_event else (
-            previous.get("convergence", {}).get("previous_vector")
-            if isinstance(previous.get("convergence"), dict) else None
-        )
-        distinct_history: list[list[int]] = []
-        for event in ledger["convergence_events"]:
-            if not distinct_history or distinct_history[-1] != event["vector"]:
-                distinct_history.append(event["vector"])
-        history = distinct_history[-3:]
-
-        def monitored_metrics(item: list[int]) -> tuple[int, int, int]:
-            return (sum(item[:-1]), item[0] + item[3], item[6])
-
-        consecutive_growth = False
-        if len(history) == 3:
-            first, second, third = (monitored_metrics(item) for item in history)
-            consecutive_growth = any(first[index] < second[index] < third[index] for index in range(len(first)))
-        if delivery_readiness["status"] == "ready":
-            convergence_status, convergence_reason = "READY", "all required review and finding obligations are closed"
-        elif (
-            delivery_readiness["source_drift"]
-            or delivery_readiness["prototype_blocked"]
-            or delivery_readiness["product_lock_blocked"]
-            or delivery_readiness["open_owner_decision_findings"]
-            or exhausted
-        ):
-            convergence_status, convergence_reason = "NEEDS_DECISION", "source/Product Lock/finding decision or review budget is required"
-        elif not campaigns and not lock_errors:
-            convergence_status, convergence_reason = "CONVERGING", "SAFE Product Lock established; architecture Review may begin"
-        elif campaigns and consecutive_growth:
-            convergence_status, convergence_reason = "DIVERGING", "a monitored obligation increased across two consecutive transitions"
-        elif isinstance(prior_vector, list) and vector == prior_vector:
-            convergence_status, convergence_reason = "STABLE_BLOCKED", "the lexicographic obligation vector did not decrease"
-        else:
-            convergence_status, convergence_reason = "CONVERGING", "the lexicographic obligation vector decreased or established a baseline"
-        convergence = {
-            "status": convergence_status, "vector": vector,
-            "previous_vector": prior_vector if isinstance(prior_vector, list) else None,
-            "ready_distance": sum(vector[:-1]), "history": history,
-            "budget": budget, "used": used, "reason": convergence_reason,
-        }
+        convergence = derive_convergence(graph, delivery_readiness, ledger)
         if check and not appended_event and isinstance(previous.get("convergence"), dict):
             # --check is observational: verify the last compiled result rather
             # than manufacturing a second no-progress observation.

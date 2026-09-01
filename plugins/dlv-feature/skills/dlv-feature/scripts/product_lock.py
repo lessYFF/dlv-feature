@@ -242,6 +242,41 @@ def validate_alignment_record(
     alignment: dict[str, Any], graph: dict[str, Any], source_revision: dict[str, Any],
     product_subgraph_sha256: str, prd_sha256: str, *, directory: Path,
 ) -> list[str]:
+    integrity_errors = alignment_integrity_errors(
+        alignment, source_revision, directory=directory, feature_id=graph["feature_id"],
+    )
+    if integrity_errors:
+        return integrity_errors
+    return alignment_binding_errors(
+        alignment, graph, source_revision, product_subgraph_sha256, prd_sha256,
+        directory=directory,
+    )
+
+
+def alignment_binding_errors(
+    alignment: dict[str, Any], graph: dict[str, Any], source_revision: dict[str, Any],
+    product_subgraph_sha256: str, prd_sha256: str, *, directory: Path,
+) -> list[str]:
+    """Compare an already-authenticated Alignment with current product truth."""
+    try:
+        direct_refs, constraint_refs = known_origin_refs(directory, graph, source_revision)
+        expected = alignment_core(
+            graph, source_revision, product_subgraph_sha256, prd_sha256,
+            alignment.get("entries"), alignment.get("source_entries"),
+            direct_refs=direct_refs, constraint_refs=constraint_refs,
+        )
+        expected["execution"] = alignment["execution"]
+        expected["alignment_digest"] = alignment_digest(expected)
+    except (KeyError, TypeError, ValueError) as exc:
+        return [str(exc)]
+    return [] if alignment == expected else ["Product Alignment is stale or not reproducible"]
+
+
+def alignment_integrity_errors(
+    alignment: dict[str, Any], source_revision: dict[str, Any], *, directory: Path,
+    feature_id: str,
+) -> list[str]:
+    """Validate immutable Alignment identity/provenance without current Graph bindings."""
     expected_keys = {
         "schema_version", "feature_id", "source_revision", "source_digest",
         "product_subgraph_sha256", "prd_sha256", "delivery_prototype_sha256",
@@ -250,54 +285,57 @@ def validate_alignment_record(
     }
     if not isinstance(alignment, dict) or set(alignment) != expected_keys:
         return ["Product Alignment contains unknown or missing fields"]
+    if (
+        alignment.get("schema_version") != 13
+        or alignment.get("feature_id") != feature_id
+        or alignment.get("reviewer") != "codex-exec"
+        or alignment.get("independent") is not True
+        or alignment.get("verdict") != "SAFE"
+    ):
+        return ["Product Alignment immutable identity or SAFE verdict is invalid"]
+    if alignment.get("alignment_digest") != alignment_digest(alignment):
+        return ["Product Alignment content digest is invalid"]
+    execution = alignment.get("execution")
+    expected_execution_keys = {
+        "mode", "provider", "invocation_id", "transcript_path", "transcript_sha256",
+        "result_sha256", "independent", "kernel_receipt",
+    }
+    if (
+        not isinstance(execution, dict) or set(execution) != expected_execution_keys
+        or execution.get("mode") != "isolated_process" or execution.get("provider") != "codex-exec"
+        or execution.get("independent") is not True
+        or not isinstance(execution.get("invocation_id"), str)
+        or re.fullmatch(r"alignment-[0-9a-f]{32}", execution["invocation_id"]) is None
+        or execution.get("result_sha256") != value_digest({
+            "entries": alignment.get("entries"), "source_entries": alignment.get("source_entries"),
+        })
+    ):
+        return ["Product Alignment requires independent isolated-process execution"]
+    root = directory.parent.parent
+    transcript = root / str(execution.get("transcript_path", ""))
+    review_dir = root / ".dlv" / "product-alignments" / feature_id
+    if (
+        not transcript.is_file() or transcript.resolve() != transcript.absolute()
+        or transcript.parent != review_dir or file_digest(transcript) != execution.get("transcript_sha256")
+    ):
+        return ["Product Alignment transcript is missing, escaped, or stale"]
+    receipt_payload = {
+        "invocation_id": execution["invocation_id"],
+        "transcript_sha256": execution["transcript_sha256"],
+        "result_sha256": execution["result_sha256"],
+        "source_digest": alignment.get("source_digest"),
+        "product_subgraph_sha256": alignment.get("product_subgraph_sha256"),
+        "prd_sha256": alignment.get("prd_sha256"),
+        "delivery_prototype_sha256": alignment.get("delivery_prototype_sha256"),
+    }
     try:
-        direct_refs, constraint_refs = known_origin_refs(directory, graph, source_revision)
-        expected = alignment_core(
-            graph, source_revision, product_subgraph_sha256, prd_sha256,
-            alignment.get("entries"), alignment.get("source_entries"),
-            direct_refs=direct_refs, constraint_refs=constraint_refs,
-        )
-        execution = alignment.get("execution")
-        expected_execution_keys = {
-            "mode", "provider", "invocation_id", "transcript_path", "transcript_sha256", "result_sha256", "independent", "kernel_receipt",
-        }
-        if (
-            not isinstance(execution, dict) or set(execution) != expected_execution_keys
-            or execution.get("mode") != "isolated_process" or execution.get("provider") != "codex-exec"
-            or execution.get("independent") is not True
-            or not isinstance(execution.get("invocation_id"), str)
-            or re.fullmatch(r"alignment-[0-9a-f]{32}", execution["invocation_id"]) is None
-            or execution.get("result_sha256") != value_digest({
-                "entries": alignment.get("entries"), "source_entries": alignment.get("source_entries"),
-            })
-        ):
-            raise ValueError("Product Alignment requires independent isolated-process execution")
-        root = directory.parent.parent
-        transcript = root / str(execution.get("transcript_path", ""))
-        review_dir = root / ".dlv" / "product-alignments" / graph["feature_id"]
-        if (
-            not transcript.is_file() or transcript.resolve() != transcript.absolute()
-            or transcript.parent != review_dir or file_digest(transcript) != execution.get("transcript_sha256")
-        ):
-            raise ValueError("Product Alignment transcript is missing, escaped, or stale")
-        receipt_payload = {
-            "invocation_id": execution["invocation_id"],
-            "transcript_sha256": execution["transcript_sha256"],
-            "result_sha256": execution["result_sha256"],
-            "source_digest": alignment["source_digest"],
-            "product_subgraph_sha256": alignment["product_subgraph_sha256"],
-            "prd_sha256": alignment["prd_sha256"],
-            "delivery_prototype_sha256": alignment["delivery_prototype_sha256"],
-        }
         verify_kernel_receipt(
             receipt_payload, execution.get("kernel_receipt"), source_revision,
             label="Product Alignment execution",
         )
-        expected["execution"] = execution
-        expected["alignment_digest"] = alignment_digest(expected)
     except (KeyError, TypeError, ValueError) as exc:
         return [str(exc)]
-    return [] if alignment == expected else ["Product Alignment is stale or not reproducible"]
+    return []
 
 
 def alignment_digest(record: dict[str, Any]) -> str:
@@ -346,8 +384,6 @@ def load_current_product_lock(directory: Path, graph: dict[str, Any]) -> tuple[d
         for key in ("covered_node_ids", "source_anchor_refs", "direct_refs", "derived_constraint_refs")
     ):
         return None, ["current Product Lock source coverage values are invalid"]
-    if coverage.get("covered_node_ids") != product_node_ids(graph):
-        return None, ["current Product Lock source coverage is stale"]
     if (
         not isinstance(record.get("owner_decision_refs"), list)
         or not all(isinstance(item, str) for item in record["owner_decision_refs"])
@@ -359,13 +395,23 @@ def load_current_product_lock(directory: Path, graph: dict[str, Any]) -> tuple[d
     return record, []
 
 
-def current_product_lock_errors(
+def current_product_lock_status(
     directory: Path, graph: dict[str, Any], source_revision: dict[str, Any],
     product_subgraph_sha256: str, prd_sha256: str,
-) -> list[str]:
+) -> dict[str, Any]:
+    """Classify the current lock without inferring policy from error text.
+
+    ``missing`` and ``content_stale`` are safe inputs to a fresh Product
+    Alignment.  ``invalid`` means the content-addressed lock or its supporting
+    Alignment cannot be trusted and must be recovered fail-closed.
+    """
+    if graph.get("product_lock") is None:
+        return {"state": "missing", "errors": ["Delivery Graph has no current Product Lock"]}
     record, errors = load_current_product_lock(directory, graph)
     if record is None:
-        return errors
+        return {"state": "invalid", "errors": errors}
+    stale_errors: list[str] = []
+    invalid_errors: list[str] = []
     expected = {
         "schema_version": 13,
         "feature_id": graph["feature_id"],
@@ -377,15 +423,17 @@ def current_product_lock_errors(
     }
     for key, value in expected.items():
         if record.get(key) != value:
-            errors.append(f"current Product Lock {key} is stale")
+            stale_errors.append(f"current Product Lock {key} is stale")
+    if record.get("source_coverage", {}).get("covered_node_ids") != product_node_ids(graph):
+        stale_errors.append("current Product Lock source coverage is stale")
     if record.get("alignment_verdict") != "SAFE":
-        errors.append("current Product Lock is not backed by SAFE Product Alignment")
+        invalid_errors.append("current Product Lock is not backed by SAFE Product Alignment")
     expected_decisions = sorted(
         item["id"] for item in source_revision.get("decisions", [])
         if isinstance(item, dict) and isinstance(item.get("id"), str)
     )
     if record.get("owner_decision_refs") != expected_decisions:
-        errors.append("current Product Lock Owner decision references are stale")
+        stale_errors.append("current Product Lock Owner decision references are stale")
     alignment_value = record.get("alignment_digest")
     root = directory.parent.parent
     alignment_path = root / ".dlv" / "product-alignments" / graph["feature_id"] / f"ALN-{str(alignment_value)[:12]}.json"
@@ -393,25 +441,52 @@ def current_product_lock_errors(
         not isinstance(alignment_value, str) or not SHA256.fullmatch(alignment_value)
         or not alignment_path.is_file() or alignment_path.resolve() != alignment_path.absolute()
     ):
-        errors.append("current Product Lock Product Alignment artifact is missing or symlinked")
+        invalid_errors.append("current Product Lock Product Alignment artifact is missing or symlinked")
     else:
         try:
             alignment = load_alignment(alignment_path)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
-            errors.append(f"current Product Lock Product Alignment artifact is invalid: {exc}")
+            invalid_errors.append(f"current Product Lock Product Alignment artifact is invalid: {exc}")
         else:
             if alignment.get("alignment_digest") != alignment_value:
-                errors.append("current Product Lock Product Alignment digest is stale")
+                invalid_errors.append("current Product Lock Product Alignment digest is stale")
+            if record.get("alignment_verdict") != alignment.get("verdict") or alignment.get("verdict") != "SAFE":
+                invalid_errors.append("current Product Lock disagrees with the authentic SAFE Product Alignment verdict")
             if record.get("source_coverage") != alignment.get("source_coverage"):
-                errors.append("current Product Lock source coverage disagrees with Product Alignment")
-            errors.extend(validate_alignment_record(
-                alignment, graph, source_revision, product_subgraph_sha256, prd_sha256,
-                directory=directory,
-            ))
-    return errors
+                invalid_errors.append("current Product Lock source coverage disagrees with Product Alignment")
+            integrity_errors = alignment_integrity_errors(
+                alignment, source_revision, directory=directory, feature_id=graph["feature_id"],
+            )
+            invalid_errors.extend(integrity_errors)
+            if not integrity_errors:
+                alignment_errors = alignment_binding_errors(
+                    alignment, graph, source_revision, product_subgraph_sha256, prd_sha256,
+                    directory=directory,
+                )
+                if stale_errors:
+                    stale_errors.extend(alignment_errors)
+                else:
+                    invalid_errors.extend(alignment_errors)
+    errors = [*stale_errors, *invalid_errors]
+    if invalid_errors:
+        state = "invalid"
+    elif stale_errors:
+        state = "content_stale"
+    else:
+        state = "safe"
+    return {"state": state, "errors": errors}
 
 
-def live_product_lock_errors(root: Path, feature_id: str, graph: dict[str, Any] | None = None) -> list[str]:
+def current_product_lock_errors(
+    directory: Path, graph: dict[str, Any], source_revision: dict[str, Any],
+    product_subgraph_sha256: str, prd_sha256: str,
+) -> list[str]:
+    return current_product_lock_status(
+        directory, graph, source_revision, product_subgraph_sha256, prd_sha256,
+    )["errors"]
+
+
+def live_product_lock_status(root: Path, feature_id: str, graph: dict[str, Any] | None = None) -> dict[str, Any]:
     """Revalidate Product Lock, Product Alignment, PRD, and prototype at a live gate."""
     from delivery_graph import feature_dir, load_graph, prototype_errors, render_stage_document, stage_hash
     from delivery_governance import load_source_revision
@@ -423,14 +498,21 @@ def live_product_lock_errors(root: Path, feature_id: str, graph: dict[str, Any] 
     try:
         source = load_source_revision(directory, feature_id, graph["source_revision"])
     except (KeyError, OSError, ValueError) as exc:
-        return [*errors, str(exc)]
+        return {"state": "invalid", "errors": [*errors, str(exc)]}
     prd_path = directory / "prd.md"
     expected_prd = render_stage_document(graph, "product")
     if not prd_path.is_file() or prd_path.resolve() != prd_path.absolute():
-        return [*errors, "current PRD artifact is missing or symlinked"]
+        return {"state": "invalid", "errors": [*errors, "current PRD artifact is missing or symlinked"]}
     if prd_path.read_text(encoding="utf-8") != expected_prd:
         errors.append("current PRD artifact is stale")
-    errors.extend(current_product_lock_errors(
+    status = current_product_lock_status(
         directory, graph, source, stage_hash(graph, "product"), file_digest(prd_path),
-    ))
-    return errors
+    )
+    combined = [*errors, *status["errors"]]
+    if errors and status["state"] == "safe":
+        return {"state": "content_stale", "errors": combined}
+    return {"state": status["state"], "errors": combined}
+
+
+def live_product_lock_errors(root: Path, feature_id: str, graph: dict[str, Any] | None = None) -> list[str]:
+    return live_product_lock_status(root, feature_id, graph)["errors"]

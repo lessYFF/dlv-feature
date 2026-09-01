@@ -103,6 +103,41 @@ Owner decision references. It is content-addressed and immutable. Missing or
 stale Product Lock blocks quality/architecture Review, Code, Proof, and finalization;
 product drift invalidates every downstream attestation and Proof Contract.
 
+After every compile, first honor `state.json.convergence`: `DIVERGING` or
+`NEEDS_DECISION` stops automation for the precise Owner decision. Otherwise
+route from `state.json.readiness`. The kernel
+derives `authoring_stage`, typed `authoring_blockers`, `product_lock_state`, and
+one `next_action`; the host must execute that action before considering Review:
+
+```text
+author_product_graph                 → Author LLM completes product truth
+regenerate_prototype                 → generator rebuilds prototype bytes/binding
+run_product_alignment                → isolated Product Alignment, then seal Lock
+recover_product_lock                 → fail closed; investigate/restore trusted artifacts
+author_architecture_graph            → Author LLM adds architecture nodes/edges/Claims
+author_implementation_proof_graph    → Author LLM adds Code Spec and Proof graph truth
+repair_blocking_findings             → implementer repairs P0/P1 Findings
+run_quality_review                   → isolated Reviewer LLM may start
+request_owner_decision               → ask one precise question and stop
+seal_or_continue_delivery            → proceed to Proof Contract/code/runtime gates
+```
+
+The compiler and validator, not an LLM, derive this route from the same
+convergence function. Product incompleteness precedes Product Alignment;
+prototype drift precedes Lock; missing or content-stale Lock reruns Product
+Alignment; an invalid/tampered Lock never gets overwritten automatically.
+After a SAFE Lock, Architecture and implementation-proof Graph authoring must
+be deterministically complete before Quality Review. Architecture and Code
+Spec remain generated views, not approval stages.
+
+Quality Review has a fail-closed preflight. While any deterministic
+critical/major authoring blocker exists, it must not invoke Codex, mark
+execution as reviewing, create transcripts or review records, or consume a
+campaign. A `reviewing` execution lease blocks concurrent compilation until the
+review records or recovers its checkpoint. Owner input remains limited to source ambiguity/conflict/degradation,
+new scope, unmapped content, platform limitations, P2 outcomes, or exhausted
+or diverging Review policy.
+
 ```bash
 python3 <skill-dir>/scripts/delivery_graph.py compile <feature-id> --root <project-root>
 python3 <skill-dir>/scripts/invalidate_downstream.py <feature-id> --root <project-root>

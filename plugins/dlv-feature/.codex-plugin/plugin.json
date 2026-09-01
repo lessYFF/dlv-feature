@@ -1,6 +1,6 @@
 {
   "name": "dlv-feature",
-  "version": "0.9.1",
+  "version": "0.9.2",
   "description": "A convergent, risk-routed, proof-carrying feature delivery workflow for Codex.",
   "author": {
     "name": "lessYFF",
