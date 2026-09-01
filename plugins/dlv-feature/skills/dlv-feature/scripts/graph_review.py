@@ -12,6 +12,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import sys
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -164,25 +165,75 @@ def prepare_isolated_codex_executable(temp: Path) -> str:
     return str(destination)
 
 
-def prepare_isolated_codex_home(temp: Path) -> tuple[Path, Path]:
+MAX_CODEX_BOOTSTRAP_BYTES = 1024 * 1024
+CODEX_BOOTSTRAP_FILES = ("auth.json", "config.toml")
+
+
+def _stable_file_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int]:
+    return (
+        metadata.st_dev, metadata.st_ino, metadata.st_size,
+        metadata.st_mtime_ns, metadata.st_ctime_ns,
+    )
+
+
+def _read_trusted_codex_bootstrap_file(directory_fd: int, name: str) -> tuple[bytes, int]:
+    try:
+        descriptor = os.open(
+            name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=directory_fd,
+        )
+    except FileNotFoundError as exc:
+        raise ValueError(f"Codex {name} is required for isolated semantic review") from exc
+    except OSError as exc:
+        raise ValueError(f"Codex {name} is not a trusted private file") from exc
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode) or before.st_nlink != 1
+            or before.st_uid != os.getuid() or before.st_mode & 0o077
+        ):
+            raise ValueError(f"Codex {name} is not a trusted private file")
+        if before.st_size > MAX_CODEX_BOOTSTRAP_BYTES:
+            raise ValueError(f"Codex {name} exceeds the isolated review bound")
+        chunks: list[bytes] = []
+        size = 0
+        while chunk := os.read(descriptor, min(1024 * 1024, MAX_CODEX_BOOTSTRAP_BYTES + 1 - size)):
+            chunks.append(chunk)
+            size += len(chunk)
+            if size > MAX_CODEX_BOOTSTRAP_BYTES:
+                raise ValueError(f"Codex {name} exceeds the isolated review bound")
+        after = os.fstat(descriptor)
+        if _stable_file_identity(before) != _stable_file_identity(after):
+            raise ValueError(f"Codex {name} changed while preparing isolated semantic review")
+        return b"".join(chunks), stat.S_IMODE(before.st_mode)
+    finally:
+        os.close(descriptor)
+
+
+def trusted_codex_bootstrap_snapshot() -> tuple[Path, dict[str, bytes], dict[str, int]]:
     source = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser().resolve(strict=True)
-    metadata = source.stat()
-    if metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
-        raise ValueError("Codex home is not trusted for isolated semantic review")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(source, flags)
+    try:
+        metadata = os.fstat(directory_fd)
+        if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o022:
+            raise ValueError("Codex home is not trusted for isolated semantic review")
+        contents: dict[str, bytes] = {}
+        modes: dict[str, int] = {}
+        for name in CODEX_BOOTSTRAP_FILES:
+            contents[name], modes[name] = _read_trusted_codex_bootstrap_file(directory_fd, name)
+        return source, contents, modes
+    finally:
+        os.close(directory_fd)
+
+
+def prepare_isolated_codex_home(temp: Path) -> tuple[Path, Path]:
+    source, contents, _ = trusted_codex_bootstrap_snapshot()
     destination = temp / ".codex"
     destination.mkdir(mode=0o700)
-    for name in ("auth.json", "config.toml"):
-        candidate = source / name
-        if not candidate.exists():
-            continue
-        details = candidate.lstat()
-        if candidate.is_symlink() or not candidate.is_file() or details.st_uid != os.getuid() or details.st_mode & 0o077:
-            raise ValueError(f"Codex {name} is not a trusted private file")
-        if details.st_size > 1024 * 1024:
-            raise ValueError(f"Codex {name} exceeds the isolated review bound")
+    for name in CODEX_BOOTSTRAP_FILES:
         target = destination / name
         if name == "config.toml":
-            text = candidate.read_text(encoding="utf-8")
+            text = contents[name].decode("utf-8", errors="strict")
             blocked = ("mcp_servers", "plugins", "marketplaces", "projects", "profiles")
             kept: list[str] = []
             include = True
@@ -195,7 +246,7 @@ def prepare_isolated_codex_home(temp: Path) -> tuple[Path, Path]:
                     kept.append(line)
             target.write_text("\n".join(kept) + "\n", encoding="utf-8")
         else:
-            shutil.copyfile(candidate, target)
+            target.write_bytes(contents[name])
         target.chmod(0o600)
     return destination, source
 
