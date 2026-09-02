@@ -8,6 +8,35 @@ reference, `claims`, typed nodes and edges, Delivery Prototype declaration, risk
 mode. Generated Markdown, state, reviews, ledgers, contracts, and evidence are
 derived records and must not be repaired by hand.
 
+`source-anchors.json` is a deterministic generated view. It splits immutable
+Source text and UTF-8 attachment content into stable clause Anchors and
+classifies normative requirements, decisions, prohibitions, states, errors,
+and artifact structure. Product truth cites Anchor IDs; humans never maintain
+this file.
+
+Every non-cryptographic Source attachment embeds `content`,
+`content_encoding`, and `size_bytes`; `sha256` is recomputed from those bytes.
+A locator may document provenance but cannot substitute for captured content.
+Binary attachments always receive a critical whole-attachment Anchor. Product
+Alignment additionally requires `extracted_text` plus `extraction_adapter`
+from a format-aware parser/OCR step; otherwise the workflow blocks for
+extraction or an explicit Owner decision instead of claiming silent coverage.
+
+`state.json.subject_reconciliation` compares Graph Symbol paths with the full
+implementation baseline-to-current repository delta, including deletions,
+ordinary later commits, tracked worktree changes, and untracked paths.
+Every observed path must map to a planned Symbol and every planned Symbol must
+bind at least one observed path before Code can complete.
+`risk_frontier` groups critical Claims by independent failure boundary and
+active generic risk axes. `critical_experiments` binds reusable,
+content-addressed PASS evidence to the current frontier, Claims, Subjects,
+Proof runner, Assertions, Environment, and Graph digest. The kernel executes
+the sealed runner, evaluates the oracle and target attestation, and signs the
+record; caller-authored PASS JSON is never accepted as experiment evidence.
+
+`state.json.delivery_status` is `AUTHORING`, `REVIEWABLE`, or
+`DELIVERY_READY`. Only the final value is a completion claim.
+
 Each Claim contains exactly `id`, `lens`, `invariant`, sorted `subjects`,
 `failure_boundary`, `critical`, and sorted `proof_ids`. Its `CLM-*` identity is
 the digest of lens + invariant + subjects + failure boundary + criticality. The only initial
@@ -99,6 +128,16 @@ status, budget use, and reason from that stream and current records. Ledger size
 is capped at 8 MiB and convergence history at 256 events; reaching the event cap
 is a hard schema-v13 terminal that requires a future versioned migration. Schema
 v13 provides no manual checkpoint, truncation, rebaseline, or rotation escape hatch.
+
+### v13 quality-contract compatibility
+
+The 0.10 quality extension remains schema-v13 compatible. Existing locator-only
+attachments can still be loaded and compiled, but their Product Lock is
+deterministically classified `content_stale`; Product Alignment and completion
+remain blocked until `source_capture.py` records a new immutable Source revision
+that materializes the attachment bytes. Compilation regenerates the extended
+state and Proof Contract views, so there is no in-place mutation of the old
+Source revision and no second editable migration truth.
 
 ## Repository adapter and fast path
 

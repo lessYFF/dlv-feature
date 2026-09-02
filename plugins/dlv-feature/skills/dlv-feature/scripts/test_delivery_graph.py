@@ -43,6 +43,7 @@ import upgrade_v11_to_v12
 import scope_revision
 import product_alignment
 import product_lock
+import quality_core
 import seal_product_lock
 import upgrade_v12_to_v13
 import finding_ledger
@@ -416,6 +417,10 @@ class GraphTestCase(unittest.TestCase):
         self.seal_product(root, feature_id)
         with patch.object(graph_review, "run_bounded", side_effect=self.fake_semantic_run):
             graph_review.run_isolated_readiness_review(root, feature_id, run_id)
+        (root / "src").mkdir(exist_ok=True)
+        implementation = root / "src/domain_service.py"
+        if not implementation.exists():
+            implementation.write_text("# implementation fixture\n", encoding="utf-8")
         subprocess.run(["git", "add", "-A"], cwd=root, check=True)
         subprocess.run(
             [
@@ -424,6 +429,7 @@ class GraphTestCase(unittest.TestCase):
             ],
             cwd=root, check=True,
         )
+        delivery_graph.compile_graph(root, feature_id)
 
     def seal_product(self, root: Path, feature_id: str = "cross-domain-feature") -> None:
         delivery_graph.compile_graph(root, feature_id)
@@ -666,16 +672,48 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
 
     def test_initialization_creates_v12_canonical_artifacts_and_initial_source_revision(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
-            root = Path(raw)
+            root = Path(raw).resolve()
             subprocess.run(["git", "init", "-q"], cwd=root, check=True)
             path = delivery_graph.initialize(root, "new-feature", "New feature")
             self.assertTrue(path.is_file())
             self.assertFalse((path.parent / "state.md").exists())
             self.assertEqual(
-                {"delivery-graph.json", "state.json", "prd.md", "architecture-design.md", "code-spec.md", "proof-contract.json", "source-revisions"},
+                {"delivery-graph.json", "state.json", "prd.md", "architecture-design.md", "code-spec.md", "proof-contract.json", "source-anchors.json", "source-revisions"},
                 {item.name for item in path.parent.iterdir()},
             )
             self.assertTrue((path.parent / "source-revisions/SRC-001.json").is_file())
+
+    def test_legacy_v13_locator_only_source_loads_and_routes_to_recapture(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw).resolve()
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            directory = root / "delivery/legacy-quality"
+            directory.mkdir(parents=True)
+            attachment = root / "brief.txt"
+            attachment.write_text("The result must persist.\n", encoding="utf-8")
+            create_source_revision(
+                directory, "legacy-quality", "SRC-001", {
+                    "title": "Legacy quality", "description": "Legacy schema-v13 source.",
+                    "comments": [], "attachments": [{
+                        "ref": "brief", "kind": "brief", "locator": "brief.txt",
+                    }], "decisions": [], "risk_vector": {},
+                }, owner="test", status="confirmed",
+            )
+            source_path = directory / "source-revisions/SRC-001.json"
+            source = json.loads(source_path.read_text())
+            legacy = next(item for item in source["attachments"] if item.get("ref") == "brief")
+            for key in ("content", "content_encoding", "size_bytes"):
+                legacy.pop(key)
+            source["source_digest"] = delivery_proof.value_digest(canonical_source_payload(source))
+            write_json(source_path, source)
+            loaded = delivery_governance.load_source_revision(directory, "legacy-quality", "SRC-001")
+            self.assertEqual("brief.txt", loaded["attachments"][0]["locator"])
+            write_json(directory / "delivery-graph.json", delivery_graph.default_graph("legacy-quality", "Legacy quality"))
+            state = delivery_graph.compile_graph(root, "legacy-quality")
+            graph = delivery_graph.load_graph(root, "legacy-quality")
+            status = product_lock.current_product_lock_status(directory, graph, loaded, "x", "y")
+            self.assertEqual("content_stale", status["state"])
+            self.assertTrue(state["readiness"]["product_lock_blocked"])
 
     def test_stable_entrypoints_dispatch_schema_v12_end_to_end(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -1834,6 +1872,12 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertEqual(("PASS", []), (verdict, errors))
             graph_finalize.finalize(root, "cross-domain-feature")
             self.assertEqual([], graph_validation.validate(root, "cross-domain-feature", final=True))
+            cli = subprocess.run(
+                [sys.executable, str(SCRIPTS / "validate_feature.py"), "cross-domain-feature", "--root", str(root), "--final"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(0, cli.returncode, cli.stdout + cli.stderr)
+            self.assertIn("DELIVERY_READY: 0 errors", cli.stdout)
             manifest = json.loads((root / "delivery/cross-domain-feature/delivery-manifest.json").read_text())
             self.assertEqual(13, manifest["schema_version"])
             self.assertEqual(manifest["tree_digest"], delivery_proof.value_digest({
@@ -1843,6 +1887,11 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertTrue(any(path.startswith(".dlv/product-alignments/cross-domain-feature/ALN-") for path in manifest_paths))
             self.assertTrue(any(path.endswith(".transcript.jsonl") and path.startswith(".dlv/product-alignments/") for path in manifest_paths))
             self.assertTrue((destination / "evidence.jsonl").is_file())
+            state_path = root / "delivery/cross-domain-feature/state.json"
+            state = delivery_graph.load_state(state_path)
+            state["verification"]["finalization"]["token"] = "0" * 64
+            write_json(state_path, state)
+            self.assertTrue(any("finalization token is stale" in item for item in graph_validation.validate(root, "cross-domain-feature")))
 
     def test_nonzero_runner_cannot_pass_on_valid_stdout_without_exit_contract(self) -> None:
         temporary, root = self.make_root()
@@ -2818,7 +2867,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertIs(False, payload["plugin_identity_verified"])
             self.assertIs(True, payload["host_verification_required"])
             self.assertEqual("dlv-feature", payload["plugin"])
-            self.assertEqual("0.9.2", payload["diagnostic_version"])
+            self.assertEqual("0.10.0", payload["diagnostic_version"])
             self.assertEqual(expected_plugin_sha256, payload["diagnostic_plugin_sha256"])
             self.assertEqual("0600", payload["bootstrap_files"]["auth.json"]["mode"])
             self.assertEqual(
@@ -3129,9 +3178,12 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             graph = delivery_graph.load_graph(root, "cross-domain-feature")
             source_path = root / "delivery/cross-domain-feature/source-revisions/SRC-001.json"
             source = json.loads(source_path.read_text())
+            prototype_content = "Share choice prototype"
             source["attachments"].append({
                 "ref": "product-prototype:share-choice", "kind": "product_prototype",
-                "sha256": "1" * 64,
+                "sha256": hashlib.sha256(prototype_content.encode()).hexdigest(),
+                "content_encoding": "utf-8", "content": prototype_content,
+                "size_bytes": len(prototype_content.encode()),
             })
             source["source_digest"] = delivery_proof.value_digest(canonical_source_payload(source))
             write_json(source_path, source)
@@ -3221,6 +3273,8 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertFalse(delivery_graph.load_state(path.parent / "state.json")["readiness"]["product_lock_blocked"])
             with patch.object(graph_review, "run_bounded", side_effect=self.fake_semantic_run):
                 graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "wmd-ready")
+            (root / "src").mkdir(exist_ok=True)
+            (root / "src/domain_service.py").write_text("# owner-approved implementation\n", encoding="utf-8")
             subprocess.run(["git", "add", "-A"], cwd=root, check=True)
             subprocess.run(
                 ["git", "-c", "user.name=DLV Test", "-c", "user.email=dlv@example.invalid", "commit", "-qm", "wmd ready\n\nDLV-Feature: cross-domain-feature"],
@@ -3816,8 +3870,12 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
 
             reciprocal_graph = copy.deepcopy(graph)
             reciprocal_source = copy.deepcopy(source)
+            reciprocal_content = "Reciprocal product prototype"
             reciprocal_source["attachments"].append({
-                "ref": "product-prototype:reciprocal", "kind": "product_prototype", "sha256": "1" * 64,
+                "ref": "product-prototype:reciprocal", "kind": "product_prototype",
+                "sha256": hashlib.sha256(reciprocal_content.encode()).hexdigest(),
+                "content_encoding": "utf-8", "content": reciprocal_content,
+                "size_bytes": len(reciprocal_content.encode()),
             })
             for node_id in ("REQ-001", "BHV-001"):
                 next(item for item in reciprocal_graph["nodes"] if item["id"] == node_id)["origins"] = [
@@ -3842,18 +3900,20 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
                     direct_refs=reciprocal_direct, constraint_refs=reciprocal_constraints,
                 )
 
-            attachment_entry = next(
-                item for item in reciprocal_sources if item["source_ref"] == "product-prototype:reciprocal"
+            attachment_anchor = next(
+                anchor["id"] for anchor in quality_core.source_anchors(reciprocal_source)
+                if anchor["source_ref"] == "product-prototype:reciprocal"
             )
+            attachment_entry = next(item for item in reciprocal_sources if item["source_ref"] == attachment_anchor)
             wrong_node_sources = copy.deepcopy(reciprocal_sources)
             next(
-                item for item in wrong_node_sources if item["source_ref"] == "product-prototype:reciprocal"
+                item for item in wrong_node_sources if item["source_ref"] == attachment_anchor
             )["node_ids"] = ["AC-001"]
             with self.assertRaisesRegex(ValueError, "without reciprocal origins"):
                 reciprocal_align(wrong_node_sources)
             omitted_origin_sources = copy.deepcopy(reciprocal_sources)
             next(
-                item for item in omitted_origin_sources if item["source_ref"] == "product-prototype:reciprocal"
+                item for item in omitted_origin_sources if item["source_ref"] == attachment_anchor
             )["node_ids"] = [attachment_entry["node_ids"][0]]
             with self.assertRaisesRegex(ValueError, "omits a reciprocal Graph origin"):
                 reciprocal_align(omitted_origin_sources)

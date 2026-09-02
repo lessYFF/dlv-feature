@@ -57,6 +57,13 @@ from delivery_contracts import (
     review_budget,
     target_attestation_provenance_errors,
 )
+from quality_core import (
+    derive_delivery_status,
+    derive_risk_frontier,
+    experiment_plan,
+    reconcile_subjects,
+    source_anchors,
+)
 
 
 STAGES = ("product", "architecture", "implementation_proof")
@@ -663,6 +670,8 @@ def readiness(
     source_status: dict[str, Any] | None = None, ledger: dict[str, Any] | None = None,
     product_lock_errors: list[str] | None = None,
     product_lock_status: dict[str, Any] | None = None,
+    subject_reconciliation: dict[str, Any] | None = None,
+    critical_experiments: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(attestations, dict):
         attestations = {}
@@ -710,6 +719,8 @@ def readiness(
         and entry.get("severity") in {"critical", "major"}
         and entry.get("status") in {"OPEN", "MERGE_CANDIDATE"}
     ]
+    subject_reconciliation = subject_reconciliation or {"status": "pending_observation", "unmapped_paths": []}
+    critical_experiments = critical_experiments or {"status": "ready", "missing_required": []}
 
     if drift or finding_counts["owner_decisions"]:
         authoring_stage, authoring_blockers, next_action = "owner_decision", [], "request_owner_decision"
@@ -737,6 +748,10 @@ def readiness(
         authoring_stage, authoring_blockers, next_action = (
             "implementation_proof", implementation_blockers, "author_implementation_proof_graph",
         )
+    elif subject_reconciliation.get("status") == "blocked":
+        authoring_stage, authoring_blockers, next_action = "subject_reconciliation", [], "reconcile_observed_subjects"
+    elif critical_experiments.get("status") == "blocked":
+        authoring_stage, authoring_blockers, next_action = "critical_experiment", [], "run_critical_experiments"
     elif repairable_blockers:
         authoring_stage, authoring_blockers, next_action = "finding_repair", [], "repair_blocking_findings"
     elif missing or blocked or finding_counts["open_blockers"]:
@@ -768,6 +783,8 @@ def readiness(
         "next_action": next_action,
         "open_blocking_findings": finding_counts["open_blockers"],
         "open_owner_decision_findings": finding_counts["owner_decisions"],
+        "unmapped_observed_subjects": list(subject_reconciliation.get("unmapped_paths", [])),
+        "missing_critical_experiments": list(critical_experiments.get("missing_required", [])),
     }
 
 
@@ -1555,7 +1572,9 @@ def render_stage_document(graph: dict[str, Any], stage: str) -> str:
     )
 
 
-def generate_proof_contract(graph: dict[str, Any]) -> dict[str, Any]:
+def generate_proof_contract(
+    graph: dict[str, Any], critical_experiments: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     nodes = node_map(graph)
     edges = graph.get("edges", [])
     environments: list[dict[str, Any]] = []
@@ -1611,6 +1630,14 @@ def generate_proof_contract(graph: dict[str, Any]) -> dict[str, Any]:
         "claims": canonical_claims(graph),
         "environments": environments,
         "obligations": obligations,
+        "experiment_evidence": sorted(
+            (
+                {"experiment_id": experiment["id"], **evidence}
+                for experiment in (critical_experiments or {}).get("experiments", [])
+                for evidence in experiment.get("evidence", [])
+            ),
+            key=lambda item: (item["experiment_id"], item["path"]),
+        ),
     }
     return {**core, "draft_sha256": value_digest(core), "status": "draft", "attestations": {}, "sealed_at": None, "seal": None}
 
@@ -1721,6 +1748,10 @@ def compile_graph(
             "effective": union_risk_vectors(source_revision["risk_vector"], design_risk, observed_risk),
         }
         risk["profiles"] = profiles_for(risk["effective"])
+        previous_baseline = previous.get("subject_reconciliation", {}).get("baseline_oid")
+        subject_reconciliation = reconcile_subjects(root, feature_id, graph, previous_baseline)
+        risk_frontier = derive_risk_frontier(graph, risk["effective"])
+        critical_experiments = experiment_plan(root, feature_id, risk_frontier, graph)
         product_document = render_stage_document(graph, "product")
         from product_lock import current_product_lock_status
         lock_status = current_product_lock_status(
@@ -1733,8 +1764,10 @@ def compile_graph(
         delivery_readiness = readiness(
             graph, attestations, source_status=source_status, ledger=ledger,
             product_lock_status=lock_status,
+            subject_reconciliation=subject_reconciliation,
+            critical_experiments=critical_experiments,
         )
-        contract = generate_proof_contract(graph)
+        contract = generate_proof_contract(graph, critical_experiments)
         previous_contract = load_json(contract_path) if contract_path.is_file() else None
         sealed_contract_preserved = False
         if (
@@ -1790,6 +1823,9 @@ def compile_graph(
             "source_revision": source_status,
             "product_lock": copy.deepcopy(graph.get("product_lock")),
             "risk": risk,
+            "risk_frontier": risk_frontier,
+            "subject_reconciliation": subject_reconciliation,
+            "critical_experiments": critical_experiments,
             "finding_ledger": {
                 "record_path": f".dlv/findings/{feature_id}/ledger.json",
                 "sha256": ledger_sha256,
@@ -1807,9 +1843,14 @@ def compile_graph(
             "verification": verification,
             "last_compiled_at": previous.get("last_compiled_at") if check else timestamp(),
         }
+        state["delivery_status"] = derive_delivery_status(state)
         outputs = {
             **({root / f".dlv/findings/{feature_id}/ledger.json": ledger_content} if ledger_needs_write else {}),
             directory / "prd.md": product_document,
+            directory / "source-anchors.json": json.dumps(
+                {"source_revision": graph["source_revision"], "anchors": source_anchors(source_revision)},
+                ensure_ascii=False, indent=2, sort_keys=True,
+            ) + "\n",
             directory / "architecture-design.md": render_stage_document(graph, "architecture"),
             directory / "code-spec.md": render_stage_document(graph, "implementation_proof"),
             contract_path: json.dumps(contract, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
@@ -1879,6 +1920,12 @@ def mark_code_complete(root: Path, feature_id: str) -> str:
             or state.get("convergence", {}).get("status") != "READY"
         ):
             raise ValueError("Code requires current Source Revision, zero blocking Findings, and Delivery Readiness")
+        reconciliation = reconcile_subjects(
+            root, feature_id, graph, state.get("subject_reconciliation", {}).get("baseline_oid"),
+        )
+        if reconciliation.get("status") != "reconciled":
+            raise ValueError("Code requires complete and current planned/observed Subject reconciliation")
+        state["subject_reconciliation"] = reconciliation
         observed = observed_code_risk_vector(root, graph)
         planned = union_risk_vectors(
             state.get("risk", {}).get("source", {}),

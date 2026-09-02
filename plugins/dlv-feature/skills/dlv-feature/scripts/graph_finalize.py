@@ -12,6 +12,7 @@ from delivery_proof import atomic_write_text, exclusive_file_lock, file_digest
 from graph_validation import finalization_token, validate
 from delivery_manifest import build_manifest
 from graph_verification import recover_pending_transaction, render, run_directory, validate_run
+from quality_core import derive_delivery_status
 
 
 def _text(path: Path) -> str | None:
@@ -69,6 +70,9 @@ def finalize(root: Path, feature_id: str) -> Path:
                 },
             })
             verification["finalization"]["token"] = finalization_token(state, file_digest(report_path))
+            state["delivery_status"] = derive_delivery_status(state)
+            if state["delivery_status"] != "DELIVERY_READY":
+                raise ValueError("finalization did not satisfy deterministic DELIVERY_READY gates")
             atomic_write_json(state_path, state)
             expected_state = _text(state_path)
             atomic_write_json(manifest_path, build_manifest(directory, feature_id))
@@ -98,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"error: finalization failed; safe rollback attempted: {exc}", file=sys.stderr)
         return 1
-    print(f"DELIVERY COMPLETE: {path}")
+    print(f"DELIVERY_READY: {path}")
     return 0
 
 

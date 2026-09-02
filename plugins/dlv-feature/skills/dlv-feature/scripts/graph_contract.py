@@ -35,10 +35,10 @@ def validate_contract(root: Path, feature_id: str, contract: dict[str, Any], sta
     graph = load_graph(root, feature_id)
     from product_lock import live_product_lock_errors
     errors.extend(live_product_lock_errors(root, feature_id, graph))
-    expected = generate_proof_contract(graph)
+    expected = generate_proof_contract(graph, state.get("critical_experiments", {}))
     expected_keys = {
         "schema_version", "feature_id", "graph_sha256", "subgraph_sha256", "product_lock_sha256",
-        "claims", "environments", "obligations", "draft_sha256", "status", "attestations",
+        "claims", "environments", "obligations", "experiment_evidence", "draft_sha256", "status", "attestations",
         "sealed_at", "seal",
     }
     if set(contract) != expected_keys:
@@ -47,7 +47,12 @@ def validate_contract(root: Path, feature_id: str, contract: dict[str, Any], sta
         errors.append("Proof Contract identity/schema is invalid")
     if contract.get("draft_sha256") != expected["draft_sha256"]:
         errors.append("Proof Contract draft is stale for the current implementation/proof subgraph")
-    if contract.get("claims") != expected["claims"] or contract.get("environments") != expected["environments"] or contract.get("obligations") != expected["obligations"]:
+    if (
+        contract.get("claims") != expected["claims"]
+        or contract.get("environments") != expected["environments"]
+        or contract.get("obligations") != expected["obligations"]
+        or contract.get("experiment_evidence") != expected["experiment_evidence"]
+    ):
         errors.append("Proof Contract disagrees with the deterministic graph compiler")
     if contract.get("status") != "sealed":
         errors.append("Proof Contract is not sealed")
@@ -163,7 +168,7 @@ def seal_contract(root: Path, feature_id: str) -> str:
         if issues:
             raise ValueError("Proof Contract cannot seal with semantic issues: " + "; ".join(issue["statement"] for issue in issues))
         current = load_json(contract_path)
-        expected = generate_proof_contract(graph)
+        expected = generate_proof_contract(graph, state.get("critical_experiments", {}))
         if current.get("status") == "sealed":
             errors: list[str] = []
             validate_contract(root, feature_id, current, state, errors)

@@ -1,10 +1,19 @@
 # DLV Feature
 
-Current plugin version: **0.9.2**, Delivery Graph schema v13.
+Current plugin version: **0.10.0**, Delivery Graph schema v13.
 
 DLV Feature is a proof-carrying Codex workflow with immutable Source Revisions, generated PRD and Delivery Prototype views, independent Product Alignment, a content-addressed Product Lock, stable Claims and semantic Findings, budgeted convergence control, target-runtime authenticity, and deterministic finalization.
 
-Version 0.9.2 keeps the schema-v13 artifact format and adds deterministic,
+Version 0.10.0 improves first-pass completeness without another manual review
+loop. Source attachment bytes are materialized and digest-checked at capture.
+The kernel automatically derives clause-level anchors, planned versus observed
+implementation Subjects, a risk frontier, and the minimum independent critical
+experiment set. Valid early experiment evidence is content-addressed and reused
+by the final Proof Contract. Semantic completion is `REVIEWABLE`; only
+reconciled Code plus sealed Proof plus finalized target-runtime PASS becomes
+`DELIVERY_READY`.
+
+Version 0.10.0 keeps the schema-v13 artifact format and adds deterministic,
 stage-aware workflow routing. `state.json.readiness.next_action` now separates
 Product authoring, prototype regeneration, Product Alignment, post-lock
 Architecture/Code Spec Graph authoring, Finding repair, Quality Review, Owner
@@ -45,6 +54,7 @@ python3 plugins/dlv-feature/skills/dlv-feature/scripts/scope_revision.py feature
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/delivery_graph.py compile feature-id --root /path/to/project
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/product_alignment.py feature-id --root /path/to/project
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/seal_product_lock.py feature-id --root /path/to/project --alignment /path/to/ALN-....json
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/critical_experiment.py feature-id --root /path/to/project --experiment EXP-...
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/quality_review.py feature-id --root /path/to/project --run-id review-01
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/seal_proof_contract.py feature-id --root /path/to/project
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/reconcile_code.py feature-id --root /path/to/project
@@ -105,5 +115,6 @@ Compatibility importers for schema v9/v10 emit an untrusted v13 candidate. Impor
 
 ```bash
 python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_delivery_graph.py
+python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_quality_core.py
 python3 /path/to/skill-creator/scripts/quick_validate.py plugins/dlv-feature/skills/dlv-feature
 ```

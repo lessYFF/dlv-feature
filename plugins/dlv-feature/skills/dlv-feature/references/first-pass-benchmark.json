@@ -1,0 +1,22 @@
+{
+  "cases": [
+    {
+      "id": "wmd-201-driver-guide-example",
+      "domain": "field-service-guide",
+      "text": "The guide must include every numbered step. Never replace the supplied visual hierarchy. Empty and failed states must show a recovery action. The artifact structure requires a title, ordered procedure, and troubleshooting section.",
+      "expected_kinds": ["requirement", "prohibition", "state", "artifact_structure"]
+    },
+    {
+      "id": "payment-reversal",
+      "domain": "financial-workflow",
+      "text": "A reversal must be idempotent. The state moves from requested to settled only after ledger readback. Invalid currency is rejected. Never emit the external transfer twice.",
+      "expected_kinds": ["requirement", "state", "error", "prohibition"]
+    },
+    {
+      "id": "device-firmware-rollout",
+      "domain": "embedded-operations",
+      "text": "The rollout shall preserve the previous image. A failed health check requires automatic rollback. The manifest file must contain model, checksum, and minimum bootloader fields. Devices in quarantined state cannot activate.",
+      "expected_kinds": ["requirement", "error", "artifact_structure", "state"]
+    }
+  ]
+}

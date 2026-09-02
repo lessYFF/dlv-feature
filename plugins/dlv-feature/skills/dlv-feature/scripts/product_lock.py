@@ -10,6 +10,7 @@ from typing import Any
 
 from delivery_governance import DECISION_REASONS, verify_kernel_receipt
 from delivery_proof import file_digest, value_digest
+from quality_core import attachment_materialization_errors, critical_anchor_coverage, source_anchors
 
 
 ALIGNMENT_RESULTS = {"PRESERVED", "CLARIFIED", "DECISION_REQUIRED"}
@@ -53,35 +54,19 @@ def product_node_ids(graph: dict[str, Any]) -> list[str]:
 
 
 def source_anchor_refs(source_revision: dict[str, Any]) -> list[str]:
-    revision_id = source_revision["revision_id"]
-    anchors = [f"{revision_id}:title"]
-    if source_revision.get("description"):
-        anchors.append(f"{revision_id}:description")
-    anchors.extend(f"{revision_id}:comment:{index:03d}" for index, _ in enumerate(source_revision.get("comments", []), 1))
-    anchors.extend(
-        item["ref"] for item in source_revision.get("attachments", [])
-        if isinstance(item, dict) and item.get("kind") not in NON_PRODUCT_ATTACHMENT_KINDS
-        and isinstance(item.get("ref"), str)
-    )
-    anchors.extend(
-        item["id"] for item in source_revision.get("decisions", [])
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
-    )
-    return sorted(set(anchors))
+    return [item["id"] for item in source_anchors(source_revision)]
 
 
 def _anchor_origin_contract(source_revision: dict[str, Any], anchor: str) -> tuple[str, set[str]]:
-    revision_id = source_revision["revision_id"]
-    if anchor.startswith(f"{revision_id}:"):
-        return "direct_revision", set()
-    for attachment in source_revision.get("attachments", []):
-        if isinstance(attachment, dict) and attachment.get("kind") not in NON_PRODUCT_ATTACHMENT_KINDS and attachment.get("ref") == anchor:
-            return "direct", {
-                value for key in ("ref", "locator")
-                if isinstance((value := attachment.get(key)), str) and value
-            }
-    if any(isinstance(item, dict) and item.get("id") == anchor for item in source_revision.get("decisions", [])):
-        return "derived", {anchor}
+    matches = [item for item in source_anchors(source_revision) if item["id"] == anchor]
+    if len(matches) == 1:
+        item = matches[0]
+        if item["kind"] == "decision":
+            return "derived", {anchor, item["source_ref"]}
+        references = {anchor, item["source_ref"]}
+        if str(item["source_ref"]).startswith(source_revision["revision_id"] + ":"):
+            references.add(source_revision["revision_id"])
+        return "direct", references
     raise ValueError(f"unknown Source anchor contract: {anchor}")
 
 
@@ -212,6 +197,10 @@ def alignment_core(
         "source_coverage": {
             "covered_node_ids": expected,
             "source_anchor_refs": anchors,
+            "critical_anchor_refs": sorted(
+                item["id"] for item in source_anchors(source_revision) if item["critical"]
+            ),
+            "critical_coverage_pct": critical_anchor_coverage(graph, source_revision)["coverage_pct"],
             "direct_refs": source_refs,
             "derived_constraint_refs": derived_refs,
         },
@@ -224,6 +213,7 @@ def known_origin_refs(directory: Path, graph: dict[str, Any], source_revision: d
     from delivery_governance import load_source_revision
 
     direct = {graph["source_revision"]}
+    direct.update(item["id"] for item in source_anchors(source_revision) if item["kind"] != "decision")
     attachment_refs: set[str] = set()
     for item in source_revision.get("attachments", []):
         if not isinstance(item, dict) or item.get("kind") in NON_PRODUCT_ATTACHMENT_KINDS:
@@ -232,8 +222,7 @@ def known_origin_refs(directory: Path, graph: dict[str, Any], source_revision: d
             if isinstance(item.get(key), str) and item[key].strip():
                 attachment_refs.add(item[key])
     decision_refs = {
-        item["id"] for item in source_revision.get("decisions", [])
-        if isinstance(item, dict) and isinstance(item.get("id"), str)
+        anchor["id"] for anchor in source_anchors(source_revision) if anchor["kind"] == "decision"
     }
     return direct | attachment_refs, attachment_refs | decision_refs
 
@@ -375,15 +364,22 @@ def load_current_product_lock(directory: Path, graph: dict[str, Any]) -> tuple[d
     if set(record) != expected_keys:
         return None, ["current Product Lock contains unknown or missing fields"]
     coverage = record.get("source_coverage")
-    if not isinstance(coverage, dict) or set(coverage) != {"covered_node_ids", "source_anchor_refs", "direct_refs", "derived_constraint_refs"}:
+    if not isinstance(coverage, dict) or set(coverage) != {
+        "covered_node_ids", "source_anchor_refs", "critical_anchor_refs",
+        "critical_coverage_pct", "direct_refs", "derived_constraint_refs",
+    }:
         return None, ["current Product Lock source coverage is invalid"]
     if any(
         not isinstance(coverage.get(key), list)
         or not all(isinstance(item, str) for item in coverage[key])
         or coverage[key] != sorted(set(coverage[key]))
-        for key in ("covered_node_ids", "source_anchor_refs", "direct_refs", "derived_constraint_refs")
+        for key in ("covered_node_ids", "source_anchor_refs", "critical_anchor_refs", "direct_refs", "derived_constraint_refs")
     ):
         return None, ["current Product Lock source coverage values are invalid"]
+    if coverage.get("critical_coverage_pct") != 100:
+        return None, ["current Product Lock critical Source coverage must be 100%"]
+    if not set(coverage["critical_anchor_refs"]) <= set(coverage["source_anchor_refs"]):
+        return None, ["current Product Lock critical Source coverage is incomplete"]
     if (
         not isinstance(record.get("owner_decision_refs"), list)
         or not all(isinstance(item, str) for item in record["owner_decision_refs"])
@@ -405,6 +401,12 @@ def current_product_lock_status(
     Alignment.  ``invalid`` means the content-addressed lock or its supporting
     Alignment cannot be trusted and must be recovered fail-closed.
     """
+    materialization_errors = attachment_materialization_errors(source_revision)
+    if materialization_errors:
+        return {
+            "state": "content_stale",
+            "errors": ["Source attachments require recapture: " + "; ".join(materialization_errors)],
+        }
     if graph.get("product_lock") is None:
         return {"state": "missing", "errors": ["Delivery Graph has no current Product Lock"]}
     record, errors = load_current_product_lock(directory, graph)

@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from delivery_proof import atomic_write_text, file_digest, load_json, validate_feature_id, value_digest
+from quality_core import attachment_materialization_errors, materialize_attachments
 
 
 SCHEMA_VERSION = 13
@@ -706,6 +707,9 @@ def _validate_source(value: Any, *, expected_feature_id: str | None = None) -> d
     )
     if attachment_identifiers & reserved_anchors:
         raise ValueError("source revision attachment identifiers collide with Source text or decision anchors")
+    # Locator-only attachments remain loadable for schema-v13 compatibility.
+    # They cannot be aligned or locked; recapturing a new Source revision
+    # materializes the bytes under the current quality contract.
     convergence_attachments = [
         item for item in value["attachments"] if item.get("kind") == "convergence_authority"
     ]
@@ -745,6 +749,7 @@ def create_source_revision(
         raise ValueError("source input attachments must be an object array")
     if not isinstance(decisions, list):
         raise ValueError("source input decisions must be an array")
+    attachments = materialize_attachments(feature_directory, attachments)
     if not any(item.get("kind") == "convergence_authority" for item in attachments):
         attachments = [*attachments, _source_convergence_attachment(feature_directory, feature_id)]
     if not isinstance(owner, str) or not owner.strip():
