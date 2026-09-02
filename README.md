@@ -1,12 +1,18 @@
 # DLV Feature
 
-Current plugin version: **0.9.1**, Delivery Graph schema v13.
+Current plugin version: **0.9.2**, Delivery Graph schema v13.
 
 DLV Feature is a proof-carrying Codex workflow with immutable Source Revisions, generated PRD and Delivery Prototype views, independent Product Alignment, a content-addressed Product Lock, stable Claims and semantic Findings, budgeted convergence control, target-runtime authenticity, and deterministic finalization.
 
-Version 0.9.1 keeps the schema-v13 artifact format and makes Product Alignment
-identity-safe: the reviewer returns order-independent verdicts carrying immutable
-Product node and Source anchor IDs, while the trusted kernel binds identities and derives exact
+Version 0.9.2 keeps the schema-v13 artifact format and adds deterministic,
+stage-aware workflow routing. `state.json.readiness.next_action` now separates
+Product authoring, prototype regeneration, Product Alignment, post-lock
+Architecture/Code Spec Graph authoring, Finding repair, Quality Review, Owner
+decisions, and fail-closed Lock recovery. Quality Review cannot invoke Codex or
+create execution/campaign/transcript state while deterministic critical/major
+authoring blockers remain. Product Alignment remains identity-safe: the reviewer
+returns order-independent verdicts carrying immutable Product node and Source
+anchor IDs, while the trusted kernel binds identities and derives exact
 Source-to-Graph reciprocal mappings. Hosts must provision `CODEX_HOME/auth.json`
 and `config.toml` as owner-controlled, single-linked regular files with permissions
 no broader than `0600`; missing files and symlinks are rejected by design. A host
@@ -47,6 +53,13 @@ python3 plugins/dlv-feature/skills/dlv-feature/scripts/verification_run.py start
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/verification_run.py record feature-id --root /path/to/project --run-id run-01 --result /path/to/result.json
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/finalize_delivery.py feature-id --root /path/to/project
 ```
+
+After each compile, honor `state.json.convergence` stop states first, then
+execute `state.json.readiness.next_action`. In
+particular, a SAFE Product Lock is followed by deterministic Architecture and
+implementation-proof Graph authoring when needed; Quality Review starts only
+when the route is `run_quality_review`. Missing/content-stale Locks route to
+Product Alignment, while invalid/tampered Locks route to fail-closed recovery.
 
 If Product Alignment returns `NEEDS_DECISION`, record only the precise Owner
 answer to the reported ambiguity, degradation, conflict, new scope, unmapped

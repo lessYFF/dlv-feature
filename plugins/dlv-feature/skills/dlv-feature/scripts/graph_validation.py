@@ -15,6 +15,8 @@ from delivery_graph import (
     SCHEMA_VERSION,
     STAGES,
     confined_project_path,
+    convergence_snapshot,
+    derive_convergence,
     feature_dir,
     generate_proof_contract,
     graph_digest,
@@ -39,7 +41,7 @@ from delivery_governance import (
     source_revision_status,
 )
 from graph_contract import validate_contract
-from delivery_contracts import claim_succession_map, convergence_vector, review_budget
+from delivery_contracts import claim_succession_map
 
 
 ALLOWED_FILES = {
@@ -126,7 +128,10 @@ def validate_attestations(root: Path, feature_id: str, graph: dict[str, Any], st
             errors.append(f"PASS attestation hides a critical/major issue: {lens}")
         if lens == GLOBAL_LENS:
             covered = set(unit["node_ids"])
-            expected_issues = [issue for issue in semantic_issues(graph) if issue["node_id"] in covered]
+            expected_issues = [
+                issue for issue in semantic_issues(graph)
+                if issue["node_id"] == "GRAPH" or issue["node_id"] in covered
+            ]
         else:
             covered = set(unit["node_ids"])
             expected_issues = [issue for issue in semantic_issues(graph, lens) if issue["node_id"] == "GRAPH" or issue["node_id"] in covered]
@@ -316,14 +321,18 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     source_reference = state.get("source_revision")
     if source_reference != source_status:
         errors.append("state Source Revision reference is stale")
-    from product_lock import current_product_lock_errors
+    from product_lock import current_product_lock_status
     prd_path = directory / "prd.md"
-    lock_errors = ["current Product Lock cannot be validated without a valid Source Revision"]
+    lock_status = {
+        "state": "invalid",
+        "errors": ["current Product Lock cannot be validated without a valid Source Revision"],
+    }
     if source_revision is not None:
-        lock_errors = current_product_lock_errors(
+        lock_status = current_product_lock_status(
             directory, graph, source_revision,
             stage_hash(graph, "product"), file_digest(prd_path) if prd_path.is_file() else "",
         )
+    lock_errors = lock_status["errors"]
     if state.get("product_lock") != graph.get("product_lock"):
         errors.append("state Product Lock reference is stale")
     risk = state.get("risk")
@@ -356,78 +365,17 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     else:
         expected_readiness = readiness(
             graph, state.get("attestations", {}), source_status=source_status, ledger=ledger,
-            product_lock_errors=lock_errors,
+            product_lock_status=lock_status,
         )
-        expected_vector = convergence_vector(graph, expected_readiness, ledger)
-        campaigns = ledger.get("campaigns", [])
-        expected_budget = review_budget(graph)
-        expected_used = {
-            "campaigns": len(campaigns),
-            "unit_reviews": sum(item["unit_count"] for item in campaigns),
-            "new_findings": sum(item["new_findings"] for item in campaigns),
-        }
-        exhausted = (
-            expected_used["campaigns"] >= expected_budget["max_campaigns"]
-            or expected_used["unit_reviews"] >= expected_budget["max_unit_reviews"]
-            or expected_used["new_findings"] >= expected_budget["max_new_findings"]
-        ) and expected_readiness["status"] != "ready"
+        snapshot = convergence_snapshot(graph, expected_readiness, ledger)
         events = ledger.get("convergence_events", [])
-        state_key = value_digest({
-            "graph_sha256": graph_digest(graph), "readiness": expected_readiness,
-            "vector": expected_vector, "used": expected_used,
-        })
-        if not events or events[-1].get("state_key") != state_key or events[-1].get("vector") != expected_vector:
-            errors.append("kernel convergence history is missing or stale")
-        distinct_history: list[list[int]] = []
-        for event in events:
-            event_vector = event.get("vector")
-            if isinstance(event_vector, list) and (not distinct_history or distinct_history[-1] != event_vector):
-                distinct_history.append(event_vector)
-        history = distinct_history[-3:]
-        metrics = lambda item: (sum(item[:-1]), item[0] + item[3], item[6])
-        consecutive_growth = len(history) == 3 and any(
-            metrics(history[0])[index] < metrics(history[1])[index] < metrics(history[2])[index]
-            for index in range(3)
-        )
-        # A repeated compile intentionally does not append a duplicate signed
-        # event.  STABLE_BLOCKED is fail-closed, so it may use the current
-        # matching event as its comparison baseline; every state that permits
-        # continued automation must still derive from the prior signed event.
-        repeated_block = (
-            convergence.get("status") == "STABLE_BLOCKED"
-            and events
-            and events[-1].get("state_key") == state_key
-        )
-        previous_event = events[-1] if repeated_block else (events[-2] if len(events) >= 2 else None)
-        expected_previous = previous_event.get("vector") if isinstance(previous_event, dict) else None
-        if expected_readiness["status"] == "ready":
-            expected_status, expected_reason = "READY", "all required review and finding obligations are closed"
-        elif (
-            expected_readiness["source_drift"]
-            or expected_readiness["prototype_blocked"]
-            or expected_readiness["product_lock_blocked"]
-            or expected_readiness["open_owner_decision_findings"]
-            or exhausted
-        ):
-            expected_status, expected_reason = "NEEDS_DECISION", "source/Product Lock/finding decision or review budget is required"
-        elif not campaigns and not lock_errors:
-            expected_status, expected_reason = "CONVERGING", "SAFE Product Lock established; architecture Review may begin"
-        elif campaigns and consecutive_growth:
-            expected_status, expected_reason = "DIVERGING", "a monitored obligation increased across two consecutive transitions"
-        elif expected_previous == expected_vector:
-            expected_status, expected_reason = "STABLE_BLOCKED", "the lexicographic obligation vector did not decrease"
-        else:
-            expected_status, expected_reason = "CONVERGING", "the lexicographic obligation vector decreased or established a baseline"
         if (
-            convergence.get("vector") != expected_vector
-            or convergence.get("ready_distance") != sum(expected_vector[:-1])
-            or convergence.get("budget") != expected_budget
-            or convergence.get("used") != expected_used
-            or convergence.get("previous_vector") != expected_previous
-            or convergence.get("history") != history
-            or convergence.get("status") != expected_status
-            or convergence.get("reason") != expected_reason
+            not events
+            or events[-1].get("state_key") != snapshot["state_key"]
+            or events[-1].get("vector") != snapshot["vector"]
         ):
+            errors.append("kernel convergence history is missing or stale")
+        if convergence != derive_convergence(graph, expected_readiness, ledger):
             errors.append("state convergence derivation is stale or tampered")
     execution = state.get("execution")
     if not isinstance(execution, dict) or set(execution) != {"status", "checkpoint", "reason"}:
@@ -435,7 +383,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     validate_attestations(root, feature_id, graph, state, errors)
     if state.get("readiness") != readiness(
         graph, state.get("attestations", {}), source_status=source_status, ledger=ledger,
-        product_lock_errors=lock_errors,
+        product_lock_status=lock_status,
     ):
         errors.append("state readiness disagrees with current review units/governance")
     contract_path = directory / "proof-contract.json"

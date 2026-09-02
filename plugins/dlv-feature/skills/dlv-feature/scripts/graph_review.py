@@ -27,6 +27,7 @@ from delivery_graph import (
     atomic_write_json,
     compile_graph,
     confined_project_path,
+    derive_convergence,
     feature_dir,
     graph_digest,
     load_graph,
@@ -39,7 +40,13 @@ from delivery_graph import (
     structural_errors,
     timestamp,
 )
-from delivery_proof import atomic_write_text, exclusive_file_lock, file_digest, value_digest
+from delivery_proof import (
+    atomic_write_text,
+    exclusive_file_lock,
+    file_digest,
+    nonblocking_exclusive_file_lock,
+    value_digest,
+)
 from runtime_evidence import MAX_CAPTURE_BYTES, run_bounded, verify_macos_signature
 from delivery_governance import (
     BLOCKING_FINDING_STATUSES,
@@ -306,7 +313,10 @@ def evaluate_unit(
     lens = unit["lens"]
     if lens == GLOBAL_LENS:
         covered = set(unit["node_ids"])
-        issues = [issue for issue in semantic_issues(graph) if issue["node_id"] in covered]
+        issues = [
+            issue for issue in semantic_issues(graph)
+            if issue["node_id"] == "GRAPH" or issue["node_id"] in covered
+        ]
         stage = "global"
     else:
         if lens not in LENSES:
@@ -406,8 +416,9 @@ def _record_units(
     graph = load_graph(root, feature_id)
     errors = structural_errors(graph, feature_id)
     errors.extend(prototype_errors(root, feature_id, graph))
-    from product_lock import live_product_lock_errors
-    errors.extend(live_product_lock_errors(root, feature_id, graph))
+    from product_lock import live_product_lock_status
+    lock_status = live_product_lock_status(root, feature_id, graph)
+    errors.extend(lock_status["errors"])
     if errors:
         raise ValueError("automatic Review requires a decision: " + "; ".join(errors))
     units = review_units(graph)
@@ -438,7 +449,8 @@ def _record_units(
         state = load_state(state_path)
         if state.get("graph_sha256") != graph_digest(graph):
             raise ValueError("compile the current Delivery Graph before review")
-        lock_errors = live_product_lock_errors(root, feature_id, current)
+        lock_status = live_product_lock_status(root, feature_id, current)
+        lock_errors = lock_status["errors"]
         if lock_errors:
             raise ValueError("quality/architecture Review requires a current SAFE Product Lock")
         ledger_file = ledger_path(root, feature_id)
@@ -538,7 +550,7 @@ def _record_units(
             graph, attestations,
             source_status=source_revision_status(directory, feature_id, graph["source_revision"]),
             ledger=ledger,
-            product_lock_errors=lock_errors,
+            product_lock_status=lock_status,
         )
         state["execution"] = {"status": "idle", "checkpoint": "review-recorded", "reason": None}
         state["last_compiled_at"] = timestamp()
@@ -776,43 +788,99 @@ def run_isolated_readiness_review(root: Path, feature_id: str, run_id: str) -> l
     root = root.expanduser().resolve()
     if not SAFE_RUN_ID.fullmatch(run_id):
         raise ValueError("review-run-id must use lowercase letters, digits, dots, underscores, or hyphens")
+    review_lease = confined_project_path(
+        root, Path(".dlv") / "runs" / feature_id / ".review-execution.lock", "Review execution lease",
+    )
+    try:
+        with nonblocking_exclusive_file_lock(review_lease):
+            return _run_isolated_readiness_review(root, feature_id, run_id)
+    except BlockingIOError as exc:
+        raise ValueError("automatic Review is already active") from exc
+
+
+def _run_isolated_readiness_review(root: Path, feature_id: str, run_id: str) -> list[Path]:
     lock = confined_project_path(root, Path(".dlv") / "runs" / feature_id / ".feature.lock", "feature lock")
     with exclusive_file_lock(lock):
         recover_review_transaction(root, feature_id)
-    graph = load_graph(root, feature_id)
-    errors = structural_errors(graph, feature_id)
-    errors.extend(prototype_errors(root, feature_id, graph))
-    errors.extend(prototype_review_blockers(graph))
-    from product_lock import live_product_lock_errors
-    errors.extend(live_product_lock_errors(root, feature_id, graph))
-    if errors:
-        raise ValueError("automatic Review requires a decision: " + "; ".join(errors))
-    state = load_state(feature_dir(root, feature_id) / "state.json")
-    if state.get("convergence", {}).get("status") in {"STABLE_BLOCKED", "DIVERGING", "NEEDS_DECISION"}:
-        raise ValueError("automatic Review is stopped because convergence requires a decision")
-    ledger = load_ledger(root, feature_id)
-    budget = review_budget(graph)
-    campaigns = ledger.get("campaigns", [])
-    used_units = sum(item.get("unit_count", 0) for item in campaigns if isinstance(item, dict))
-    used_findings = sum(item.get("new_findings", 0) for item in campaigns if isinstance(item, dict))
-    if len(campaigns) >= budget["max_campaigns"] or used_units >= budget["max_unit_reviews"] or used_findings >= budget["max_new_findings"]:
-        raise ValueError("automatic Review budget is exhausted; NEEDS_DECISION")
-    units = review_units(graph)
-    attestations = state.get("attestations", {})
-    stale = [
-        unit for unit_id, unit in units.items()
-        if (
-            unit_id not in attestations
-            or not _is_independent_attestation(root, attestations[unit_id])
-            # A blocked review must run again after the implementer marks its
-            # Finding fixed; otherwise a valid repair has no path to a fresh
-            # PASS attestation and the ledger can never converge.
-            or attestations[unit_id].get("verdict") != "PASS"
+        graph = load_graph(root, feature_id)
+        directory = feature_dir(root, feature_id)
+        state_path = directory / "state.json"
+        state = load_state(state_path)
+        execution = state.get("execution")
+        if isinstance(execution, dict) and execution.get("status") == "reviewing":
+            state["execution"] = {
+                "status": "needs_resume",
+                "checkpoint": "semantic-review",
+                "reason": f"recovered stale Review lease: {execution.get('reason') or 'unknown'}",
+            }
+            atomic_write_json(state_path, state)
+        if state.get("graph_sha256") != graph_digest(graph):
+            raise ValueError("compile the current Delivery Graph before automatic Review")
+        from graph_validation import validate_attestations
+        attestation_errors: list[str] = []
+        validate_attestations(root, feature_id, graph, state, attestation_errors)
+        if attestation_errors:
+            raise ValueError("automatic Review preflight found invalid attestation state: " + "; ".join(attestation_errors))
+        errors = structural_errors(graph, feature_id)
+        errors.extend(prototype_errors(root, feature_id, graph))
+        if errors:
+            raise ValueError("automatic Review preflight failed closed: " + "; ".join(errors))
+        from product_lock import live_product_lock_status
+        lock_status = live_product_lock_status(root, feature_id, graph)
+        ledger = load_ledger(root, feature_id)
+        live_readiness = readiness(
+            graph,
+            state.get("attestations", {}),
+            source_status=source_revision_status(directory, feature_id, graph["source_revision"]),
+            ledger=ledger,
+            product_lock_status=lock_status,
         )
-    ]
-    if not stale:
-        return []
-    _set_execution(root, feature_id, status="reviewing", checkpoint="semantic-review", reason=None)
+        live_convergence = derive_convergence(graph, live_readiness, ledger)
+        if live_convergence["status"] in {"STABLE_BLOCKED", "DIVERGING", "NEEDS_DECISION"}:
+            raise ValueError("automatic Review is stopped because convergence requires a decision")
+        next_action = live_readiness["next_action"]
+        units = review_units(graph)
+        attestations = state.get("attestations", {})
+        independently_complete = all(
+            unit_id in attestations
+            and attestations[unit_id].get("verdict") == "PASS"
+            and _is_independent_attestation(root, attestations[unit_id])
+            for unit_id in units
+        )
+        if next_action == "seal_or_continue_delivery" and independently_complete:
+            if lock_status["errors"]:
+                raise ValueError("automatic Review preflight failed closed: " + "; ".join(lock_status["errors"]))
+            return []
+        if next_action == "seal_or_continue_delivery":
+            next_action = "run_quality_review"
+        if next_action != "run_quality_review":
+            if next_action == "recover_product_lock":
+                raise ValueError("automatic Review preflight blocked; Product Lock requires fail-closed recovery")
+            raise ValueError(f"automatic Review preflight blocked; next action: {next_action}")
+        gate_errors = [*prototype_review_blockers(graph), *lock_status["errors"]]
+        if gate_errors:
+            raise ValueError("automatic Review preflight failed closed: " + "; ".join(gate_errors))
+        budget = review_budget(graph)
+        campaigns = ledger.get("campaigns", [])
+        used_units = sum(item.get("unit_count", 0) for item in campaigns if isinstance(item, dict))
+        used_findings = sum(item.get("new_findings", 0) for item in campaigns if isinstance(item, dict))
+        if len(campaigns) >= budget["max_campaigns"] or used_units >= budget["max_unit_reviews"] or used_findings >= budget["max_new_findings"]:
+            raise ValueError("automatic Review budget is exhausted; NEEDS_DECISION")
+        stale = [
+            unit for unit_id, unit in units.items()
+            if (
+                unit_id not in attestations
+                or not _is_independent_attestation(root, attestations[unit_id])
+                # A blocked review must run again after the implementer marks its
+                # Finding fixed; otherwise a valid repair has no path to a fresh
+                # PASS attestation and the ledger can never converge.
+                or attestations[unit_id].get("verdict") != "PASS"
+            )
+        ]
+        if not stale:
+            return []
+        state["execution"] = {"status": "reviewing", "checkpoint": "semantic-review", "reason": run_id}
+        atomic_write_json(state_path, state)
     with ThreadPoolExecutor(max_workers=min(MAX_REVIEW_WORKERS, len(stale))) as executor:
         futures = [executor.submit(_run_semantic_unit, root, feature_id, graph, unit, run_id) for unit in stale]
         completed: list[tuple[str, dict[str, Any], Path]] = []
