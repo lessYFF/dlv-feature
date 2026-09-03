@@ -2,6 +2,18 @@
 
 All notable changes to DLV Feature are documented here.
 
+## [0.11.0] - 2026-09-03
+
+### Added
+
+- Record a minimal, non-blocking quality and efficiency assessment for every terminal DLV execution.
+- Append later user, Review, or production defect feedback without rewriting the original assessment.
+
+### Changed
+
+- Evaluate first-pass completeness, final functional/visual/edge quality, critical coverage, and false Ready before comparing delivery efficiency.
+- Preserve all observed deviations while selecting one primary target for the next skill improvement.
+
 ## [0.10.0] - 2026-09-03
 
 ### Added

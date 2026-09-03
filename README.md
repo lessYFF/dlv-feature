@@ -1,6 +1,6 @@
 # DLV Feature
 
-Current plugin version: **0.10.0**, Delivery Graph schema v13.
+Current plugin version: **0.11.0**, Delivery Graph schema v13.
 
 DLV Feature is a proof-carrying Codex workflow with immutable Source Revisions, generated PRD and Delivery Prototype views, independent Product Alignment, a content-addressed Product Lock, stable Claims and semantic Findings, budgeted convergence control, target-runtime authenticity, and deterministic finalization.
 
@@ -37,6 +37,13 @@ non-Ready result moves to `NEEDS_DECISION` instead of starting another loop.
 
 Architecture and Code Spec are generated views, not serial approval stages. A local edit invalidates only its dependency component. Owner, Boundary, StateTransition, critical/major Risk, shared Fact, or shared Environment changes also invalidate the Global Skeleton attestation.
 
+Version 0.11.0 adds a non-blocking execution assessment after every terminal
+skill outcome. It records first-pass and final quality separately from delivery
+efficiency, derives false Ready instead of trusting a self-report, keeps one
+primary improvement target without discarding other observed deviations, and
+supports append-only escaped-defect feedback. The assessment does not alter the
+Delivery Graph, add a Review, or participate in Ready gates.
+
 ## Install
 
 ```bash
@@ -62,6 +69,7 @@ python3 plugins/dlv-feature/skills/dlv-feature/scripts/delivery_graph.py mark-co
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/verification_run.py start feature-id --root /path/to/project --run-id run-01 --environment ENV-001=/path/to/env.json
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/verification_run.py record feature-id --root /path/to/project --run-id run-01 --result /path/to/result.json
 python3 plugins/dlv-feature/skills/dlv-feature/scripts/finalize_delivery.py feature-id --root /path/to/project
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/execution_assessment.py feature-id --root /path/to/project record --run-id delivery-01 --input /path/to/assessment.json
 ```
 
 After each compile, honor `state.json.convergence` stop states first, then
@@ -116,5 +124,6 @@ Compatibility importers for schema v9/v10 emit an untrusted v13 candidate. Impor
 ```bash
 python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_delivery_graph.py
 python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_quality_core.py
+python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_execution_assessment.py
 python3 /path/to/skill-creator/scripts/quick_validate.py plugins/dlv-feature/skills/dlv-feature
 ```
