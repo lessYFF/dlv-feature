@@ -310,5 +310,15 @@ and requires fresh Product Alignment. Compatibility importers for v9/v10 emit
 the same untrusted v13 state. Finalization emits `delivery-manifest.json` with a
 deterministic tree digest for Multica artifact retention; remote upload receipts
 remain outside the DLV schema.
+
+At every terminal invocation outcome (`DELIVERY_READY`, `failed`, `blocked`, or
+`cancelled`), record one non-blocking execution assessment from facts the host
+already has. This telemetry never changes Graph truth, Readiness, Review, or
+Owner interaction. It preserves all evidenced deviations, selects at most one
+primary improvement target, and derives quality before efficiency without a
+compensating composite score. Read
+[execution-assessment.md](references/execution-assessment.md) for the input
+contract, thresholds, command, and delayed escaped-defect feedback.
+
 Read [workflow.md](references/workflow.md) for operating detail. Claim
 completion only when final validation reports zero errors.

@@ -2867,7 +2867,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertIs(False, payload["plugin_identity_verified"])
             self.assertIs(True, payload["host_verification_required"])
             self.assertEqual("dlv-feature", payload["plugin"])
-            self.assertEqual("0.10.0", payload["diagnostic_version"])
+            self.assertEqual("0.11.0", payload["diagnostic_version"])
             self.assertEqual(expected_plugin_sha256, payload["diagnostic_plugin_sha256"])
             self.assertEqual("0600", payload["bootstrap_files"]["auth.json"]["mode"])
             self.assertEqual(
