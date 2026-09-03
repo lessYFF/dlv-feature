@@ -41,13 +41,20 @@ from delivery_governance import (
     source_revision_status,
 )
 from graph_contract import validate_contract
+from quality_core import (
+    derive_delivery_status,
+    derive_risk_frontier,
+    experiment_plan,
+    reconcile_subjects,
+    source_anchors,
+)
 from delivery_contracts import claim_succession_map
 
 
 ALLOWED_FILES = {
     "delivery-graph.json", "state.json", "prd.md", "architecture-design.md",
     "code-spec.md", "proof-contract.json", "prototype.html", "verification.md",
-    "delivery-manifest.json",
+    "delivery-manifest.json", "source-anchors.json",
 }
 
 
@@ -268,6 +275,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     expected_state_keys = {
         "schema_version", "feature_id", "graph_sha256", "node_hashes", "stage_hashes",
         "readiness", "attestations", "source_revision", "product_lock", "risk", "finding_ledger", "convergence",
+        "risk_frontier", "subject_reconciliation", "critical_experiments", "delivery_status",
         "execution", "proof_contract", "code", "verification", "last_compiled_at",
     }
     if set(state) != expected_state_keys:
@@ -328,6 +336,13 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
         "errors": ["current Product Lock cannot be validated without a valid Source Revision"],
     }
     if source_revision is not None:
+        anchors_content = json.dumps(
+            {"source_revision": graph["source_revision"], "anchors": source_anchors(source_revision)},
+            ensure_ascii=False, indent=2, sort_keys=True,
+        ) + "\n"
+        anchors_path = directory / "source-anchors.json"
+        if not anchors_path.is_file() or anchors_path.read_text(encoding="utf-8") != anchors_content:
+            errors.append("generated artifact is missing or stale: source-anchors.json")
         lock_status = current_product_lock_status(
             directory, graph, source_revision,
             stage_hash(graph, "product"), file_digest(prd_path) if prd_path.is_file() else "",
@@ -338,6 +353,17 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     risk = state.get("risk")
     if not isinstance(risk, dict) or set(risk) != {"source", "design", "observed", "effective", "profiles"}:
         errors.append("state risk assessment is invalid")
+    expected_subjects = reconcile_subjects(
+        root, feature_id, graph, state.get("subject_reconciliation", {}).get("baseline_oid"),
+    )
+    expected_frontier = derive_risk_frontier(graph, risk.get("effective", {}) if isinstance(risk, dict) else {})
+    expected_experiments = experiment_plan(root, feature_id, expected_frontier, graph)
+    if state.get("subject_reconciliation") != expected_subjects:
+        errors.append("state planned/observed Subject reconciliation is stale")
+    if state.get("risk_frontier") != expected_frontier:
+        errors.append("state risk frontier is stale")
+    if state.get("critical_experiments") != expected_experiments:
+        errors.append("state critical experiment plan/evidence is stale")
     ledger_reference = state.get("finding_ledger")
     if not isinstance(ledger_reference, dict) or set(ledger_reference) != {"record_path", "sha256", "summary"}:
         errors.append("state finding ledger reference is invalid")
@@ -366,6 +392,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
         expected_readiness = readiness(
             graph, state.get("attestations", {}), source_status=source_status, ledger=ledger,
             product_lock_status=lock_status,
+            subject_reconciliation=expected_subjects, critical_experiments=expected_experiments,
         )
         snapshot = convergence_snapshot(graph, expected_readiness, ledger)
         events = ledger.get("convergence_events", [])
@@ -384,8 +411,11 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     if state.get("readiness") != readiness(
         graph, state.get("attestations", {}), source_status=source_status, ledger=ledger,
         product_lock_status=lock_status,
+        subject_reconciliation=expected_subjects, critical_experiments=expected_experiments,
     ):
         errors.append("state readiness disagrees with current review units/governance")
+    if state.get("delivery_status") != derive_delivery_status(state):
+        errors.append("state delivery_status is stale or falsely claims completion")
     contract_path = directory / "proof-contract.json"
     if not contract_path.is_file():
         errors.append("missing generated proof-contract.json")
@@ -410,7 +440,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
         if contract.get("status") == "sealed":
             validate_contract(root, feature_id, contract, state, errors)
         elif contract.get("status") == "draft":
-            expected_contract = generate_proof_contract(graph)
+            expected_contract = generate_proof_contract(graph, expected_experiments)
             expected_contract["attestations"] = dict(state.get("attestations", {}))
             if contract != expected_contract:
                 errors.append("generated Proof Contract draft is stale")
@@ -513,7 +543,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
                 errors.append("generated Verification report is missing or stale")
     elif (directory / "verification.md").exists() or (directory / "verification.md").is_symlink():
         errors.append("verification.md exists without an active schema-v13 run")
-    if final:
+    if final or state.get("delivery_status") == "DELIVERY_READY":
         if state.get("readiness", {}).get("status") != "ready":
             errors.append("final validation requires Delivery Readiness")
         if state.get("code", {}).get("status") != "completed":
@@ -571,7 +601,7 @@ def main(argv: list[str] | None = None) -> int:
     if errors:
         print(f"INVALID: {len(errors)} error(s)")
         return 1
-    print("DELIVERY COMPLETE: 0 errors" if args.final else "VALID INTERMEDIATE: 0 errors")
+    print("DELIVERY_READY: 0 errors" if args.final else "VALID INTERMEDIATE: 0 errors")
     return 0
 
 

@@ -1,7 +1,7 @@
 {
   "name": "dlv-feature",
-  "version": "0.9.2",
-  "description": "A convergent, risk-routed, proof-carrying feature delivery workflow for Codex.",
+  "version": "0.10.0",
+  "description": "A first-pass-complete, risk-routed, proof-carrying feature delivery workflow for Codex.",
   "author": {
     "name": "lessYFF",
     "url": "https://github.com/lessYFF"
@@ -13,13 +13,13 @@
   "interface": {
     "displayName": "DLV Feature",
     "shortDescription": "Deliver features with evidence-backed gates.",
-    "longDescription": "Guides a feature through a schema-v13 Delivery Graph with independent Product Alignment, content-addressed Product Locks, stable Claims and Findings, authentic target-runtime Proof, and deterministic finalization.",
+    "longDescription": "Guides a feature from materialized Source through anchor-complete Product Alignment, planned/observed Subject reconciliation, critical experiments, authentic runtime Proof, and deterministic DELIVERY_READY finalization.",
     "developerName": "lessYFF",
     "category": "Productivity",
-    "capabilities": ["Product Alignment", "Content-addressed Product Lock", "Origin traceability", "Stable Claim contracts", "Semantic Finding convergence", "Repository adapters", "Frontend fast path", "Target-runtime authenticity", "Pixel-level UI comparison", "Deterministic recovery"],
+    "capabilities": ["Materialized Source", "Anchor-complete Product Alignment", "Content-addressed Product Lock", "Planned/observed Subject reconciliation", "Derived risk frontier", "Reusable critical experiments", "Stable Claim contracts", "Semantic Finding convergence", "Repository adapters", "Frontend fast path", "Target-runtime authenticity", "Pixel-level UI comparison", "Deterministic DELIVERY_READY"],
     "websiteURL": "https://github.com/lessYFF/dlv-feature",
     "defaultPrompt": [
-      "Use $dlv-feature to deliver this feature with schema-v13 Product Alignment, a sealed Product Lock, stable Claims and Findings, authentic target-runtime Proof, and deterministic finalization."
+      "Use $dlv-feature to deliver this feature with materialized Source, 100% critical-anchor coverage, reconciled implementation subjects, minimal critical experiments, authentic target-runtime Proof, and deterministic DELIVERY_READY finalization."
     ]
   }
 }

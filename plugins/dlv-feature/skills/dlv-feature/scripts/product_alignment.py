@@ -19,6 +19,7 @@ from delivery_proof import atomic_write_text, exclusive_file_lock, file_digest, 
 from graph_review import prepare_isolated_codex_executable, prepare_isolated_codex_home
 from product_lock import ALIGNMENT_RESULTS, DECISION_REASONS, alignment_core, alignment_digest, known_origin_refs, product_node_ids, source_anchor_node_ids, source_anchor_refs
 from runtime_evidence import MAX_CAPTURE_BYTES, run_bounded
+from quality_core import attachment_interpretation_errors, attachment_materialization_errors, critical_anchor_coverage, source_anchors
 
 
 def _write_exclusive_at(directory_fd: int, name: str, content: bytes) -> None:
@@ -108,8 +109,24 @@ def review(root: Path, feature_id: str) -> Path:
     if errors:
         raise ValueError("Product Alignment requires a current Delivery Prototype: " + "; ".join(errors))
     source = load_source_revision(directory, feature_id, graph["source_revision"])
+    materialization_errors = attachment_materialization_errors(source)
+    if materialization_errors:
+        raise ValueError("Product Alignment requires materialized Source attachments: " + "; ".join(materialization_errors))
+    interpretation_errors = attachment_interpretation_errors(source)
+    if interpretation_errors:
+        raise ValueError(
+            "Product Alignment cannot interpret binary Source; run a format-aware extraction/OCR adapter or request an Owner decision: "
+            + "; ".join(interpretation_errors)
+        )
     prd = render_stage_document(graph, "product")
     node_ids, anchors = product_node_ids(graph), source_anchor_refs(source)
+    anchor_records = source_anchors(source)
+    missing_critical_origins = critical_anchor_coverage(graph, source)["missing"]
+    if missing_critical_origins:
+        raise ValueError(
+            "Product Alignment requires exact Graph origins for every critical Source anchor: "
+            + ", ".join(missing_critical_origins)
+        )
     invocation_id = f"alignment-{secrets.token_hex(16)}"
     review_dir = confined_project_path(root, Path(".dlv") / "product-alignments" / feature_id, "Product Alignment directory")
     review_dir.mkdir(parents=True, exist_ok=True)
@@ -128,7 +145,7 @@ def review(root: Path, feature_id: str) -> Path:
             assert content is not None
             prototype_content = content.decode("utf-8", errors="strict")
         snapshot = {
-            "feature_id": feature_id, "source": source, "source_anchors": anchors,
+            "feature_id": feature_id, "source": source, "source_anchors": anchor_records,
             "product_nodes": [node for node in graph["nodes"] if node.get("id") in node_ids],
             "product_edges": [edge for edge in graph["edges"] if edge.get("source") in node_ids or edge.get("target") in node_ids],
             "prd": prd, "delivery_prototype": prototype, "prototype_content": prototype_content,

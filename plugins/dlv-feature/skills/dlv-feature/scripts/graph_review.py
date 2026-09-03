@@ -61,6 +61,7 @@ from delivery_governance import (
     write_ledger,
 )
 from delivery_contracts import claims_by_id, prototype_review_blockers, review_budget
+from quality_core import derive_delivery_status
 
 
 def _root_owned_immutable_chain(path: Path, stop: Path | None = None) -> bool:
@@ -551,7 +552,10 @@ def _record_units(
             source_status=source_revision_status(directory, feature_id, graph["source_revision"]),
             ledger=ledger,
             product_lock_status=lock_status,
+            subject_reconciliation=state.get("subject_reconciliation"),
+            critical_experiments=state.get("critical_experiments"),
         )
+        state["delivery_status"] = derive_delivery_status(state)
         state["execution"] = {"status": "idle", "checkpoint": "review-recorded", "reason": None}
         state["last_compiled_at"] = timestamp()
         expected_ledger = (json.dumps(ledger, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
@@ -834,6 +838,8 @@ def _run_isolated_readiness_review(root: Path, feature_id: str, run_id: str) -> 
             source_status=source_revision_status(directory, feature_id, graph["source_revision"]),
             ledger=ledger,
             product_lock_status=lock_status,
+            subject_reconciliation=state.get("subject_reconciliation"),
+            critical_experiments=state.get("critical_experiments"),
         )
         live_convergence = derive_convergence(graph, live_readiness, ledger)
         if live_convergence["status"] in {"STABLE_BLOCKED", "DIVERGING", "NEEDS_DECISION"}:

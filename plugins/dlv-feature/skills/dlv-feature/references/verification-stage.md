@@ -36,4 +36,4 @@ and validation invalidates evidence.
 
 `verification.md` is generated from the run and may be deleted/rebuilt. Finalization validates contract/Code/Environment freshness, preflight anchors, contiguous append-only IDs, hash-chain head/count, anchor hashes/sizes, supersession, exact active Proof coverage, and assertion results. It writes completed PASS and a token only after these checks, then performs final validation.
 
-Only `DELIVERY COMPLETE` is completion. Local hashes detect accidental/ordinary rewriting; use signed remote attestation when an actor able to rewrite the kernel and every local artifact is in scope.
+Only `DELIVERY_READY` is completion. Local hashes detect accidental/ordinary rewriting; use signed remote attestation when an actor able to rewrite the kernel and every local artifact is in scope.

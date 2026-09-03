@@ -14,6 +14,13 @@ Schema v13 makes Product Lock, Claims, Review, and Proof quality contracts. Sour
 lint, risk routing, precise invalidation, Finding convergence, and recovery are
 efficiency mechanisms. Do not trade the first set away to optimize the second.
 
+First-pass quality is deterministic before it is semantic. Capture embeds the
+verified bytes of every product attachment; locator-only records are rejected.
+The kernel generates `source-anchors.json` for normative requirements,
+decisions, prohibitions, states, errors, and artifact structure. Product nodes
+cite those stable Anchor IDs in `origins`; Product Alignment and Product Lock
+require 100% exact coverage of critical Anchors.
+
 ## Truth and inputs
 
 `delivery/{feature-id}/delivery-graph.json` is editable machine truth. PRD,
@@ -46,6 +53,23 @@ python3 <skill-dir>/scripts/delivery_graph.py compile <feature-id> --root <proje
 python3 <skill-dir>/scripts/product_alignment.py <feature-id> --root <project-root>
 python3 <skill-dir>/scripts/seal_product_lock.py <feature-id> --root <project-root> --alignment /abs/ALN-....json
 ```
+
+After implementation/proof authoring, inspect the generated
+`state.json.risk_frontier`, `subject_reconciliation`, and
+`critical_experiments`. The implementation baseline, every later commit,
+deletion, tracked worktree change, and untracked path must reconcile to planned
+Symbol subjects. A critical independent failure boundary may
+require an early measured experiment:
+
+```bash
+python3 <skill-dir>/scripts/critical_experiment.py <feature-id> --root <project-root> \
+  --experiment EXP-...
+```
+
+The kernel executes the Graph-bound runner, evaluates its Assertions and target
+attestation, and signs the result. Fresh PASS evidence is reused in
+`proof-contract.json`; a changed frontier, runner, Assertion, Environment,
+Claim, Subject, or Graph invalidates only its experiment.
 
 Before running this plugin, the host or package manager must verify the release
 digest/signature outside the plugin and load it from the verified snapshot.
@@ -116,6 +140,8 @@ run_product_alignment                → isolated Product Alignment, then seal L
 recover_product_lock                 → fail closed; investigate/restore trusted artifacts
 author_architecture_graph            → Author LLM adds architecture nodes/edges/Claims
 author_implementation_proof_graph    → Author LLM adds Code Spec and Proof graph truth
+reconcile_observed_subjects          → Map actual changed paths to planned Symbols
+run_critical_experiments             → Measure independent critical failure boundaries
 repair_blocking_findings             → implementer repairs P0/P1 Findings
 run_quality_review                   → isolated Reviewer LLM may start
 request_owner_decision               → ask one precise question and stop
@@ -240,6 +266,10 @@ python3 <skill-dir>/scripts/verification_run.py record <feature-id> --root <proj
 python3 <skill-dir>/scripts/finalize_delivery.py <feature-id> --root <project-root>
 python3 <skill-dir>/scripts/validate_feature.py <feature-id> --root <project-root> --final
 ```
+
+`readiness.status=ready` means `REVIEWABLE`, not shipped. Never describe that
+state as complete. Only final validation after Code reconciliation, a sealed
+Proof Contract, and finalized target-runtime PASS may emit `DELIVERY_READY`.
 
 High-strength runtime/invariant/visual Proof requires committed source with a
 HEAD `DLV-Feature` trailer and binds the real Git commit OID, Code fingerprint,

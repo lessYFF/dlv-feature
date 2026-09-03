@@ -3,7 +3,8 @@
 ```text
 capture source → confirm epoch → author Product Graph → compile
 → regenerate prototype when stale → Product Alignment → SAFE Product Lock
-→ author Architecture + implementation-proof Graph → deterministic clean gate
+→ author Architecture + implementation-proof Graph → reconcile observed Subjects
+→ run only required critical experiments → deterministic clean gate
 → review stale risk components → converge Findings
 → seal → implement/reconcile → authentic target Proof → finalize
 ```
@@ -19,6 +20,16 @@ deterministic critical/major blockers are clean. Missing/content-stale Locks
 route to Product Alignment; invalid/tampered Locks route to fail-closed
 recovery. Neither condition is silently converted into an Owner product
 decision.
+
+Source capture materializes attachment bytes before the Author sees them and
+generates clause Anchors automatically. Review receives only unresolved or
+stale components. `readiness.status=ready` yields `REVIEWABLE`; finalization is
+the sole transition to `DELIVERY_READY`.
+
+For a legacy schema-v13 Source containing locator-only attachments, recapture a
+new revision with `source_capture.py` before Product Alignment. The old revision
+remains readable and immutable; the compiler reports `content_stale` and routes
+to recapture/alignment instead of treating the feature as corrupt.
 
 Quality contracts never change by route. Efficiency may reuse fresh component
 attestations, run cheapest checks first, or select the frontend fast path; it
