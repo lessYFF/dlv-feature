@@ -53,10 +53,21 @@ ready distance, blocking Findings, or Review units rise across two consecutive
 transitions (`DIVERGING`), or when a source/Product Lock/budget decision is needed
 (`NEEDS_DECISION`). `STABLE_BLOCKED` means no progress and requires repair or an
 Owner decision. Budget exhaustion never synthesizes a waiver or PASS.
-Automatic Review has a hard maximum of three campaigns. Configuration may use
-one or two but never more than three. After the third non-Ready campaign, stop
-automatic iteration and ask the Owner to choose; do not chase a zero-Finding
-result.
+Automatic Review has a hard maximum of three model-execution attempts.
+Configuration may use one or two but never more than three. Reserve a campaign
+and the prospective missing/stale unit count before invoking a model. Failed,
+interrupted, and resumed attempts count; deterministic preflight rejection does
+not. A reservation is stored in the existing campaign ledger with an
+`<run-id>.attempt-<nonce>` identity; semantic records retain the requested run ID.
+Valid peer units are committed through the existing atomic record/attestation
+path even when another unit fails. Their PASS is reusable only while its normal
+input, transcript, and Product Lock checks remain fresh. Partial completion
+never grants global Ready. Resume the same run ID for the remaining units;
+after a product/Graph revision, use a new run ID, without resetting the budget.
+An unchanged tool-failure checkpoint may retry despite STABLE_BLOCKED only when
+the live route still requires review; source, Product Lock, decision, divergence,
+and budget gates still apply. After the third non-Ready attempt, stop automatic
+iteration and report the remaining business or tool blocker separately.
 
 Risk acceptance is priority-based: critical/P0 and major/P1 Findings must be
 fixed and independently verified. Moderate/P2 Findings require an explicit

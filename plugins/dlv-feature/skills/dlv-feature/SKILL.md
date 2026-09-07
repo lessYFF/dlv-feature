@@ -5,6 +5,41 @@ description: Deliver an end-to-end feature with a repository-agnostic, proof-car
 
 # DLV Feature
 
+## Risk-directed delivery
+
+风险导向、抓大放小: optimize for verified business outcomes, not formal
+perfection. Keep Graph, Product Lock, evidence binding, and deterministic
+completion. Do not bypass them, rewrite their history, or patch the reviewer
+while delivering a business feature.
+
+Cover every agreed requirement, but distinguish source coverage from business
+severity. A critical Source anchor means the requirement must not be lost; it
+does not automatically require a critical Risk, a separate Claim, or a separate
+semantic Review unit. Group compatible acceptance checks into one executable
+Proof per coherent business result. Create additional state, infrastructure,
+or strong Claims only for a concrete independent failure with material impact.
+Optional metadata and document polish must not become new blocking findings.
+
+For export improvements like WMD-238, focus strong review on public-link/tenant
+authorization, published-snapshot consistency, and sensitive-price disclosure.
+Verify ordinary headers, cell content, and layout through generated-output
+tests and the final code review. Do not model an entire lifecycle subsystem
+just to satisfy the delivery framework. Do not silently omit requested output.
+
+For API or required-step changes like WMD-221, inspect existing consumers and
+release order before coding. Add a concrete compatibility Claim and executable
+Proof for old supported clients against the new server, using the old request
+sequence and persisted state. Include the reverse combination when rollout or
+rollback allows it. An additive field is not proof of behavioral compatibility;
+never satisfy a new price-confirmation step by silently confirming for the user.
+
+Default to one substantive review plus targeted verification of repairs. Extra
+review requires a concrete unresolved/new defect or stale relevant evidence.
+Tool/protocol failures are process failures, not new business defects. Preserve
+valid unit results and resume only missing/stale units within the same budget.
+Gate exceptions apply only to the named gate: relaxing Product Alignment never
+relaxes Quality Review, source fidelity, or evidence authenticity.
+
 DLV minimizes delivery, Review, and rerun cost subject to: critical requirement
 coverage = 100%, critical invariant Proof coverage = 100%, unresolved P0/P1
 Findings = 0, unresolved P2 Findings without an Owner decision = 0, and false
@@ -129,7 +164,9 @@ product drift invalidates every downstream attestation and Proof Contract.
 
 After every compile, first honor `state.json.convergence`: `STABLE_BLOCKED`,
 `DIVERGING`, or `NEEDS_DECISION` stops automation for repair or the precise
-Owner decision. Otherwise route from `state.json.readiness`. The kernel
+Owner decision. The bounded same-run tool-failure recovery described in
+[workflow.md](references/workflow.md) is the only STABLE_BLOCKED retry exception.
+Otherwise route from `state.json.readiness`. The kernel
 derives `authoring_stage`, typed `authoring_blockers`, `product_lock_state`, and
 one `next_action`; the host must execute that action before considering Review:
 
@@ -184,9 +221,12 @@ and `minor=P3`. P0/P1 must be fixed and independently verified. P2 must be
 fixed, moved out of scope, or explicitly accepted by an Owner with a reason.
 P3 may remain OPEN as non-blocking follow-up work. Do not optimize for zero
 Findings after these gates pass.
-Automatic Review is capped at three campaigns, even when Graph metadata asks
-for more. If the third campaign is not Ready, stop at `NEEDS_DECISION`; do not
-start a fourth automatic repair/review loop.
+Automatic Review is capped at three attempts, even when Graph metadata asks
+for more. Each invocation that starts model work reserves a campaign and its
+missing/stale unit count before execution; failures, interruptions, and resumed
+invocations consume that budget. Rejected preflight spends no campaign. After
+the third non-Ready attempt, stop at `NEEDS_DECISION`; do not start a fourth
+automatic repair/review loop or use a different run ID to reset the budget.
 The Finding Ledger owns a convergence event record signed by an external RSA
 private key. The confirmed Source Revision binds the repository-carried public
 identity, so another machine or CI can verify history without signing authority.
@@ -217,7 +257,8 @@ python3 <skill-dir>/scripts/finding_ledger.py <feature-id> --root <project-root>
 ```
 
 TENANCY, AUTHORIZATION, MONEY, and irreversible-side-effect risks are not
-waivable. `STABLE_BLOCKED`, `DIVERGING`, or `NEEDS_DECISION` requires Owner action; do not
+waivable. Except for the bounded tool-failure retry above, `STABLE_BLOCKED`,
+`DIVERGING`, or `NEEDS_DECISION` requires Owner action; do not
 automatically rewrite the Graph until a decision changes the facts.
 
 Delivery Prototype is `generated` or `not_applicable`. There is no

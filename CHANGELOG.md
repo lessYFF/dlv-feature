@@ -2,6 +2,21 @@
 
 All notable changes to DLV Feature are documented here.
 
+## [0.12.0] - 2026-09-07
+
+### Changed
+
+- Keep Graph, Product Lock and authentic Proof while separating source coverage from business-risk severity.
+- Require old-client/new-server workflow evidence for API or mandatory-step changes; extend cross-client risk discovery.
+- Reserve prospective review units before model calls and count failed/interrupted/recovery attempts against the existing budget.
+- Preserve valid peer attestations after unit failure and resume only missing or stale units without granting partial Ready.
+- Constrain semantic-review output to the current unit's Claim and Subject IDs.
+
+### Validation
+
+- Add WMD-238-style partial-failure/recovery, preflight budget, retry-budget and local-schema regressions.
+- Add a WMD-221-style old-client risk-discovery regression; this is not a replay of the production mini-program.
+
 ## [0.11.0] - 2026-09-03
 
 ### Added

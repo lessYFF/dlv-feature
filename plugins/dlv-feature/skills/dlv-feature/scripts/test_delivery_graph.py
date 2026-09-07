@@ -1677,6 +1677,192 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
                         root, "cross-domain-feature", graph, unit, "failed-review",
                     )
 
+    def test_review_reserves_prospective_units_before_any_model_call(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            path = root / "delivery/cross-domain-feature/delivery-graph.json"
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            graph["metadata"]["review_budget"] = {"max_campaigns": 3, "max_unit_reviews": 1, "max_new_findings": 24}
+            write_json(path, graph)
+            self.seal_product(root)
+            with patch.object(graph_review, "_run_semantic_unit") as reviewer:
+                with self.assertRaisesRegex(graph_review.ReviewBudgetExceeded, "before model execution"):
+                    graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "prospective")
+            reviewer.assert_not_called()
+            self.assertEqual([], load_ledger(root, "cross-domain-feature")["campaigns"])
+
+    def test_wmd238_tool_failure_preserves_valid_peers_and_resumes_only_failed_unit(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            units = delivery_graph.review_units(graph)
+            failed_id = next(iter(units))
+            original = graph_review._run_semantic_unit
+
+            def fail_one(root, feature_id, graph, unit, run_id):
+                if unit["unit_id"] == failed_id:
+                    raise ValueError("injected protocol failure")
+                return original(root, feature_id, graph, unit, run_id)
+
+            with patch.object(graph_review, "run_bounded", side_effect=self.fake_semantic_run):
+                with patch.object(graph_review, "_run_semantic_unit", side_effect=fail_one):
+                    with self.assertRaisesRegex(ValueError, "injected protocol failure"):
+                        graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "recover-units")
+                state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+                self.assertEqual(set(units) - {failed_id}, set(state["attestations"]))
+                self.assertNotEqual("ready", state["readiness"]["status"])
+                kept = copy.deepcopy(state["attestations"])
+                with patch.object(graph_review, "_run_semantic_unit", wraps=original) as reviewer:
+                    graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "recover-units")
+                self.assertEqual(1, reviewer.call_count)
+            state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+            self.assertTrue(all(state["attestations"][key] == value for key, value in kept.items()))
+            self.assertEqual("ready", state["readiness"]["status"])
+            campaigns = load_ledger(root, "cross-domain-feature")["campaigns"]
+            self.assertEqual([len(units), 1], [item["unit_count"] for item in campaigns])
+            self.assertFalse(graph_validation.validate(root, "cross-domain-feature"))
+
+    def test_malformed_review_unit_preserves_valid_peer_attestations(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            units = delivery_graph.review_units(delivery_graph.load_graph(root, "cross-domain-feature"))
+            failed_id = sorted(units)[0]
+            original = graph_review._run_semantic_unit
+
+            def malformed_one(root, feature_id, graph, unit, run_id):
+                unit_id, result, transcript = original(root, feature_id, graph, unit, run_id)
+                if unit_id == failed_id:
+                    result["checks"] = []
+                return unit_id, result, transcript
+
+            with patch.object(graph_review, "run_bounded", side_effect=self.fake_semantic_run):
+                with patch.object(graph_review, "_run_semantic_unit", side_effect=malformed_one):
+                    with self.assertRaisesRegex(ValueError, "invalid checks/verdict"):
+                        graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "malformed-unit")
+            state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+            self.assertEqual(set(units) - {failed_id}, set(state["attestations"]))
+            self.assertNotEqual("ready", state["readiness"]["status"])
+            self.assertEqual([], graph_validation.validate(root, "cross-domain-feature"))
+            peer = next(iter(state["attestations"].values()))
+            record = json.loads((root / peer["record_path"]).read_text())
+            (root / record["execution"]["transcript_path"]).write_text("tampered", encoding="utf-8")
+            with patch.object(graph_review, "_run_semantic_unit") as reviewer:
+                with self.assertRaisesRegex(ValueError, "invalid attestation"):
+                    graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "malformed-unit")
+            reviewer.assert_not_called()
+
+    def test_reserved_review_counts_new_findings_and_stops_over_budget(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            graph = delivery_graph.load_graph(root, "cross-domain-feature")
+            graph["metadata"]["review_budget"] = {
+                "max_campaigns": 3, "max_unit_reviews": 99, "max_new_findings": 1,
+            }
+            write_json(root / "delivery/cross-domain-feature/delivery-graph.json", graph)
+            self.seal_product(root)
+            unit = next(iter(delivery_graph.review_units(graph).values()))
+            claim = next(item for item in graph["claims"] if item["id"] in unit["claim_ids"])
+            original = graph_review._run_semantic_unit
+
+            def findings_one(root, feature_id, graph, current_unit, run_id):
+                unit_id, result, transcript = original(root, feature_id, graph, current_unit, run_id)
+                if unit_id == unit["unit_id"]:
+                    result["verdict"] = "BLOCKED"
+                    result["findings"] = [{
+                        "id": "NEW", "severity": "major", "status": "OPEN",
+                        "statement": f"Budget finding {index}", "evidence": claim["subjects"][0],
+                        "risk_path": "budget", "root_cause": f"root {index}",
+                        "claim_id": claim["id"], "failure_mode": f"failure {index}",
+                        "violated_invariant": claim["invariant"], "subjects": [claim["subjects"][0]],
+                        "risk_axes": ["CONCURRENCY"], "previously_invisible_reason": "combined response",
+                    } for index in range(2)]
+                return unit_id, result, transcript
+
+            with patch.object(graph_review, "run_bounded", side_effect=self.fake_semantic_run):
+                with patch.object(graph_review, "_run_semantic_unit", side_effect=findings_one):
+                    with self.assertRaisesRegex(graph_review.ReviewBudgetExceeded, "new-finding budget"):
+                        graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "reserved-findings")
+            ledger = load_ledger(root, "cross-domain-feature")
+            self.assertEqual(1, len(ledger["campaigns"]))
+            self.assertEqual(2, ledger["campaigns"][0]["new_findings"])
+            self.assertEqual(2, len(ledger["entries"]))
+            state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
+            self.assertEqual({}, state["attestations"])
+            self.assertEqual("NEEDS_DECISION", state["convergence"]["status"])
+            self.assertEqual([], graph_validation.validate(root, "cross-domain-feature"))
+
+    def test_failed_review_attempts_cannot_evade_campaign_budget_by_changing_run_id(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            self.seal_product(root)
+            with patch.object(graph_review, "_run_semantic_unit", side_effect=ValueError("tool unavailable")):
+                for _ in range(3):
+                    with self.assertRaisesRegex(ValueError, "tool unavailable"):
+                        graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "failed-attempt")
+                    self.assertEqual([], graph_validation.validate(root, "cross-domain-feature"))
+            self.assertEqual(3, len(load_ledger(root, "cross-domain-feature")["campaigns"]))
+            with patch.object(graph_review, "_run_semantic_unit") as reviewer:
+                with self.assertRaisesRegex(ValueError, "decision|budget"):
+                    graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "new-id")
+            reviewer.assert_not_called()
+
+    def test_semantic_schema_bounds_claim_and_subject_ids_to_unit(self) -> None:
+        graph = valid_graph()
+        for unit in delivery_graph.review_units(graph).values():
+            schema = graph_review.semantic_output_schema(unit, graph["claims"])["properties"]["findings"]
+            if unit.get("claim_ids"):
+                self.assertEqual(unit["claim_ids"], schema["items"]["properties"]["claim_id"]["enum"])
+                subjects = sorted({
+                    subject for claim in graph["claims"] if claim["id"] in unit["claim_ids"]
+                    for subject in claim["subjects"]
+                })
+                self.assertEqual(subjects, schema["items"]["properties"]["subjects"]["items"]["enum"])
+            else:
+                self.assertEqual(0, schema["maxItems"])
+
+    def test_semantic_schema_preserves_cross_component_finding_identity(self) -> None:
+        graph = valid_graph()
+        units = delivery_graph.review_units(graph)
+        unit = units[delivery_graph.GLOBAL_LENS]
+        claim = next(claim for claim in graph["claims"] if not set(claim["subjects"]) & set(unit["node_ids"]))
+        ledger, findings = apply_review_findings(
+            delivery_governance.empty_ledger("cross-domain-feature"),
+            unit_id=unit["unit_id"], source_revision=graph["source_revision"], findings=[{
+                "id": "NEW", "severity": "major", "status": "OPEN",
+                "statement": "Cross-component failure", "evidence": "Claim subjects",
+                "claim_id": claim["id"], "failure_mode": "inconsistent cross-component result",
+                "violated_invariant": claim["invariant"], "subjects": claim["subjects"],
+                "risk_axes": ["CROSS_CLIENT"],
+            }],
+        )
+        finding = findings[0]
+        ledger["entries"][finding["id"]]["status"] = "FIXED_PENDING_REVIEW"
+        finding = dict(finding, status="VERIFIED")
+        schema = graph_review.semantic_output_schema(unit, graph["claims"])
+        allowed = schema["properties"]["findings"]["items"]["properties"]
+        self.assertIn(finding["claim_id"], allowed["claim_id"]["enum"])
+        self.assertTrue(set(finding["subjects"]) <= set(allowed["subjects"]["items"]["enum"]))
+        _, verified = apply_review_findings(
+            ledger, unit_id=unit["unit_id"], source_revision=graph["source_revision"],
+            findings=[finding], claim_ids=set(unit["claim_ids"]),
+            claim_subjects={claim["id"]: set(claim["subjects"])},
+        )
+        self.assertEqual(finding["id"], verified[0]["id"])
+        self.assertEqual("VERIFIED", verified[0]["status"])
+
+    def test_wmd221_legacy_client_signal_escalates_without_sync_or_event_code(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            (root / "price-flow.ts").write_text(
+                "// 旧客户端仍调用原确认接口\nconst clientVersion = 'previous';\n", encoding="utf-8",
+            )
+            graph = {"nodes": [{"type": "Symbol", "attributes": {"path": "price-flow.ts"}}]}
+            risk = delivery_graph.observed_code_risk_vector(root, graph)
+            self.assertEqual("present", risk["CROSS_CLIENT"])
+            self.assertEqual("absent", risk["CONCURRENCY"])
+
     def test_open_major_semantic_finding_forces_composite_blocked(self) -> None:
         graph = valid_graph()
         semantic = {
@@ -2867,7 +3053,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertIs(False, payload["plugin_identity_verified"])
             self.assertIs(True, payload["host_verification_required"])
             self.assertEqual("dlv-feature", payload["plugin"])
-            self.assertEqual("0.11.0", payload["diagnostic_version"])
+            self.assertEqual("0.12.0", payload["diagnostic_version"])
             self.assertEqual(expected_plugin_sha256, payload["diagnostic_plugin_sha256"])
             self.assertEqual("0600", payload["bootstrap_files"]["auth.json"]["mode"])
             self.assertEqual(

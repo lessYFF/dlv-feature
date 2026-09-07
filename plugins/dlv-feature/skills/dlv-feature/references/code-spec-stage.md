@@ -18,6 +18,11 @@ Make every planned change, symbol, test, runtime, proof, and assertion executabl
 3. Connect Proof `proves` to exact Acceptance/Exception and supporting Test/Boundary/Transition/Risk targets; connect `runs_in` exactly one Environment.
 4. Create structured `Assertion` nodes with `attributes.oracle`. Each Assertion `proves` exactly one Proof.
 5. Every Acceptance/Exception requires both Test and Proof coverage. Choose the strongest applicable type: `visual`, `runtime`, `boundary`, `invariant`, or `artifact`. Do not downgrade for convenience.
+   One coherent Proof may cover several related Acceptance/Exception nodes;
+   source-clause count must not dictate runner or review-unit count. Generated
+   file assertions can verify ordinary export content together. Independent
+   security, financial, compatibility, or data-loss boundaries retain their
+   own relevant checks.
 6. A locked generated Delivery Prototype requires every Acceptance/Exception to declare boolean `prototype_applicable`, with at least one true value and direct visual Proof coverage for every true node.
 7. Each visual Proof runs in a visual target runtime, binds Product Lock SHA, sets exact `capture_profile={viewport,state,data,dpr,fonts}`, and has exactly one `eq 0.0` pixel-diff assertion, one `eq 0` geometry-diff assertion, and one `eq 0` forbidden-element assertion. Its `visual_bundle` runner returns the locked Delivery Prototype SHA/profile and exact Prototype/Implementation/Diff PNG paths.
 
