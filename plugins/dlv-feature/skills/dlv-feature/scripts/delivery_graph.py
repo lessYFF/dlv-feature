@@ -110,7 +110,10 @@ OBSERVED_RISK_PATTERNS = {
     "MONEY": re.compile(r"\b(?:amount|price|payment|settlement|reimburse|refund|currency)\b", re.I),
     "CONCURRENCY": re.compile(r"\b(?:idempot|retry|lock|concurr|transaction|atomic)\b", re.I),
     "IRREVERSIBLE_SIDE_EFFECT": re.compile(r"\b(?:delete|publish|send|cancel|charge|execute)\b", re.I),
-    "CROSS_CLIENT": re.compile(r"\b(?:websocket|event|sync|broadcast|push)\b", re.I),
+    "CROSS_CLIENT": re.compile(
+        r"\b(?:websocket|event|sync|broadcast|push|compatibility|backward.compatible|"
+        r"client[_ -]?version|app[_ -]?version|mini[_ -]?program|weapp)\b|小程序|旧客户端", re.I,
+    ),
     "VISUAL_CONTRACT": re.compile(r"\b(?:css|style|layout|component|render|view)\b", re.I),
 }
 

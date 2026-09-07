@@ -2,6 +2,14 @@
 
 ## Start
 
+For changed API contracts or mandatory steps, execute the old supported client
+request sequence against the new server with relevant historical state. Do not
+substitute a newly rebuilt client or a successful new/new integration run.
+Check reverse version combinations when rollout or rollback permits them. Bind
+the client fixture/version to the Proof so changing it invalidates the evidence.
+Verify the complete action and readback, including the ability to finish a
+price-confirmation flow; a status flag or additive JSON field alone is insufficient.
+
 1. Materialize one JSON file per sealed Environment, exactly matching its structured spec. High-strength runtime/invariant/visual specs include concrete target, build, deployment, adapter SHA, fixture path/SHA, and a pinned RS256 target-attestation issuer/audience/public JWK.
 2. Start a unique run. The kernel checks the sealed contract, current Code fingerprint, Environment equality, and executes every preflight command.
 3. A failed preflight creates a blocked run. Fix the environment or credentials; do not change business code to counterfeit availability.

@@ -15,6 +15,18 @@ Represent verified system facts, singular ownership, boundaries, state transitio
 7. Encode repository/path/symbol evidence in node attributes. Do not copy a schema table or API matrix into Markdown; the generated Architecture is a view of graph claims.
 8. Compile and inspect the generated view. Fix missing or wrong graph claims.
 
+Before adding a new node or Claim, identify the business failure it prevents.
+Source-preservation criticality is not business-risk severity. Reuse existing
+owners, state and public contracts; ordinary output changes do not justify a new
+lifecycle subsystem. Keep checks for one coherent result together.
+
+For API or mandatory workflow changes, inspect old supported consumers, stored
+states and rollout/rollback order. Record the compatibility failure boundary
+and link a Claim to executable old-client/new-server Proof. A new optional
+response field can still introduce a breaking prerequisite or strand an old
+confirmation flow. Missing old-client evidence is a real risk, not metadata
+polish. Regex risk discovery is only an escalation hint, never sufficient proof.
+
 ## Gate
 
 `STATE_AND_ATOMICITY` and `BOUNDARY_AND_CONCURRENCY` enforce exact ownership, Fact persistence, executable database DDL with column meaning, guards, transitions, and risk links. The database contract contains schema intent, not repository migration numbers or procedural migration code. Stable Claims bind invariants and failure boundaries; independent review challenges second sources of truth, unsafe concurrency/tenant/authorization, ambiguous lineage, compatibility, and failure modes.

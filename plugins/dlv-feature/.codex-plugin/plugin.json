@@ -1,7 +1,7 @@
 {
   "name": "dlv-feature",
-  "version": "0.11.0",
-  "description": "A first-pass-complete, risk-routed, proof-carrying feature delivery workflow for Codex.",
+  "version": "0.12.0",
+  "description": "Risk-directed feature delivery with bounded review recovery and evidence-backed completion.",
   "author": {
     "name": "lessYFF",
     "url": "https://github.com/lessYFF"
@@ -19,7 +19,7 @@
     "capabilities": ["Materialized Source", "Anchor-complete Product Alignment", "Content-addressed Product Lock", "Planned/observed Subject reconciliation", "Derived risk frontier", "Reusable critical experiments", "Stable Claim contracts", "Semantic Finding convergence", "Repository adapters", "Frontend fast path", "Target-runtime authenticity", "Pixel-level UI comparison", "Deterministic DELIVERY_READY"],
     "websiteURL": "https://github.com/lessYFF/dlv-feature",
     "defaultPrompt": [
-      "Use $dlv-feature to deliver this feature with materialized Source, 100% critical-anchor coverage, reconciled implementation subjects, minimal critical experiments, authentic target-runtime Proof, and deterministic DELIVERY_READY finalization."
+      "Use $dlv-feature to deliver this feature with risk-directed modeling, existing-client compatibility checks, bounded review recovery, and authentic evidence. Preserve Graph, Product Lock, source fidelity, and deterministic completion without adding formalism unrelated to business risk."
     ]
   }
 }

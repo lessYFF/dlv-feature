@@ -1,8 +1,22 @@
 # DLV Feature
 
-Current plugin version: **0.11.0**, Delivery Graph schema v13.
+Current plugin version: **0.12.0**, Delivery Graph schema v13.
 
 DLV Feature is a proof-carrying Codex workflow with immutable Source Revisions, generated PRD and Delivery Prototype views, independent Product Alignment, a content-addressed Product Lock, stable Claims and semantic Findings, budgeted convergence control, target-runtime authenticity, and deterministic finalization.
+
+Version 0.12.0 keeps those safeguards and makes delivery explicitly risk-directed.
+Source coverage does not automatically elevate business severity or require a
+separate review unit per clause. Ordinary export assertions may share a coherent
+Proof; authorization, snapshot integrity, sensitive-price disclosure, and old-client
+compatibility receive targeted evidence. Formal completeness is not a reason to
+invent new scope, state machines, or infrastructure.
+
+Automatic Review reserves its prospective unit count before model execution.
+Each started invocation, including failure or recovery, consumes one of at most
+three campaign attempts. Valid peer results survive a failed unit through the
+existing atomic attestation path; resumption reuses fresh PASS units and invokes
+only missing/stale ones. No partial batch can grant global Ready. This release
+does not relax Product Lock invalidation, signatures, or final evidence checks.
 
 Version 0.10.0 improves first-pass completeness without another manual review
 loop. Source attachment bytes are materialized and digest-checked at capture.
@@ -32,8 +46,9 @@ success does not authorize Product Alignment without that prior host verificatio
 
 Review is risk-gated rather than zero-Finding-gated: critical/P0 and major/P1
 Findings block delivery, moderate/P2 requires an explicit Owner decision, and
-minor/P3 is advisory. Automatic Review is capped at three campaigns; a third
-non-Ready result moves to `NEEDS_DECISION` instead of starting another loop.
+minor/P3 is advisory. Automatic Review is capped at three model-execution attempts,
+including tool failures and recovery; a third non-Ready result requires a decision
+instead of starting another loop.
 
 Architecture and Code Spec are generated views, not serial approval stages. A local edit invalidates only its dependency component. Owner, Boundary, StateTransition, critical/major Risk, shared Fact, or shared Environment changes also invalidate the Global Skeleton attestation.
 
