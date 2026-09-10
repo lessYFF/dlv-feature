@@ -64,6 +64,7 @@ from quality_core import (
     reconcile_subjects,
     source_anchors,
 )
+from high_risk_contracts import high_risk_issues
 
 
 STAGES = ("product", "architecture", "implementation_proof")
@@ -104,12 +105,15 @@ VISUAL_RUNTIMES = {"browser", "chromium", "firefox", "webkit", "wechat-devtools"
 MAX_COMMAND_TIMEOUT_SECONDS = 3600
 OBSERVED_RISK_PATTERNS = {
     "API_CONTRACT": re.compile(r"\b(?:route|endpoint|controller|api/v[0-9]|requestmapping)\b", re.I),
-    "PERSISTENCE": re.compile(r"\b(?:select |insert |update |delete |migration|repository|database|sql)\b", re.I),
+    "PERSISTENCE": re.compile(r"\b(?:(?:select|insert|update|delete)\s+|(?:create|alter|drop|truncate)\s+table\b|migration\b|repository\b|database\b|sql\b)", re.I),
     "AUTHORIZATION": re.compile(r"\b(?:authori[sz]|permission|role|access[_ -]?control)\b", re.I),
     "TENANCY": re.compile(r"\b(?:tenant|organization_id|org_id)\b", re.I),
     "MONEY": re.compile(r"\b(?:amount|price|payment|settlement|reimburse|refund|currency)\b", re.I),
     "CONCURRENCY": re.compile(r"\b(?:idempot|retry|lock|concurr|transaction|atomic)\b", re.I),
-    "IRREVERSIBLE_SIDE_EFFECT": re.compile(r"\b(?:delete|publish|send|cancel|charge|execute)\b", re.I),
+    "IRREVERSIBLE_SIDE_EFFECT": re.compile(
+        r"\b(?:(?:delete|publish|send|cancel|charge|execute)\b|(?:drop|truncate)\s+table\b|"
+        r"alter\s+table\b[^;]*?\b(?:drop|alter|modify|change|rename)\b)", re.I,
+    ),
     "CROSS_CLIENT": re.compile(
         r"\b(?:websocket|event|sync|broadcast|push|compatibility|backward.compatible|"
         r"client[_ -]?version|app[_ -]?version|mini[_ -]?program|weapp)\b|小程序|旧客户端", re.I,
@@ -675,6 +679,7 @@ def readiness(
     product_lock_status: dict[str, Any] | None = None,
     subject_reconciliation: dict[str, Any] | None = None,
     critical_experiments: dict[str, Any] | None = None,
+    required_risk: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(attestations, dict):
         attestations = {}
@@ -712,6 +717,9 @@ def readiness(
             for issue in semantic_issues(graph, lens):
                 if issue.get("severity") in {"critical", "major"}:
                     by_key[(issue["code"], issue["node_id"])] = issue
+        if stage == "implementation_proof":
+            for issue in high_risk_issues(graph, required_risk):
+                by_key[(issue["code"], issue["node_id"])] = issue
         return [by_key[key] for key in sorted(by_key)]
 
     product_blockers = blockers_for("product")
@@ -1052,14 +1060,18 @@ def graph_risk_vector(graph: dict[str, Any]) -> dict[str, str]:
     return union_risk_vectors(declared, inferred)
 
 
-def observed_code_risk_vector(root: Path, graph: dict[str, Any]) -> dict[str, str]:
-    """R2: conservatively detect risk in the concrete Symbols declared by Graph.
+def observed_code_risk_vector(
+    root: Path, graph: dict[str, Any], baseline_oid: str | None = None,
+) -> dict[str, str]:
+    """R2: scan declared Subjects and their removed/added implementation lines.
 
     This is an escalation signal, not a proof of safety.  It intentionally
     never lowers R0/R1 and ignores undeclared paths rather than scanning an
     unrelated repository.
     """
+    root = root.resolve()
     result = {axis: "absent" for axis in RISK_AXES}
+    subjects: set[str] = set()
     for node in graph.get("nodes", []):
         if not isinstance(node, dict) or node.get("type") != "Symbol":
             continue
@@ -1067,16 +1079,69 @@ def observed_code_risk_vector(root: Path, graph: dict[str, Any]) -> dict[str, st
         relative = attributes.get("path")
         if not isinstance(relative, str) or not relative or Path(relative).is_absolute() or ".." in Path(relative).parts:
             continue
-        path = root / relative
-        if not path.is_file() or path.is_symlink():
-            continue
-        try:
-            content = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
+        subjects.add(Path(relative).as_posix())
+
+    if not subjects:
+        return result
+
+    def scan(content: str) -> None:
         for axis, pattern in OBSERVED_RISK_PATTERNS.items():
             if pattern.search(content):
                 result[axis] = "present"
+
+    # Literal pathspecs prevent a Symbol containing glob/pathspec syntax from
+    # scanning unrelated files. Git diff includes deleted files and old lines;
+    # --no-renames exposes both sides even when only the old path is declared.
+    pathspecs = [f":(literal){path}" for path in sorted(subjects)]
+    baseline = baseline_oid
+    if baseline is None:
+        head = run_process(
+            ["git", "rev-parse", "--verify", "HEAD"], cwd=root,
+            capture_output=True, text=True, check=False,
+        )
+        baseline = head.stdout.strip() if head.returncode == 0 else "UNBORN"
+    if baseline != "UNBORN":
+        if not re.fullmatch(r"[0-9a-f]{40,64}", baseline):
+            raise ValueError("Observed risk implementation baseline must be a Git commit OID")
+        verified = run_process(
+            ["git", "rev-parse", "--verify", f"{baseline}^{{commit}}"], cwd=root,
+            capture_output=True, text=True, check=False,
+        )
+        if verified.returncode != 0 or verified.stdout.strip() != baseline:
+            raise ValueError("Observed risk implementation baseline is missing from Git")
+        if pathspecs:
+            delta = run_process(
+                ["git", "diff", "--no-ext-diff", "--no-textconv", "--no-renames",
+                 "--no-color", "--output-indicator-old=-", "--output-indicator-new=+",
+                 "--unified=0", baseline, "--", *pathspecs], cwd=root,
+                capture_output=True, text=True, errors="replace", check=False,
+            )
+            if delta.returncode != 0:
+                raise ValueError("Observed risk cannot compare the implementation baseline")
+            scan("\n".join(
+                line[1:] for line in delta.stdout.splitlines()
+                if line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+            ))
+    paths = set(subjects)
+    directories = [f":(literal){path}" for path in sorted(subjects) if (root / path).is_dir()]
+    if directories:
+        listed = run_process(
+            ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--", *directories],
+            cwd=root, capture_output=True, text=True, errors="replace", check=False,
+        )
+        if listed.returncode != 0 and baseline != "UNBORN":
+            raise ValueError("Observed risk cannot enumerate declared Subjects")
+        if listed.returncode == 0:
+            paths.update(path for path in listed.stdout.split("\0") if path)
+    for relative in sorted(paths):
+        path = root / relative
+        # Do not follow symlinked parent directories into private/outside files.
+        if not path.is_file() or path.resolve() != path or not path.is_relative_to(root):
+            continue
+        try:
+            scan(path.read_text(encoding="utf-8", errors="replace"))
+        except OSError as exc:
+            raise ValueError(f"Observed risk cannot read declared Subject: {relative}") from exc
     return result
 
 
@@ -1510,6 +1575,8 @@ def semantic_issues(graph: dict[str, Any], lens: str | None = None) -> list[dict
                     or any(subject not in nodes or nodes[subject]["type"] in {"Proof", "Assertion", "Environment"} for subject in subject_ids)
                 ):
                     add("ASSERTION_SUBJECTS_INVALID", node["id"], "Assertion requires sorted explicit business subject_ids", "critical")
+    if "RUNTIME_AUTHENTICITY" in enabled:
+        issues.extend(high_risk_issues(graph))
     return sorted(issues, key=lambda item: (item["severity"], item["code"], item["node_id"]))
 
 
@@ -1669,7 +1736,22 @@ def _valid_attestation_reference(root: Path, feature_id: str, unit_id: str, summ
         path.resolve().relative_to(root)
     except ValueError:
         return False
-    return path.is_file() and path.resolve() == path.absolute() and file_digest(path) == summary.get("record_sha256")
+    if not (path.is_file() and path.resolve() == path.absolute() and file_digest(path) == summary.get("record_sha256")):
+        return False
+    from review_evidence import evidence_execution_errors
+    try:
+        record = load_json(path)
+        return not evidence_execution_errors(root, graph, unit, record.get("execution", {}))
+    except (OSError, ValueError):
+        return False
+
+
+def required_domain_risk(root: Path, graph: dict[str, Any], state: dict[str, Any]) -> dict[str, str]:
+    source = load_source_revision(root / "delivery" / graph["feature_id"], graph["feature_id"], graph["source_revision"])
+    return union_risk_vectors(
+        source["risk_vector"], state.get("risk", {}).get("observed", {}),
+        observed_code_risk_vector(root, graph, state.get("subject_reconciliation", {}).get("baseline_oid")),
+    )
 
 
 def compile_graph(
@@ -1742,7 +1824,8 @@ def compile_graph(
             observed_risk = normalize_risk_vector(observed_risk, label="observed risk vector")
         except ValueError:
             observed_risk = {axis: "absent" for axis in RISK_AXES}
-        observed_risk = union_risk_vectors(observed_risk, observed_code_risk_vector(root, graph))
+        previous_baseline = previous.get("subject_reconciliation", {}).get("baseline_oid")
+        observed_risk = union_risk_vectors(observed_risk, observed_code_risk_vector(root, graph, previous_baseline))
         design_risk = graph_risk_vector(graph)
         risk = {
             "source": source_revision["risk_vector"],
@@ -1751,7 +1834,6 @@ def compile_graph(
             "effective": union_risk_vectors(source_revision["risk_vector"], design_risk, observed_risk),
         }
         risk["profiles"] = profiles_for(risk["effective"])
-        previous_baseline = previous.get("subject_reconciliation", {}).get("baseline_oid")
         subject_reconciliation = reconcile_subjects(root, feature_id, graph, previous_baseline)
         risk_frontier = derive_risk_frontier(graph, risk["effective"])
         critical_experiments = experiment_plan(root, feature_id, risk_frontier, graph)
@@ -1769,6 +1851,7 @@ def compile_graph(
             product_lock_status=lock_status,
             subject_reconciliation=subject_reconciliation,
             critical_experiments=critical_experiments,
+            required_risk=union_risk_vectors(source_revision["risk_vector"], observed_risk),
         )
         contract = generate_proof_contract(graph, critical_experiments)
         previous_contract = load_json(contract_path) if contract_path.is_file() else None
@@ -1929,7 +2012,10 @@ def mark_code_complete(root: Path, feature_id: str) -> str:
         if reconciliation.get("status") != "reconciled":
             raise ValueError("Code requires complete and current planned/observed Subject reconciliation")
         state["subject_reconciliation"] = reconciliation
-        observed = observed_code_risk_vector(root, graph)
+        observed = union_risk_vectors(
+            state.get("risk", {}).get("observed", {}),
+            observed_code_risk_vector(root, graph, reconciliation.get("baseline_oid")),
+        )
         planned = union_risk_vectors(
             state.get("risk", {}).get("source", {}),
             state.get("risk", {}).get("design", {}),
@@ -1946,6 +2032,9 @@ def mark_code_complete(root: Path, feature_id: str) -> str:
             }
             atomic_write_json(state_path, state)
             raise ValueError("Code introduced undeclared risk axes; update Delivery Graph and rerun review: " + ", ".join(unplanned))
+        domain_errors = high_risk_issues(graph, required_domain_risk(root, graph, state))
+        if domain_errors:
+            raise ValueError("Code requires complete high-risk verification: " + "; ".join(item["statement"] for item in domain_errors))
         required = review_units(graph)
         if not required or not all(
             _valid_attestation_reference(root, feature_id, unit_id, state.get("attestations", {}).get(unit_id), graph)

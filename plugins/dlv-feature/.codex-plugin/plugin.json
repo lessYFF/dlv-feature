@@ -1,6 +1,6 @@
 {
   "name": "dlv-feature",
-  "version": "0.12.0",
+  "version": "0.12.1",
   "description": "Risk-directed feature delivery with bounded review recovery and evidence-backed completion.",
   "author": {
     "name": "lessYFF",

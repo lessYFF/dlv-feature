@@ -188,7 +188,12 @@ def valid_graph(feature_id: str = "cross-domain-feature", *, runtime: str = "pyt
         node("BND-001", "Boundary", "Authorization boundary", "Authorization guards state mutation"),
         node("ST-001", "StateTransition", "Pending to complete", "The entity moves to completed"),
         node("DEC-001", "Decision", "Single writer", "One service owns the write transaction"),
-        node("RISK-001", "Risk", "Duplicate execution", "Concurrent execution could duplicate side effects", severity="major", risk_axes=["CONCURRENCY"]),
+        node("RISK-001", "Risk", "Duplicate execution", "Concurrent execution could duplicate side effects", severity="major", risk_axes=["CONCURRENCY"], verification={
+            "symbols": ["SYM-001"], "domains": {"concurrency": {
+                "context": {"schedule": "Two callers contend on the guarded transition", "failure_point": "After the initial state read"},
+                "checks": {"interleaving": "ASRT-011", "invariant_readback": "ASRT-015"},
+            }},
+        }),
         node("CHG-001", "Change", "Implement transaction", "Implement the guarded atomic transition"),
         node("SYM-001", "Symbol", "DomainService.execute", "Change the domain service execution symbol", path="src/domain_service.py"),
         node("ENV-001", "Environment", "Python runtime", "Execute in the target Python runtime", target="python runtime", spec={
@@ -310,7 +315,7 @@ def fast_path_eligibility_snapshot(root: Path, adapter: dict, adapter_sha256: st
 
 
 def remove_invariant_obligation(graph: dict[str, object]) -> None:
-    removed = {"PO-002", "ASRT-010", "ASRT-011", "ASRT-012", "ASRT-013", "ASRT-015"}
+    removed = {"PO-002", "ASRT-010", "ASRT-011", "ASRT-012", "ASRT-013", "ASRT-015", "RISK-001"}
     graph["claims"] = [
         item for item in graph["claims"]
         if item["lens"] not in {"STATE_AND_ATOMICITY", "BOUNDARY_AND_CONCURRENCY"}
@@ -380,6 +385,8 @@ class GraphTestCase(unittest.TestCase):
         delivery_graph.compile_graph(root, feature_id)
         graph = valid_graph(feature_id)
         bind_test_runtime_files(root, graph)
+        (root / "src").mkdir(exist_ok=True)
+        (root / "src/domain_service.py").write_text("# implementation fixture\n", encoding="utf-8")
         write_json(directory / "delivery-graph.json", graph)
         return temporary, root
 
@@ -415,7 +422,12 @@ class GraphTestCase(unittest.TestCase):
         self, root: Path, feature_id: str = "cross-domain-feature", run_id: str = "readiness-01",
     ) -> None:
         self.seal_product(root, feature_id)
-        with patch.object(graph_review, "run_bounded", side_effect=self.fake_semantic_run):
+        # This helper already replaces the model process. Keep executable
+        # bootstrap checks in the dedicated isolation/preflight tests instead
+        # of copying and code-signing a host binary for every graph fixture.
+        with patch.object(graph_review, "prepare_isolated_codex_executable", return_value="codex"), patch.object(
+            graph_review, "run_bounded", side_effect=self.fake_semantic_run,
+        ):
             graph_review.run_isolated_readiness_review(root, feature_id, run_id)
         (root / "src").mkdir(exist_ok=True)
         implementation = root / "src/domain_service.py"
@@ -1029,15 +1041,34 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
     def test_observed_symbol_risk_requires_graph_reconciliation_before_code_completion(self) -> None:
         temporary, root = self.make_root()
         with temporary:
-            (root / "src").mkdir()
-            (root / "src/domain_service.py").write_text("def reimburse(amount): return amount\n", encoding="utf-8")
+            (root / "src").mkdir(exist_ok=True)
             self.review_all(root)
             graph_contract.seal_contract(root, "cross-domain-feature")
+            (root / "src/domain_service.py").write_text("def reimburse(amount): return amount\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "undeclared risk axes"):
                 delivery_graph.mark_code_complete(root, "cross-domain-feature")
             state = delivery_graph.load_state(root / "delivery/cross-domain-feature/state.json")
             self.assertEqual("needs_reconcile", state["code"]["status"])
             self.assertEqual("present", state["risk"]["observed"]["MONEY"])
+
+    def test_removed_legacy_client_logic_cannot_clear_code_risk_gate(self) -> None:
+        temporary, root = self.make_root()
+        with temporary:
+            (root / "src").mkdir(exist_ok=True)
+            implementation = root / "src/domain_service.py"
+            self.review_all(root)
+            graph_contract.seal_contract(root, "cross-domain-feature")
+            implementation.write_text("client_version = 'old'\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "undeclared risk axes.*CROSS_CLIENT"):
+                delivery_graph.mark_code_complete(root, "cross-domain-feature")
+            implementation.write_text("result = 1\n", encoding="utf-8")
+            state = delivery_graph.compile_graph(root, "cross-domain-feature")
+            self.assertTrue(any(item["code"] == "HIGH_RISK_UNMODELED" for item in state["readiness"]["authoring_blockers"]))
+            with self.assertRaises(ValueError):
+                delivery_graph.mark_code_complete(root, "cross-domain-feature")
+            self.assertEqual("present", state["risk"]["observed"]["CROSS_CLIENT"])
+            reasons = frontend_fast_path.eligibility(root, "cross-domain-feature")
+            self.assertTrue(any("ineligible for elevated risk axes" in reason and "CROSS_CLIENT" in reason for reason in reasons), reasons)
 
     def test_v10_compatibility_import_archives_mutable_records_and_resets_claims(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
@@ -3053,7 +3084,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             self.assertIs(False, payload["plugin_identity_verified"])
             self.assertIs(True, payload["host_verification_required"])
             self.assertEqual("dlv-feature", payload["plugin"])
-            self.assertEqual("0.12.0", payload["diagnostic_version"])
+            self.assertEqual("0.12.1", payload["diagnostic_version"])
             self.assertEqual(expected_plugin_sha256, payload["diagnostic_plugin_sha256"])
             self.assertEqual("0600", payload["bootstrap_files"]["auth.json"]["mode"])
             self.assertEqual(
@@ -3457,10 +3488,10 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
             lock = json.loads(lock_path.read_text())
             self.assertEqual(["DEC-001"], lock["owner_decision_refs"])
             self.assertFalse(delivery_graph.load_state(path.parent / "state.json")["readiness"]["product_lock_blocked"])
-            with patch.object(graph_review, "run_bounded", side_effect=self.fake_semantic_run):
-                graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "wmd-ready")
             (root / "src").mkdir(exist_ok=True)
             (root / "src/domain_service.py").write_text("# owner-approved implementation\n", encoding="utf-8")
+            with patch.object(graph_review, "run_bounded", side_effect=self.fake_semantic_run):
+                graph_review.run_isolated_readiness_review(root, "cross-domain-feature", "wmd-ready")
             subprocess.run(["git", "add", "-A"], cwd=root, check=True)
             subprocess.run(
                 ["git", "-c", "user.name=DLV Test", "-c", "user.email=dlv@example.invalid", "commit", "-qm", "wmd ready\n\nDLV-Feature: cross-domain-feature"],
@@ -5287,7 +5318,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
                     target = root / ".dlv/repository-adapter.json" if drift == "adapter" else fixture
                     write_json(target, {"changed": True})
                     completed = {"exit_code": 0, "stdout": "{}", "stderr": "", "timed_out": False}
-                    with patch.object(graph_verification, "run_bounded", return_value=completed), self.assertRaisesRegex(ValueError, "fingerprint|repository adapter"):
+                    with patch.object(graph_verification, "run_bounded", return_value=completed), self.assertRaisesRegex(ValueError, "fingerprint|repository adapter|fixture digest is stale"):
                         graph_verification.record("cross-domain-feature", root, f"drift-{drift}", result, [])
 
     def test_frontend_fast_path_escalates_risk_and_requires_adapter_capabilities(self) -> None:
@@ -5353,7 +5384,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
         with temporary:
             delivery_graph.compile_graph(root, "cross-domain-feature")
             self.seal_product(root)
-            (root / "src").mkdir()
+            (root / "src").mkdir(exist_ok=True)
             (root / "src/view.tsx").write_text("export const View = () => null;\n", encoding="utf-8")
             adapter = {
                 "schema_version": 12, "name": "test", "source_ref": "test-repository-adapter", "frontend_roots": ["src"], "capabilities": {
@@ -5406,7 +5437,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
     def test_frontend_fast_path_atomically_reserves_one_concurrent_run(self) -> None:
         temporary, root = self.make_root()
         with temporary:
-            (root / "src").mkdir()
+            (root / "src").mkdir(exist_ok=True)
             (root / "src/view.tsx").write_text("export const View = () => null;\n", encoding="utf-8")
             adapter = {
                 "schema_version": 12, "name": "test", "source_ref": "test-repository-adapter",
@@ -5455,7 +5486,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
     def test_frontend_fast_path_blocks_adapter_repository_mutation(self) -> None:
         temporary, root = self.make_root()
         with temporary:
-            (root / "src").mkdir()
+            (root / "src").mkdir(exist_ok=True)
             (root / "src/view.tsx").write_text("export const View = () => null;\n", encoding="utf-8")
             adapter = {
                 "schema_version": 12, "name": "test", "source_ref": "test-repository-adapter", "frontend_roots": ["src"], "capabilities": {
@@ -5581,7 +5612,7 @@ ALTER TABLE trip_accounting ALTER COLUMN amount TYPE numeric(20, 2);
     def test_macos_repository_adapter_uses_bounded_disposable_oci_runtime(self) -> None:
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
-            (root / "src").mkdir()
+            (root / "src").mkdir(exist_ok=True)
             adapter = {
                 "schema_version": 12, "name": "isolated", "source_ref": "test",
                 "frontend_roots": ["src"],

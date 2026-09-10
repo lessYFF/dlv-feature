@@ -1,6 +1,6 @@
 # DLV Feature
 
-Current plugin version: **0.12.0**, Delivery Graph schema v13.
+Current plugin version: **0.12.1**, Delivery Graph schema v13.
 
 DLV Feature is a proof-carrying Codex workflow with immutable Source Revisions, generated PRD and Delivery Prototype views, independent Product Alignment, a content-addressed Product Lock, stable Claims and semantic Findings, budgeted convergence control, target-runtime authenticity, and deterministic finalization.
 
@@ -140,5 +140,25 @@ Compatibility importers for schema v9/v10 emit an untrusted v13 candidate. Impor
 python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_delivery_graph.py
 python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_quality_core.py
 python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_execution_assessment.py
+python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_high_risk_baseline.py
+python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_high_risk_contracts.py
+python3 -m unittest plugins/dlv-feature/skills/dlv-feature/scripts/test_high_risk_delivery.py
+python3 plugins/dlv-feature/skills/dlv-feature/scripts/high_risk_baseline.py
 python3 /path/to/skill-creator/scripts/quick_validate.py plugins/dlv-feature/skills/dlv-feature
 ```
+
+The high-risk baseline executes five local accident controls: deleted columns
+breaking old services, money precision loss, old-client payment interruption,
+disabled-account sessions, and duplicate payment callbacks. It reports correct
+and defective measurements through the existing oracle, plus deliberately weak
+checks that miss the defects. It does not run semantic Review or establish
+production/target-runtime readiness. See the
+[verification obligations](plugins/dlv-feature/skills/dlv-feature/references/high-risk-verification.md)
+and [coverage report](plugins/dlv-feature/skills/dlv-feature/references/high-risk-baseline-report.md).
+
+High-risk Graphs now require domain context and measured Assertion bindings on
+their Risk nodes. Independent Review receives bounded actual implementation
+and bound fixture content, and source changes invalidate affected attestations.
+The delivery integration tests exercise signed observations and finalization
+for all five accident pairs; model responses and target transport are fixtures,
+so they do not establish real-model recall or production readiness.

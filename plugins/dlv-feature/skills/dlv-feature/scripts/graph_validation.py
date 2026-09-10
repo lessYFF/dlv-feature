@@ -26,6 +26,7 @@ from delivery_graph import (
     prototype_errors,
     readiness,
     review_units,
+    required_domain_risk,
     semantic_issues,
     render_stage_document,
     stage_hash,
@@ -49,6 +50,8 @@ from quality_core import (
     source_anchors,
 )
 from delivery_contracts import claim_succession_map
+from review_evidence import evidence_execution_errors
+from high_risk_contracts import evidence_symbol_ids
 
 
 ALLOWED_FILES = {
@@ -183,6 +186,9 @@ def validate_attestations(root: Path, feature_id: str, graph: dict[str, Any], st
                 "mode", "provider", "invocation_id", "transcript_path",
                 "transcript_sha256", "result_sha256", "independent",
             }
+            if evidence_symbol_ids(graph, set(unit["node_ids"])):
+                expected_execution_keys.add("implementation_sha256")
+            errors.extend(evidence_execution_errors(root, graph, unit, execution))
             if (
                 set(execution) != expected_execution_keys
                 or execution.get("provider") != "codex-exec"
@@ -356,6 +362,10 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
     expected_subjects = reconcile_subjects(
         root, feature_id, graph, state.get("subject_reconciliation", {}).get("baseline_oid"),
     )
+    try:
+        domain_risk = required_domain_risk(root, graph, state)
+    except (OSError, ValueError) as exc:
+        return errors + [f"high-risk prerequisites cannot be validated: {exc}"]
     expected_frontier = derive_risk_frontier(graph, risk.get("effective", {}) if isinstance(risk, dict) else {})
     expected_experiments = experiment_plan(root, feature_id, expected_frontier, graph)
     if state.get("subject_reconciliation") != expected_subjects:
@@ -393,6 +403,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
             graph, state.get("attestations", {}), source_status=source_status, ledger=ledger,
             product_lock_status=lock_status,
             subject_reconciliation=expected_subjects, critical_experiments=expected_experiments,
+            required_risk=domain_risk,
         )
         snapshot = convergence_snapshot(graph, expected_readiness, ledger)
         events = ledger.get("convergence_events", [])
@@ -412,6 +423,7 @@ def validate(root: Path, feature_id: str, *, final: bool = False) -> list[str]:
         graph, state.get("attestations", {}), source_status=source_status, ledger=ledger,
         product_lock_status=lock_status,
         subject_reconciliation=expected_subjects, critical_experiments=expected_experiments,
+        required_risk=domain_risk,
     ):
         errors.append("state readiness disagrees with current review units/governance")
     if state.get("delivery_status") != derive_delivery_status(state):

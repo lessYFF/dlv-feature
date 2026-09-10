@@ -219,3 +219,13 @@ Proof. Schema v11 migration archives old mutable records and promotes no prior
 seal, PASS, Ready, or Product Lock claim. v12 migration preserves original bytes
 under `archive-v12` and promotes no prototype. Migration prevalidates symlinks, stages a complete
 archive, and rolls back every mutated record if compilation fails.
+
+High-risk Risk nodes use the existing attributes extension point for
+`verification={symbols,domains}`. See
+[high-risk-verification.md](high-risk-verification.md) for exact domain roles.
+These checks are deterministic pre-Review authoring blockers and are rechecked
+at sealing/completion. Isolated Review execution metadata additionally requires
+`implementation_sha256` whenever its unit contains such Risks; it binds actual
+before/after Symbol bytes and verified Environment fixtures. Legacy graph-only
+diagnostic records still cannot seal a Proof Contract. Code/fixture drift makes
+bound attestations stale even when the Graph itself did not change.

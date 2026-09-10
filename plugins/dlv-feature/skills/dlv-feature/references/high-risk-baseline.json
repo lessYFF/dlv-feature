@@ -1,0 +1,48 @@
+{
+  "cases": [
+    {
+      "id": "deleted_column_old_service",
+      "assertions": [
+        {"id": "old-query-succeeds", "oracle": {"kind": "state", "source": "/observation/old_service_errors", "operator": "eq", "expected": 0}},
+        {"id": "old-value-preserved", "oracle": {"kind": "state", "source": "/observation/old_amount", "operator": "eq", "expected": 1099}},
+        {"id": "new-value-preserved", "oracle": {"kind": "state", "source": "/observation/new_amount", "operator": "eq", "expected": 1099}}
+      ],
+      "weak_assertions": [{"id": "migration-ran", "oracle": {"kind": "state", "source": "/observation/migration_completed", "operator": "eq", "expected": 1}}]
+    },
+    {
+      "id": "money_precision_loss",
+      "assertions": [
+        {"id": "all-values-preserved", "oracle": {"kind": "state", "source": "/observation/mismatched_rows", "operator": "eq", "expected": 0}},
+        {"id": "row-count-preserved", "oracle": {"kind": "state", "source": "/observation/row_count", "operator": "eq", "expected": 3}},
+        {"id": "exact-amounts", "oracle": {"kind": "state", "source": "/observation/amounts", "operator": "eq", "expected": [1099, -1099, 1]}}
+      ],
+      "weak_assertions": [{"id": "migration-ran", "oracle": {"kind": "state", "source": "/observation/migration_completed", "operator": "eq", "expected": 1}}]
+    },
+    {
+      "id": "old_client_payment",
+      "assertions": [
+        {"id": "old-pay-succeeds", "oracle": {"kind": "http_status", "source": "/observation/pay_http_status", "operator": "eq", "expected": 200}},
+        {"id": "order-finished", "oracle": {"kind": "state", "source": "/observation/order_status", "operator": "eq", "expected": "paid"}},
+        {"id": "charge-correct", "oracle": {"kind": "state", "source": "/observation/charged_minor", "operator": "eq", "expected": 1099}}
+      ],
+      "weak_assertions": [{"id": "detail-still-works", "oracle": {"kind": "http_status", "source": "/observation/detail_http_status", "operator": "eq", "expected": 200}}]
+    },
+    {
+      "id": "disabled_account_session",
+      "assertions": [
+        {"id": "old-session-denied", "oracle": {"kind": "http_status", "source": "/observation/request_http_status", "operator": "eq", "expected": 403}},
+        {"id": "no-write", "oracle": {"kind": "side_effect", "source": "/observation/mutation_count", "operator": "eq", "expected": 0}}
+      ],
+      "weak_assertions": [{"id": "account-disabled", "oracle": {"kind": "state", "source": "/observation/account_enabled", "operator": "eq", "expected": 0}}]
+    },
+    {
+      "id": "duplicate_payment_callback",
+      "assertions": [
+        {"id": "both-saw-absence", "oracle": {"kind": "state", "source": "/observation/prewrite_counts", "operator": "eq", "expected": [0, 0]}},
+        {"id": "one-posting", "oracle": {"kind": "state", "source": "/observation/posting_count", "operator": "eq", "expected": 1}},
+        {"id": "one-charge", "oracle": {"kind": "state", "source": "/observation/charged_minor", "operator": "eq", "expected": 1099}}
+      ],
+      "weak_assertions": [{"id": "callbacks-executed", "oracle": {"kind": "state", "source": "/observation/callback_count", "operator": "eq", "expected": 2}}]
+    }
+  ]
+}

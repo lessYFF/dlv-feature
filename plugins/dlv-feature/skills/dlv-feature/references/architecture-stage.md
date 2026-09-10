@@ -6,6 +6,10 @@ Represent verified system facts, singular ownership, boundaries, state transitio
 
 ## Build the subgraph
 
+For database evolution, client compatibility, authorization or money/concurrency
+changes, read [high-risk-verification.md](high-risk-verification.md) and bind the
+applicable failure boundaries using the existing Graph contracts.
+
 1. Inspect repository evidence only as needed. Search results are candidates; read code/schema/tests before asserting a `Fact`.
 2. Create one `Owner` for each authoritative fact family. Connect `Owner owns Fact/Boundary/StateTransition/Decision`; one protected truth must not have multiple owners. Every `Fact` declares `attributes.persistence`. Use `kind=database` with a schema-focused `schema_sql`; use `external/ephemeral/none` with a concrete rationale. Never leave `kind=unknown` after import reconciliation.
 3. Create `Boundary` for authorization, tenant/product/lifecycle, projection, lineage/source, or write-entry constraints. Connect it with `guards` to every protected StateTransition or behavior.

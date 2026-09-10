@@ -2,6 +2,10 @@
 
 ## Start
 
+For database evolution, old clients, account authorization or money/concurrency,
+apply [high-risk-verification.md](high-risk-verification.md). Its local benchmark
+is a regression fixture, not a substitute for the sealed target-runtime Proof.
+
 For changed API contracts or mandatory steps, execute the old supported client
 request sequence against the new server with relevant historical state. Do not
 substitute a newly rebuilt client or a successful new/new integration run.

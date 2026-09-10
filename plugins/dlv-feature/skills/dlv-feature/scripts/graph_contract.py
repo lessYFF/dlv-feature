@@ -20,10 +20,13 @@ from delivery_graph import (
     load_graph,
     load_state,
     review_units,
+    required_domain_risk,
     semantic_issues,
     timestamp,
 )
 from delivery_proof import exclusive_file_lock, file_digest, load_json, value_digest
+from high_risk_contracts import high_risk_issues, evidence_symbol_ids
+from review_evidence import evidence_execution_errors
 
 
 def seal_payload(contract: dict[str, Any]) -> dict[str, Any]:
@@ -33,6 +36,7 @@ def seal_payload(contract: dict[str, Any]) -> dict[str, Any]:
 def validate_contract(root: Path, feature_id: str, contract: dict[str, Any], state: dict[str, Any], errors: list[str]) -> None:
     root = root.expanduser().resolve()
     graph = load_graph(root, feature_id)
+    errors.extend(item["statement"] for item in high_risk_issues(graph, required_domain_risk(root, graph, state)))
     from product_lock import live_product_lock_errors
     errors.extend(live_product_lock_errors(root, feature_id, graph))
     expected = generate_proof_contract(graph, state.get("critical_experiments", {}))
@@ -100,6 +104,14 @@ def validate_contract(root: Path, feature_id: str, contract: dict[str, Any], sta
                 continue
             record = load_json(record_path)
             execution = record.get("execution")
+            expected_execution_keys = {
+                "mode", "provider", "invocation_id", "transcript_path",
+                "transcript_sha256", "result_sha256", "independent",
+            }
+            if evidence_symbol_ids(graph, set(units[unit_id]["node_ids"])):
+                expected_execution_keys.add("implementation_sha256")
+            if isinstance(execution, dict):
+                errors.extend(evidence_execution_errors(root, graph, units[unit_id], execution))
             if (
                 record.get("feature_id") != feature_id
                 or record.get("unit_id") != unit_id
@@ -112,10 +124,7 @@ def validate_contract(root: Path, feature_id: str, contract: dict[str, Any], sta
                 continue
             if (
                 not isinstance(execution, dict)
-                or set(execution) != {
-                    "mode", "provider", "invocation_id", "transcript_path",
-                    "transcript_sha256", "result_sha256", "independent",
-                }
+                or set(execution) != expected_execution_keys
                 or execution.get("mode") != "isolated_process"
                 or execution.get("provider") != "codex-exec"
                 or execution.get("independent") is not True

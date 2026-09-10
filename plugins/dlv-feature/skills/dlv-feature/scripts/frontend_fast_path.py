@@ -20,6 +20,7 @@ from delivery_graph import (
     graph_digest,
     graph_risk_vector,
     load_graph,
+    load_state,
     observed_code_risk_vector,
     prototype_errors,
     structural_errors,
@@ -68,7 +69,11 @@ def _eligibility_snapshot(root: Path, feature_id: str) -> tuple[list[str], dict[
         source_risk = {}
     else:
         source_risk = source["risk_vector"]
-    vector = union_risk_vectors(source_risk, graph_risk_vector(graph), observed_code_risk_vector(root, graph))
+    state = load_state(root / "delivery" / feature_id / "state.json")
+    vector = union_risk_vectors(
+        source_risk, graph_risk_vector(graph), state.get("risk", {}).get("observed", {}),
+        observed_code_risk_vector(root, graph, state.get("subject_reconciliation", {}).get("baseline_oid")),
+    )
     elevated = sorted(axis for axis in ELEVATED_AXES if vector.get(axis) != "absent")
     if elevated:
         reasons.append("frontend fast path is ineligible for elevated risk axes: " + ", ".join(elevated))

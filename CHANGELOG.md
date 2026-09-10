@@ -2,6 +2,28 @@
 
 All notable changes to DLV Feature are documented here.
 
+## [0.12.1] - 2026-09-10
+
+### Changed
+
+- Scan declared implementation Subjects against their frozen Git baseline so
+  deletion cannot erase authorization, persistence or client-compatibility risk.
+- Detect table DDL risk, preserve observed risk at code completion and frontend
+  routing, and document applicable high-risk verification obligations.
+- Enforce database, compatibility, authorization, money and concurrency
+  obligations before Review and at completion using existing Risk attributes.
+- Bind independent Review to actual before/after implementation and existing
+  Environment fixture bytes; invalidate affected attestations on source drift.
+
+### Validation
+
+- Add five executable local accident controls with correct/defective pairs and
+  deliberately insufficient checks, evaluated by the existing delivery oracle.
+- Add deleted/renamed/directory Subject, literal-path, baseline and code-gate
+  regressions. Local fixture PASS is not semantic or production readiness.
+- Exercise all five accident pairs through signed runtime observations and
+  finalization, with explicit model/transport doubles and real local SQL.
+
 ## [0.12.0] - 2026-09-07
 
 ### Changed

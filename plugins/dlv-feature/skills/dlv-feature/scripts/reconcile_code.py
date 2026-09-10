@@ -8,7 +8,7 @@ import json
 import sys
 from pathlib import Path
 
-from delivery_graph import compile_graph, formal_feature_commits, graph_risk_vector, load_graph, observed_code_risk_vector
+from delivery_graph import compile_graph, formal_feature_commits, graph_risk_vector, load_graph
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -22,7 +22,7 @@ def main(argv: list[str] | None = None) -> int:
         graph = load_graph(root, args.feature_id)
         print(json.dumps({
             "declared_design_risk": graph_risk_vector(graph),
-            "observed_code_risk": observed_code_risk_vector(root, graph),
+            "observed_code_risk": state["risk"]["observed"],
             "effective_risk": state["risk"]["effective"],
             "formal_feature_commits": formal_feature_commits(root, args.feature_id),
             "code_status": state["code"]["status"],

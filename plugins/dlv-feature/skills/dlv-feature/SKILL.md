@@ -77,6 +77,15 @@ Graph. Consult a stage reference only when it applies: [PRD](references/prd-stag
 [Prototype](references/prototype-stage.md), [implementation](references/implementation-stage.md),
 or [runtime verification](references/verification-stage.md).
 
+For database, API/old-client, account/tenant, money or concurrency changes,
+read [high-risk-verification.md](references/high-risk-verification.md).
+Applicable Risk nodes must bind domain context and measured checks to existing
+Claims/Assertions. Missing obligations block Review before model execution.
+Implement the affected source and prepare the bound historical/client fixtures
+before high-risk Review: the Reviewer receives bounded actual before/after
+Symbol bytes and fixture content. Code or fixture drift invalidates only bound
+Review units. A completed delivery never authorizes a later destructive action.
+
 ## Workflow
 
 ```bash
